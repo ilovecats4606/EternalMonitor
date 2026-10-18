@@ -374,6 +374,11 @@ impl Session {
             session_id,
             device = %hello.device_name,
             screen = format!("{}x{}", hello.screen_px_w, hello.screen_px_h),
+            screen_points = format!("{}x{}", hello.screen_pt_w, hello.screen_pt_h),
+            refresh_hz = hello.refresh_hz,
+            preferred_fps = hello.preferred_fps,
+            decoder_caps = hello.decoder_caps,
+            feature_caps = hello.feature_caps,
             "Client session established"
         );
         self.active = Some(ActiveSession {

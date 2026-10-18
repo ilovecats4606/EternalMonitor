@@ -36,7 +36,9 @@ impl AudioSender {
         };
         if now_us.saturating_sub(queued.packet.capture_ts_us) > 100_000 {
             self.reset_pending = true;
-            PIPELINE_STATS.lock().audio.dropped += 1;
+            let mut stats = PIPELINE_STATS.lock();
+            stats.audio.dropped += 1;
+            stats.audio.stale_dropped += 1;
             return None;
         }
         let stream = (queued.session_id, epoch);
@@ -52,7 +54,9 @@ impl AudioSender {
         let datagram = header.encode(&queued.packet.opus).ok()?;
         if datagram.len() > shared.max_dgram.load(std::sync::atomic::Ordering::SeqCst) as usize {
             self.reset_pending = true;
-            PIPELINE_STATS.lock().audio.dropped += 1;
+            let mut stats = PIPELINE_STATS.lock();
+            stats.audio.dropped += 1;
+            stats.audio.oversized_dropped += 1;
             return None;
         }
         Some((peer, datagram))
@@ -76,8 +80,26 @@ impl AudioSender {
                 PIPELINE_STATS.lock().audio.record_sent(payload_size);
             } else {
                 self.reset_pending = true;
-                PIPELINE_STATS.lock().audio.dropped += 1;
+                let mut stats = PIPELINE_STATS.lock();
+                stats.audio.dropped += 1;
+                stats.audio.send_failed += 1;
             }
+        }
+    }
+
+    pub async fn send_queued(
+        &mut self,
+        receiver: &mut tokio::sync::mpsc::Receiver<SessionPacket>,
+        links: &TransportLinks,
+        shared: &SharedControl,
+        epoch: u32,
+    ) {
+        // Bound work even if the capture thread refills the queue while we send.
+        for _ in 0..crate::audio::QUEUE_CAPACITY {
+            let Ok(packet) = receiver.try_recv() else {
+                break;
+            };
+            self.send(packet, links, shared, epoch).await;
         }
     }
 }

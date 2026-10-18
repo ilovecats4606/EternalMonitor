@@ -6,6 +6,7 @@ pub mod autostart;
 pub mod capture;
 pub mod clock;
 pub mod control;
+pub mod diagnostics;
 pub mod discovery;
 pub mod encoder;
 pub mod gui;
@@ -26,3 +27,5 @@ pub mod gpu;
 #[cfg(not(windows))]
 #[path = "gpu_other.rs"]
 pub mod gpu;
+
+pub mod telemetry;

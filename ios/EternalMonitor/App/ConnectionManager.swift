@@ -279,7 +279,7 @@ final class ConnectionManager: ObservableObject {
         sessionWantsAudio = wantsAudio
         audioStats = AudioStats()
         debugState = ConnectionDebugState(host: normalizedHost, port: port)
-        record(.info, "connection", "Starting connection to \(normalizedHost):\(port)")
+        record(.info, "connection", "Starting connection attempt=\(connectionID) transport=\(transportMode) to \(normalizedHost):\(port) drawing=\(drawing.enabled) input=\(wantsInput) audio=\(wantsAudio)")
 
         let decoder = VideoDecoder()
         let metrics = ReceiverMetrics()
@@ -443,7 +443,7 @@ final class ConnectionManager: ObservableObject {
                 self.hostStreamConfig = info.streamConfig
                 self.record(
                     .info, "ctrl",
-                    "Connected to \(info.hostName): \(info.streamConfig.width)x\(info.streamConfig.height) @ \(info.streamConfig.fps)fps"
+                    "Connected to \(info.hostName) session_id=\(info.sessionId) host_caps=\(info.hostCaps) liveness_ms=\(info.livenessTimeoutMs) config=\(info.streamConfig)"
                 )
             }
         }
@@ -538,6 +538,7 @@ final class ConnectionManager: ObservableObject {
             preferredFPS: drawing.preferredFPS(UserDefaults.standard.frameRatePreference(), maximum: screen.maximumFramesPerSecond),
             authToken: pairingToken
         )
+        record(.info, "connection", "Client capabilities pixels=\(identity.screenPxW)x\(identity.screenPxH) refresh=\(identity.refreshHz) preferred_fps=\(identity.preferredFPS) decoder_caps=\(identity.decoderCaps) feature_caps=\(identity.featureCaps)")
         E2E.emit("E2E_HELLO w=\(identity.screenPxW) h=\(identity.screenPxH) refresh_hz=\(identity.refreshHz)")
         receiver.onListenerReady = { [weak self, weak channel] actualPort in
             channel?.startHandshake(listenPort: actualPort, identity: identity)
@@ -567,8 +568,8 @@ final class ConnectionManager: ObservableObject {
         receiver.onError = { [weak self] message in
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                self.record(.error, isUSB ? "usb" : "udp", "state=\(self.state) \(message)")
                 guard self.state == .connecting else { return }
-                self.record(.error, isUSB ? "usb" : "udp", message)
                 self.connectionError = message
                 if !isUSB { self.disconnect() }
             }
@@ -606,6 +607,7 @@ final class ConnectionManager: ObservableObject {
     private func startStatsFlushLoop() {
         statsFlushTask?.cancel()
         statsFlushTask = Task { @MainActor [weak self] in
+            var lastSummary = ProcessInfo.processInfo.systemUptime
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 250_000_000)
                 guard let self, !Task.isCancelled else { return }
@@ -645,6 +647,10 @@ final class ConnectionManager: ObservableObject {
                 // neither media nor heartbeats, so skipping this when nothing
                 // arrived is exactly when the liveness watchdog is needed.
                 self.refreshStatsAndWatchdog()
+                if ProcessInfo.processInfo.systemUptime - lastSummary >= 10 {
+                    lastSummary = ProcessInfo.processInfo.systemUptime
+                    self.recordStreamSummary(reason: "periodic")
+                }
             }
         }
     }
@@ -847,6 +853,10 @@ final class ConnectionManager: ObservableObject {
     }
 
     func disconnect(reason: ByeReason = .userDisconnect) {
+        if state != .disconnected {
+            recordStreamSummary(reason: "disconnect=\(reason)")
+            record(.info, "connection", "Disconnect state=\(state) reason=\(reason)")
+        }
         awaitingPairing = false
         pairingPrompt = nil
         currentAttempt.withLock { $0 = nil }
@@ -888,7 +898,14 @@ final class ConnectionManager: ObservableObject {
         UIApplication.shared.isIdleTimerDisabled = false
     }
 
+    private func recordStreamSummary(reason: String) {
+        let counters = frameAssembler?.counters.withLock { $0 } ?? .init()
+        let clock = controlChannel?.clockSnapshot.withLock { $0 }
+        SupportDiagnostics.shared.record("info", "stream", "reason=\(reason) state=\(state) transport=\(transportMode) session_id=\(hostInfo?.sessionId ?? 0) decoded=\(debugState.decodedFrames) assembled=\(debugState.assembledFrames) datagrams=\(debugState.datagramsReceived) bytes=\(debugState.datagramBytesReceived) fps=\(fps) size=\(videoSize) depth=\(videoDecoder?.decodeDepth ?? 0) dropped=\(counters.framesDropped) repaired=\(counters.fragsRepaired) nacks=\(counters.nacksSent) jitter_us=\(counters.jitterUs) rtt_us=\(clock?.rttUs ?? 0) e2e_ms=\(lagMs) audio=\(audioStats) thermal=\(ProcessInfo.processInfo.thermalState.rawValue) low_power=\(ProcessInfo.processInfo.isLowPowerModeEnabled)")
+    }
+
     private func record(_ level: DiagnosticLevel, _ category: String, _ message: String) {
+        SupportDiagnostics.shared.record(String(describing: level), category, message)
         E2E.emit("E2E_DIAGNOSTIC category=\(category) message=\(message)")
         diagnostics.append(DiagnosticEntry(level: level, category: category, message: message))
         if diagnostics.count > 80 {

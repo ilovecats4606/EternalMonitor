@@ -627,6 +627,10 @@ struct ConnectView: View {
                 }
                 .padding(.horizontal, 16)
                 .padding(.bottom, 16)
+                NavigationLink("Export diagnostics") { DiagnosticsView() }
+                    .font(.app(14, .medium, relativeTo: .body))
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 16)
             }
         }
         .card(padding: 0)

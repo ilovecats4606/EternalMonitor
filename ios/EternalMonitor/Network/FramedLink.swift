@@ -47,7 +47,9 @@ final class FramedLink: MediaLink {
                 guard let self, let connection, self.connection === connection else { return }
                 switch state {
                 case .ready: self.receiveNext()
-                case .failed(let error): self.fail("USB connection failed: \(error.localizedDescription)")
+                case .failed(let error):
+                    SupportDiagnostics.shared.record("error", "usb", "NWConnection failed: \(error)")
+                    self.fail("USB connection failed: \(error.localizedDescription)")
                 default: break
                 }
             }
@@ -93,7 +95,10 @@ final class FramedLink: MediaLink {
         connection.send(content: packet, completion: .contentProcessed { [weak self, weak connection] error in
             guard let self, let connection, self.connection === connection else { return }
             self.sending = false
-            if let error { self.fail("USB send failed: \(error.localizedDescription)") }
+            if let error {
+                SupportDiagnostics.shared.record("error", "usb", "NWConnection send: \(error)")
+                self.fail("USB send failed: \(error.localizedDescription)")
+            }
             else { self.sendNext() }
         })
     }
@@ -123,7 +128,10 @@ final class FramedLink: MediaLink {
                     self.fail("USB protocol mismatch."); return
                 }
             }
-            if let error { self.fail("USB receive failed: \(error.localizedDescription)") }
+            if let error {
+                SupportDiagnostics.shared.record("error", "usb", "NWConnection receive: \(error)")
+                self.fail("USB receive failed: \(error.localizedDescription)")
+            }
             else if complete { self.finish() }
             else { self.receiveNext() }
         }
@@ -157,6 +165,7 @@ final class FramedLink: MediaLink {
 
     private func fail(_ message: String) {
         guard connection != nil else { return }
+        SupportDiagnostics.shared.record("error", "usb", message)
         onError?(message)
         finish()
     }

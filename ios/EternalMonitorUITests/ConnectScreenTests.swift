@@ -55,6 +55,39 @@ final class ConnectScreenTests: XCTestCase {
         waitForExpectations(timeout: 5)
     }
 
+    func testDiagnosticsCanBeCopiedAndSharedWithoutAConnection() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO"]
+        app.launch()
+        XCTAssertTrue(app.buttons["settings.button"].waitForExistence(timeout: 10))
+        app.buttons["settings.button"].tap()
+        let diagnostics = app.buttons["settings.diagnostics"]
+        for _ in 0..<5 where !diagnostics.isHittable { app.swipeUp() }
+        XCTAssertTrue(diagnostics.waitForExistence(timeout: 5))
+        diagnostics.tap()
+        let copy = app.buttons["diagnostics.copy"]
+        XCTAssertTrue(copy.waitForExistence(timeout: 5))
+        copy.tap()
+        XCTAssertTrue(app.buttons["Diagnostics copied"].waitForExistence(timeout: 5))
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "support-diagnostics"; shot.lifetime = .keepAlways; add(shot)
+        app.buttons["diagnostics.export"].tap()
+        let share = app.navigationBars["UIActivityContentView"]
+        XCTAssertTrue(share.waitForExistence(timeout: 10), app.debugDescription)
+        XCTAssertTrue(share.otherElements["EternalMonitor-iPad-diagnostics"].waitForExistence(timeout: 5))
+        let documentType = share.otherElements.matching(NSPredicate(format: "label BEGINSWITH %@", "Text Document")).firstMatch
+        XCTAssertTrue(documentType.waitForExistence(timeout: 5))
+        let save = app.cells["Save to Files"]
+        XCTAssertTrue(save.waitForExistence(timeout: 5), app.debugDescription)
+        XCTAssertTrue(save.isEnabled)
+        // Verify our exported attachment and share actions. The Files provider
+        // can remain uninitialized on a fresh simulator after its picker opens.
+        app.buttons["header.closeButton"].tap()
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: share)
+        waitForExpectations(timeout: 5)
+        XCTAssertTrue(app.buttons["diagnostics.export"].isEnabled)
+    }
+
     func testFrameRatePreference() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-targetFPS", "60", "-allowUSB", "NO"]

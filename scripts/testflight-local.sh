@@ -56,6 +56,7 @@ ARCHIVE_ARGS=(-project "$ROOT/ios/EternalMonitor.xcodeproj" -scheme EternalMonit
 if [ "$MODE" = dry ]; then
     ARCHIVE_ARGS+=(CODE_SIGNING_ALLOWED=NO)
 else
+    : "${ETERNAL_DIAGNOSTICS_ENDPOINT:?Set the automatic diagnostics HTTPS endpoint}" "${ETERNAL_DIAGNOSTICS_INGEST_KEY:?Set the write-only diagnostics ingest credential}"
     SDK=$(xcrun --sdk iphoneos --show-sdk-version)
     [ "${SDK%%.*}" -ge 26 ] || { echo "App Store Connect uploads require the iOS 26 SDK or later; select Xcode 26+ with DEVELOPER_DIR" >&2; exit 2; }
     TF_PRIVATE=$(mktemp -d "${TMPDIR:-/tmp}/eternal-testflight.XXXXXX")
@@ -122,16 +123,23 @@ PYPROFILE
         EXPORT_OPTIONS="$TF_PRIVATE/exportOptions.plist"
     fi
 fi
+if [ -n "${ETERNAL_DIAGNOSTICS_ENDPOINT:-}" ] || [ -n "${ETERNAL_DIAGNOSTICS_INGEST_KEY:-}" ]; then
+    : "${ETERNAL_DIAGNOSTICS_ENDPOINT:?Set both diagnostics build settings}" "${ETERNAL_DIAGNOSTICS_INGEST_KEY:?Set both diagnostics build settings}"
+    ARCHIVE_ARGS+=("ETERNAL_DIAGNOSTICS_ENDPOINT=$ETERNAL_DIAGNOSTICS_ENDPOINT" "ETERNAL_DIAGNOSTICS_INGEST_KEY=$ETERNAL_DIAGNOSTICS_INGEST_KEY")
+fi
 echo "Archiving EternalMonitor $VERSION build $BUILD, mode=$MODE"
 xcodebuild "${ARCHIVE_ARGS[@]}" archive > "$OUT/archive.log" 2>&1 || { tail -70 "$OUT/archive.log"; exit 1; }
 python3 - "$OUT/EternalMonitor.xcarchive" "$VERSION" "$BUILD" <<'PY'
-import pathlib,plistlib,sys
+import os,pathlib,plistlib,sys
 app=pathlib.Path(sys.argv[1])/'Products/Applications/EternalMonitor.app'
 info=plistlib.loads((app/'Info.plist').read_bytes())
 assert info['CFBundleShortVersionString']==sys.argv[2], info
 assert info['CFBundleVersion']==sys.argv[3], info
 assert info['UIDeviceFamily']==[2], info['UIDeviceFamily']
 assert (app/'PrivacyInfo.xcprivacy').is_file(), 'Privacy manifest was not bundled'
+if os.environ.get('ETERNAL_DIAGNOSTICS_ENDPOINT'):
+    assert info.get('DiagnosticsEndpoint') == os.environ['ETERNAL_DIAGNOSTICS_ENDPOINT'], 'Diagnostics endpoint was not bundled'
+    assert info.get('DiagnosticsIngestKey') == os.environ['ETERNAL_DIAGNOSTICS_INGEST_KEY'], 'Diagnostics ingest credential was not bundled'
 print(f'Archive verified: {sys.argv[2]} ({sys.argv[3]})')
 PY
 if [ "$MODE" = upload ]; then

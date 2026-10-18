@@ -11,6 +11,7 @@ pub static PIPELINE_STATS: Lazy<Mutex<PipelineStats>> =
 const FPS_WINDOW_SECS: f64 = 1.0;
 const HISTORY_LEN: usize = 300;
 
+#[derive(Clone)]
 pub struct PipelineStats {
     pub listen_addr: String,
     pub audio: crate::audio::AudioStats,

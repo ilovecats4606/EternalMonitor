@@ -27,19 +27,50 @@ pub(super) fn select_input(
     codec_name: &str,
     supported: &[Pixel],
 ) -> Result<Pixel, &'static str> {
-    if mode == EncoderInput::Yuv420 || codec_name == "libx264" {
+    if codec_name == "libx264" {
         return Ok(Pixel::YUV420P);
     }
-    for format in [Pixel::BGRA, Pixel::BGRZ] {
+    if mode != EncoderInput::Yuv420 {
+        for format in [Pixel::BGRA, Pixel::BGRZ] {
+            if supported.contains(&format) {
+                return Ok(format);
+            }
+        }
+    }
+    if mode == EncoderInput::Bgra {
+        return Err("The selected encoder does not accept BGRA/BGR0 input");
+    }
+    // YUV420P and NV12 are both 8-bit 4:2:0. Quick Sync accepts NV12,
+    // but not planar YUV420P, in the pinned FFmpeg 7.1 SDK.
+    for format in [Pixel::YUV420P, Pixel::NV12] {
         if supported.contains(&format) {
             return Ok(format);
         }
     }
-    if mode == EncoderInput::Bgra {
-        Err("The selected encoder does not accept BGRA/BGR0 input")
-    } else {
-        Ok(Pixel::YUV420P)
+    if supported.is_empty() {
+        return Ok(Pixel::YUV420P);
     }
+    Err("The selected encoder does not accept 8-bit YUV420P/NV12 input")
+}
+
+pub(super) fn conversion_context(
+    format: Pixel,
+    width: u32,
+    height: u32,
+) -> Result<Option<ffmpeg_next::software::scaling::Context>, ffmpeg_next::Error> {
+    if !matches!(format, Pixel::YUV420P | Pixel::NV12) {
+        return Ok(None);
+    }
+    ffmpeg_next::software::scaling::Context::get(
+        Pixel::BGRA,
+        width,
+        height,
+        format,
+        width,
+        height,
+        ffmpeg_next::software::scaling::Flags::FAST_BILINEAR,
+    )
+    .map(Some)
 }
 
 #[cfg(test)]
@@ -58,7 +89,7 @@ mod tests {
         );
         assert_eq!(
             select_input(EncoderInput::Auto, "h264_qsv", &[Pixel::NV12]),
-            Ok(Pixel::YUV420P)
+            Ok(Pixel::NV12)
         );
         assert_eq!(
             select_input(EncoderInput::Auto, "unknown", &[]),
@@ -75,5 +106,77 @@ mod tests {
         );
         assert_eq!(EncoderInput::from_env("BGRA"), Some(EncoderInput::Bgra));
         assert_eq!(EncoderInput::from_env("mistyped"), None);
+    }
+
+    #[test]
+    fn quick_sync_uses_nv12_for_default_and_auto_input() {
+        for name in ["h264_qsv", "hevc_qsv"] {
+            for mode in [EncoderInput::default(), EncoderInput::Auto] {
+                assert_eq!(
+                    select_input(mode, name, &[Pixel::NV12, Pixel::QSV]),
+                    Ok(Pixel::NV12)
+                );
+            }
+            assert!(select_input(EncoderInput::Bgra, name, &[Pixel::NV12]).is_err());
+        }
+        assert!(select_input(EncoderInput::Yuv420, "unknown", &[Pixel::QSV]).is_err());
+    }
+
+    #[test]
+    fn nv12_conversion_preserves_luma_and_interleaves_chroma() {
+        ffmpeg_next::init().unwrap();
+        let (width, height) = (96, 64);
+        let mut bgra = ffmpeg_next::frame::Video::new(Pixel::BGRA, width, height);
+        let stride = bgra.stride(0);
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let offset = y * stride + x * 4;
+                bgra.data_mut(0)[offset..offset + 4].copy_from_slice(&[
+                    (x * 2) as u8,
+                    (y * 3) as u8,
+                    (x + y) as u8,
+                    255,
+                ]);
+            }
+        }
+        let mut planar = ffmpeg_next::frame::Video::new(Pixel::YUV420P, width, height);
+        let mut nv12 = ffmpeg_next::frame::Video::new(Pixel::NV12, width, height);
+        for output in [&mut planar, &mut nv12] {
+            conversion_context(output.format(), width, height)
+                .unwrap()
+                .unwrap()
+                .run(&bgra, output)
+                .unwrap();
+        }
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                assert_eq!(
+                    nv12.data(0)[y * nv12.stride(0) + x],
+                    planar.data(0)[y * planar.stride(0) + x]
+                );
+            }
+        }
+        for y in 0..height as usize / 2 {
+            for x in 0..width as usize / 2 {
+                // swscale's planar and interleaved SIMD paths can round a
+                // chroma sample differently by one on x86.
+                assert!(
+                    nv12.data(1)[y * nv12.stride(1) + 2 * x]
+                        .abs_diff(planar.data(1)[y * planar.stride(1) + x])
+                        <= 1
+                );
+                assert!(
+                    nv12.data(1)[y * nv12.stride(1) + 2 * x + 1]
+                        .abs_diff(planar.data(2)[y * planar.stride(2) + x])
+                        <= 1
+                );
+            }
+        }
+        assert!(conversion_context(Pixel::BGRA, width, height)
+            .unwrap()
+            .is_none());
+        assert!(conversion_context(Pixel::BGRZ, width, height)
+            .unwrap()
+            .is_none());
     }
 }

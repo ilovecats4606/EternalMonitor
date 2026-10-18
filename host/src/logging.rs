@@ -2,7 +2,7 @@ use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -14,14 +14,21 @@ use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuar
 use tracing_subscriber::layer::{Context, Filter};
 use tracing_subscriber::registry::LookupSpan;
 
-const LOG_BUFFER_LIMIT: usize = 200;
+const LOG_BUFFER_LIMIT: usize = 500;
+const LOG_FILE_LIMIT: u64 = 2 * 1024 * 1024;
+const LOG_LINE_LIMIT: usize = 16 * 1024;
 const OUTPUT_BUFFER_LIMIT: usize = 256;
 const SESSION_LOG_FILE_NAME: &str = "eternal-host-session.log";
 
 static LOG_BUFFER: Lazy<Arc<Mutex<VecDeque<String>>>> =
     Lazy::new(|| Arc::new(Mutex::new(VecDeque::with_capacity(LOG_BUFFER_LIMIT))));
+static STARTUP_LOG: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static OUTPUT_ERRORS: Lazy<Mutex<Option<tracing_appender::non_blocking::ErrorCounter>>> =
+    Lazy::new(|| Mutex::new(None));
+static STORAGE_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAST_STORAGE_ERROR: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 static SESSION_LOG_PATH: Lazy<PathBuf> = Lazy::new(resolve_session_log_path);
-fn open_session_log() -> Option<File> {
+fn open_session_log() -> Option<RollingLogFile> {
     let path = SESSION_LOG_PATH.clone();
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -31,16 +38,98 @@ fn open_session_log() -> Option<File> {
         Ok(()) => true,
         Err(error) => {
             eprintln!("Could not rotate session logs: {error}");
+            note_storage_error(&error);
             false
         }
     };
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(rotated)
         .append(!rotated)
-        .open(&path)
-        .ok()
+        .open(&path);
+    if let Err(error) = &file {
+        note_storage_error(error);
+    }
+    file.ok().map(|file| RollingLogFile {
+        bytes: file.metadata().map_or(0, |m| m.len()),
+        file: Some(file),
+        path,
+        limit: LOG_FILE_LIMIT,
+    })
+}
+
+/// Rotation runs on the output worker, never on capture/transport/GUI threads.
+struct RollingLogFile {
+    file: Option<File>,
+    path: PathBuf,
+    bytes: u64,
+    limit: u64,
+}
+
+impl RollingLogFile {
+    fn write_inner(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.file.is_none() {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)?;
+            self.bytes = file.metadata()?.len();
+            self.file = Some(file);
+        }
+        if self.bytes > 0 && self.bytes + bytes.len() as u64 > self.limit {
+            self.file.take(); // Windows cannot rename an open file.
+            let rotated = rotate_session_logs(&self.path).is_ok();
+            let file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(rotated)
+                .append(!rotated)
+                .open(&self.path)?;
+            self.bytes = file.metadata()?.len();
+            self.file = Some(file);
+            if !rotated {
+                return Err(io::Error::other("Support log rotation failed"));
+            }
+        }
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Support log unavailable"))?;
+        let written = file.write(bytes)?;
+        self.bytes += written as u64;
+        Ok(written)
+    }
+}
+
+impl Write for RollingLogFile {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let result = self.write_inner(bytes);
+        if let Err(error) = &result {
+            note_storage_error(error);
+        }
+        result
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(file) = self.file.as_mut() {
+            file.flush()?;
+        }
+        Ok(())
+    }
+}
+
+fn note_storage_error(error: &io::Error) {
+    STORAGE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    *LAST_STORAGE_ERROR.lock() = Some(error.to_string());
+}
+
+pub fn redact_support_text(text: &str) -> String {
+    static SECRETS: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(
+        r#"(?i)\b(pairing_code|pairingCode|auth_token(?:_hex)?|authToken|ingest_key|write_key|token)("?\s*[=:]\s*)("[^"]*"|\[[^\]]*\]|[^\s&,;]+)"#
+    ).expect("support redaction pattern")
+    });
+    SECRETS.replace_all(text, "$1$2[REDACTED]").into_owned()
 }
 
 /// A stalled console or disk must not hold a capture, transport or GUI thread.
@@ -84,6 +173,7 @@ impl MemoryLogWriter {
         let (session_file, guard) = match open_session_log() {
             Some(file) => {
                 let (writer, guard) = non_blocking_output(file);
+                *OUTPUT_ERRORS.lock() = Some(writer.error_counter());
                 (Some(writer), Some(guard))
             }
             None => (None, None),
@@ -107,11 +197,19 @@ impl MemoryLogWriter {
             .trim_end_matches(['\r', '\n'])
             .to_string();
         self.current_line.clear();
+        let line = redact_support_text(&line);
+        crate::telemetry::record(&line);
 
         if line.is_empty() {
             return;
         }
 
+        if Arc::ptr_eq(&self.shared, &LOG_BUFFER) {
+            let mut startup = STARTUP_LOG.lock();
+            if startup.len() < 200 {
+                startup.push(line.clone());
+            }
+        }
         {
             let mut shared = self.shared.lock();
             if shared.len() >= LOG_BUFFER_LIMIT {
@@ -131,9 +229,10 @@ impl MemoryLogWriter {
 impl io::Write for MemoryLogWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         for &byte in buf {
-            self.current_line.push(byte);
             if byte == b'\n' {
                 self.push_line();
+            } else if self.current_line.len() < LOG_LINE_LIMIT {
+                self.current_line.push(byte);
             }
         }
         Ok(buf.len())
@@ -163,11 +262,54 @@ pub fn recent_log_text(limit: usize) -> Option<String> {
     )
 }
 
+fn read_log_tail(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let offset = file.metadata()?.len().saturating_sub(LOG_FILE_LIMIT);
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    file.take(LOG_FILE_LIMIT).read_to_end(&mut bytes)?;
+    // A legacy log may predate size limits. Skip its partial first line, including
+    // any secret whose field name was outside the retained tail.
+    let start = if offset > 0 {
+        bytes
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(bytes.len(), |i| i + 1)
+    } else {
+        0
+    };
+    Ok(String::from_utf8_lossy(&bytes[start..]).into_owned())
+}
+
 pub fn session_log_text() -> Option<String> {
-    match std::fs::read_to_string(session_log_path()) {
-        Ok(text) if !text.trim().is_empty() => Some(text),
-        _ => recent_log_text(LOG_BUFFER_LIMIT),
+    let dropped = OUTPUT_ERRORS
+        .lock()
+        .as_ref()
+        .map_or(0, |counter| counter.dropped_lines());
+    let storage_failures = STORAGE_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+    let storage_error = LAST_STORAGE_ERROR
+        .lock()
+        .clone()
+        .unwrap_or_else(|| "none".to_string());
+    let mut report = format!("EternalMonitor support report, schema 1\n{}\nOutput queue dropped lines: {dropped}\nStorage failures: {storage_failures}, last error: {storage_error}\nLogs may contain PC/device names and local network addresses.\n\n--- Startup evidence ---\n{}\n",
+        crate::diagnostics::system_report(), STARTUP_LOG.lock().join("\n"));
+    let path = session_log_path();
+    for suffix in [".2", ".1", ""] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        if let Ok(text) = read_log_tail(&PathBuf::from(name)) {
+            report.push_str(&format!("\n--- Log{suffix} ---\n{text}"));
+        }
     }
+    // Include queued lines that may not have reached disk yet, especially the latest error.
+    if let Some(recent) = recent_log_text(LOG_BUFFER_LIMIT) {
+        report.push_str(&format!("\n--- Recent memory log ---\n{recent}\n"));
+    }
+    report.push_str(&format!(
+        "\nAutomatic upload: {}\n",
+        crate::telemetry::status()
+    ));
+    Some(redact_support_text(&report))
 }
 
 pub fn session_log_path() -> PathBuf {
@@ -361,6 +503,157 @@ mod tests {
                 "lost {expected}"
             );
         }
+    }
+
+    #[test]
+    fn support_redacts_credentials_but_keeps_error_codes_and_session_ids() {
+        let text = r#"pairing_code=123456 auth_token_hex="00112233445566778899aabbccddeeff" token=[1, 2, 3] pairingCode:654321 status=-12909 session_id=123456 "auth_token_hex": "json-secret""#;
+        let redacted = redact_support_text(text);
+        for secret in [
+            "001122",
+            "654321",
+            "[1, 2, 3]",
+            "pairing_code=123456",
+            "json-secret",
+        ] {
+            assert!(!redacted.contains(secret), "leaked {secret}: {redacted}");
+        }
+        assert!(redacted.contains("status=-12909 session_id=123456"));
+    }
+
+    #[test]
+    fn oversized_line_is_bounded_and_does_not_leak_credential_tail() {
+        let shared = Arc::new(Mutex::new(VecDeque::new()));
+        let mut writer = MemoryLogWriter {
+            shared: shared.clone(),
+            session_file: None,
+            current_line: Vec::new(),
+        };
+        writer
+            .write_all(
+                format!(
+                    "auth_token={}\nnext event\n",
+                    "secret".repeat(LOG_LINE_LIMIT)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let lines = shared.lock();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "auth_token=[REDACTED]");
+        assert_eq!(lines[1], "next event");
+    }
+
+    #[test]
+    fn legacy_oversized_log_export_is_bounded_and_skips_partial_first_line() {
+        let path = std::env::temp_dir().join(format!(
+            "eternal-tail-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut text = "auth_token=".to_string();
+        text.push_str(&"s".repeat(LOG_FILE_LIMIT as usize));
+        text.push_str("\nlatest error status=-123\n");
+        fs::write(&path, text).unwrap();
+        assert_eq!(read_log_tail(&path).unwrap(), "latest error status=-123\n");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn storage_failure_is_visible_and_writer_can_recover() {
+        let directory = std::env::temp_dir().join(format!(
+            "eternal-storage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = directory.join("blocked");
+        fs::create_dir_all(&path).unwrap();
+        let mut output = RollingLogFile {
+            file: None,
+            path: path.clone(),
+            bytes: 0,
+            limit: 64,
+        };
+        assert!(output.write_all(b"failed\n").is_err());
+        assert!(LAST_STORAGE_ERROR.lock().is_some());
+        fs::remove_dir(&path).unwrap();
+        output.write_all(b"recovered\n").unwrap();
+        drop(output);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "recovered\n");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn running_log_rotates_by_size_and_keeps_latest_events() {
+        let dir = std::env::temp_dir().join(format!(
+            "eternal-size-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(SESSION_LOG_FILE_NAME);
+        let mut output = RollingLogFile {
+            file: Some(File::create(&path).unwrap()),
+            path: path.clone(),
+            bytes: 0,
+            limit: 64,
+        };
+        for n in 0..100 {
+            writeln!(output, "event-{n:03}").unwrap();
+        }
+        output.flush().unwrap();
+        drop(output);
+        assert!(fs::read_to_string(&path).unwrap().contains("event-099"));
+        let files: Vec<_> = fs::read_dir(&dir).unwrap().map(Result::unwrap).collect();
+        assert_eq!(files.len(), 3);
+        for file in files {
+            assert!(file.metadata().unwrap().len() <= 64);
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn native_ffmpeg_errors_include_formatted_driver_details_in_support_logs() {
+        use tracing_subscriber::prelude::*;
+        let shared = Arc::new(Mutex::new(VecDeque::new()));
+        let writer = MemoryLogWriter {
+            shared: shared.clone(),
+            session_file: None,
+            current_line: Vec::new(),
+        };
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(move || writer.clone()),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            crate::diagnostics::install_ffmpeg_logging();
+            let format =
+                std::ffi::CString::new("support driver probe status=%d device=%s\n").unwrap();
+            let device = std::ffi::CString::new("test-gpu").unwrap();
+            unsafe {
+                ffmpeg_next::ffi::av_log(
+                    std::ptr::null_mut(),
+                    ffmpeg_next::ffi::AV_LOG_ERROR,
+                    format.as_ptr(),
+                    -123i32,
+                    device.as_ptr(),
+                );
+            }
+        });
+        assert!(shared
+            .lock()
+            .iter()
+            .any(|line| line.contains("support driver probe status=-123 device=test-gpu")));
     }
 
     struct BlockedOutput {

@@ -159,6 +159,18 @@ struct SettingsView: View {
                 .listRowBackground(Theme.surfaceRaised)
 
                 Section {
+                    NavigationLink {
+                        DiagnosticsView()
+                    } label: {
+                        rowLabel("Diagnostics", "doc.text.magnifyingglass")
+                    }
+                    .accessibilityIdentifier("settings.diagnostics")
+                } header: {
+                    sectionHeader("Support")
+                }
+                .listRowBackground(Theme.surfaceRaised)
+
+                Section {
                     HStack(spacing: 14) {
                         LogoMark(size: 40)
                         VStack(alignment: .leading, spacing: 2) {

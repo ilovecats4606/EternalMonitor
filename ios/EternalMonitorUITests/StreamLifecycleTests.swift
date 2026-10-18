@@ -77,6 +77,9 @@ final class StreamLifecycleTests: XCTestCase {
     }
 
     private func capture(_ name: String, app: XCUIApplication) {
+        // "On air" marks the first decoded frame. Its display view can still
+        // be fading in, which darkens the pattern in an immediate screenshot.
+        Thread.sleep(forTimeInterval: 1)
         let attachment = XCTAttachment(screenshot: app.screenshot())
         attachment.name = name
         attachment.lifetime = .keepAlways

@@ -108,6 +108,7 @@ fn amf_opens(name: &str) -> bool {
 struct StageRun {
     packets: Vec<NALUnit>,
     software_fallback: bool,
+    codec_name: String,
 }
 
 /// Feeds `FRAME_COUNT` frames through a fresh encode stage at
@@ -167,9 +168,11 @@ fn run_stage(
     }
     let packets = collector.join().unwrap();
     assert!(!packets.is_empty(), "{encoder} produced no packets");
+    let stats = PIPELINE_STATS.lock();
     StageRun {
         packets,
-        software_fallback: PIPELINE_STATS.lock().using_software_fallback,
+        software_fallback: stats.using_software_fallback,
+        codec_name: stats.codec_name.clone(),
     }
 }
 
@@ -328,8 +331,32 @@ fn software_encoder_follows_capture_mode_changes() {
 fn software_encoder_honours_keyframe_requests() {
     let _guard = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let run = run_stage("libx264", |_| LARGE, Some(KEYFRAME_REQUEST_AT));
+    assert!(
+        !run.software_fallback,
+        "explicit CPU selection is not a fallback"
+    );
+    assert_eq!(run.codec_name, "H.264 (x264)");
     assert_h264_keyframe(&run.packets[0], "the first packet");
     assert_keyframe_on_request(&run, Id::H264);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires the NVIDIA/AMD reference PC without an Intel GPU"]
+fn unavailable_quick_sync_uses_another_gpu_and_decodes() {
+    let _guard = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let run = run_stage("h264_qsv", |_| LARGE, None);
+    assert!(!run.software_fallback, "fell straight from QSV to CPU");
+    assert_eq!(run.codec_name, "H.264 (NVENC)");
+    assert_h264_keyframe(&run.packets[0], "the first packet");
+    let pictures = decode(Id::H264, &run.packets.iter().collect::<Vec<_>>());
+    assert!(pictures.len() >= 30, "GPU fallback did not sustain video");
+    assert!(pictures.windows(2).all(|pair| pair[0].2 < pair[1].2));
+    eprintln!(
+        "Unavailable QSV recovered through {} and decoded {} packets",
+        run.codec_name,
+        run.packets.len()
+    );
 }
 
 #[test]

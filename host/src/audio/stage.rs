@@ -163,7 +163,9 @@ impl CaptureSession {
                 Ok(()) => self.mark_discontinuity = false,
                 Err(TrySendError::Full(_)) => {
                     self.mark_discontinuity = true;
-                    PIPELINE_STATS.lock().audio.dropped += 1;
+                    let mut stats = PIPELINE_STATS.lock();
+                    stats.audio.dropped += 1;
+                    stats.audio.capture_queue_dropped += 1;
                 }
                 Err(TrySendError::Closed(_)) => return Ok(false),
             }
@@ -254,10 +256,12 @@ pub fn run_audio_stage(
         }
         if Instant::now() >= next_log {
             next_log = Instant::now() + Duration::from_secs(1);
-            let stats = PIPELINE_STATS.lock();
-            tracing::info!(device = %stats.audio.device, kbps = stats.audio.kbps,
-                packets_per_sec = stats.audio.packets_per_sec, quiet_packets = stats.audio.quiet_packets,
-                dropped = stats.audio.dropped, "Audio stream stats");
+            let stats = PIPELINE_STATS.lock().audio.clone();
+            tracing::info!(device = %stats.device, kbps = stats.kbps,
+                packets_per_sec = stats.packets_per_sec, quiet_packets = stats.quiet_packets,
+                dropped = stats.dropped, capture_queue_dropped = stats.capture_queue_dropped,
+                stale_dropped = stats.stale_dropped, oversized_dropped = stats.oversized_dropped,
+                send_failed = stats.send_failed, "Audio stream stats");
         }
     }
     drop(active);

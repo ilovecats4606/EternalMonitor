@@ -1171,6 +1171,7 @@ checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 name = "eternal-host"
 version = "0.3.0"
 dependencies = [
+ "cc",
  "eframe",
  "egui_kittest",
  "eternal-wire",
@@ -1180,8 +1181,10 @@ dependencies = [
  "mdns-sd",
  "once_cell",
  "parking_lot",
+ "pkg-config",
  "plist",
  "qrcode",
+ "regex",
  "semver",
  "serde",
  "serde_json",
