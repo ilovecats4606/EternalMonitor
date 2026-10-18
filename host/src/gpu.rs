@@ -1,4 +1,5 @@
 use tracing::{info, warn};
+use windows::core::Interface;
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
 
 const VENDOR_NVIDIA: u32 = 0x10DE;
@@ -103,12 +104,33 @@ fn detect_from_dxgi() -> Result<GpuInfo, Box<dyn std::error::Error>> {
         );
         let vendor = GpuVendor::from_vendor_id(desc.VendorId);
         let vram_mb = desc.DedicatedVideoMemory as u64 / (1024 * 1024);
+        let driver_version = match unsafe {
+            adapter.CheckInterfaceSupport(&windows::Win32::Graphics::Dxgi::IDXGIDevice::IID)
+        } {
+            Ok(version) => {
+                let version = version as u64;
+                format!(
+                    "{}.{}.{}.{}",
+                    version >> 48,
+                    (version >> 32) & 0xffff,
+                    (version >> 16) & 0xffff,
+                    version & 0xffff
+                )
+            }
+            Err(error) => format!("unavailable: {error}"),
+        };
 
         info!(
             adapter_index = index,
             name = %name,
             vendor = %vendor,
             vram_mb,
+            vendor_id = desc.VendorId,
+            device_id = desc.DeviceId,
+            subsystem_id = desc.SubSysId,
+            revision = desc.Revision,
+            shared_memory_mb = desc.SharedSystemMemory / (1024 * 1024),
+            driver_version,
             "Found GPU adapter"
         );
 

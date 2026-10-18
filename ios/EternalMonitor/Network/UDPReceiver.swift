@@ -99,17 +99,17 @@ final class UDPReceiver: MediaLink {
             switch state {
             case .ready:
                 let actualPort = self.localPort() ?? 0
-                print("[UDPReceiver] NW socket ready, ephemeral port \(actualPort)")
+                SupportDiagnostics.shared.record("info", "udp", "backend=Network.framework local_port=\(actualPort)")
                 self.onListenerReady?(actualPort)
                 guard self.connection === connection else { return }
                 self.onConnectionEstablished?()
                 self.startRepairTimer()
                 self.receiveLoop()
             case .waiting(let error):
-                print("[UDPReceiver] Connection waiting: \(error)")
+                SupportDiagnostics.shared.record("warning", "udp", "Network.framework waiting: \(error)")
                 self.onError?("UDP path not ready: \(error.localizedDescription)")
             case .failed(let error):
-                print("[UDPReceiver] Connection failed: \(error)")
+                SupportDiagnostics.shared.record("error", "udp", "Network.framework failed: \(error)")
                 self.onError?("UDP connection failed: \(error.localizedDescription)")
                 self.stopOnQueue()
             case .cancelled:
@@ -178,7 +178,7 @@ final class UDPReceiver: MediaLink {
             readSource = source
             source.resume()
             let actualPort = localPort() ?? 0
-            print("[UDPReceiver] BSD socket ready, ephemeral port \(actualPort), SO_RCVBUF=\(receiveBufferBytes)")
+            SupportDiagnostics.shared.record("info", "udp", "backend=bsd address_family=\(info.ai_family) local_port=\(actualPort) SO_RCVBUF=\(receiveBufferBytes)")
             onListenerReady?(actualPort)
             onConnectionEstablished?()
             startRepairTimer()
@@ -293,7 +293,7 @@ final class UDPReceiver: MediaLink {
             guard let self, let connection, self.connection === connection else { return }
 
             if let error {
-                print("[UDPReceiver] Receive error: \(error)")
+                SupportDiagnostics.shared.record("error", "udp", "Network.framework receive: \(error)")
                 // A transient error (ICMP port-unreachable while the host
                 // restarts its pipeline, a path blip) must not silently kill
                 // reception forever — re-arm after a short delay as long as the

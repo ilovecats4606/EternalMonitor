@@ -8,6 +8,7 @@ struct EternalMonitorApp: App {
 
     init() {
         FontRegistry.shared.registerBundledFonts()
+        SupportDiagnostics.shared.recordDeviceSnapshot()
     }
 
     var body: some Scene {
@@ -33,11 +34,19 @@ struct EternalMonitorApp: App {
                 .onChange(of: settings.playPCaudio) { _, enabled in
                     connectionManager.refreshAudioPreference(enabled)
                 }
+                .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
+                    SupportDiagnostics.shared.record("warning", "device", "Memory warning")
+                }
+                .onReceive(NotificationCenter.default.publisher(for: ProcessInfo.thermalStateDidChangeNotification)) { _ in
+                    SupportDiagnostics.shared.record("warning", "device", "Thermal state changed to \(ProcessInfo.processInfo.thermalState.rawValue)")
+                }
                 .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
+                    DiagnosticsUpload.shared.flushSoon()
                     connectionManager.prepareForBackground()
                 }
         }
         .onChange(of: scenePhase) { _, phase in
+            SupportDiagnostics.shared.record("info", "lifecycle", "scene=\(phase)")
             E2E.emit("E2E_SCENE phase=\(phase) uptime=\(ProcessInfo.processInfo.systemUptime)")
             // A backgrounded app cannot keep receiving UDP; tell the host
             // goodbye so it stops streaming (and can tear the virtual display

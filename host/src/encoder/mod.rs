@@ -70,7 +70,7 @@ fn run_encode_loop(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Apply GUI encoder override at pipeline start. The override is consulted only here;
     // mid-stream changes don't take effect until the user requests a Restart.
-    let (mut encoder_name, mut codec_display_name) = {
+    let (mut encoder_name, codec_display_name) = {
         let override_name = shared.encoder_override.lock().clone();
         match override_name {
             Some(name) if ffmpeg_next::encoder::find_by_name(&name).is_some() => {
@@ -247,30 +247,26 @@ fn run_encode_loop(
                     continue;
                 }
                 Err(e) if encoder_name != "libx264" => {
-                    // A hardware encoder (commonly AMF) can fail to *open* even though it is
-                    // compiled into FFmpeg — driver hiccup, AMF runtime busy/missing, transient
-                    // device loss. Fall back to software once so streaming keeps a picture
-                    // instead of the whole encode thread dying.
                     warn!(
                         encoder = %encoder_name,
                         error = %e,
-                        "Encoder failed to open — falling back to libx264 (software)"
+                        "Preferred encoder failed to open; trying remaining encoders"
                     );
-                    encoder_name = "libx264".to_string();
-                    codec_display_name = "H.264 (x264)".to_string();
-                    {
-                        let mut stats = PIPELINE_STATS.lock();
-                        stats.set_codec_name(&codec_display_name);
-                        stats.set_software_fallback(true);
-                    }
-                    encoder_state = Some(EncoderState::new(
-                        &encoder_name,
-                        raw_frame.width,
-                        raw_frame.height,
-                        desired_bitrate,
-                        target_fps,
-                        input_mode,
-                    )?);
+                    let (name, state) = open_remaining_encoders(&encoder_name, |name| {
+                        EncoderState::new(
+                            name,
+                            raw_frame.width,
+                            raw_frame.height,
+                            desired_bitrate,
+                            target_fps,
+                            input_mode,
+                        )
+                    })?;
+                    encoder_name = name.to_string();
+                    encoder_state = Some(state);
+                    PIPELINE_STATS
+                        .lock()
+                        .set_software_fallback(encoder_name == "libx264");
                     note_encoder_opened(&shared, &encoder_name);
                 }
                 Err(e) => return Err(e),
@@ -609,6 +605,8 @@ impl EncoderState {
         target_fps: u32,
         input_mode: EncoderInput,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        info!(encoder = encoder_name, width, height, bitrate_bps, target_fps,
+            input = ?input_mode, "Opening encoder session");
         let legacy_pts = std::env::var("ETERNAL_LEGACY_PTS").is_ok_and(|v| v.trim() == "1");
         let codec = ffmpeg_next::encoder::find_by_name(encoder_name)
             .ok_or_else(|| format!("{} codec not found in FFmpeg", encoder_name))?;
@@ -623,6 +621,7 @@ impl EncoderState {
             }
             formats
         };
+        info!(encoder = encoder_name, advertised_formats = ?supported, input = ?input_mode, "Encoder advertised input formats");
         let pixel_format = select_input(input_mode, encoder_name, &supported)?;
         let context = ffmpeg_next::codec::Context::new_with_codec(codec);
         let mut encoder = context.encoder().video()?;
@@ -654,7 +653,10 @@ impl EncoderState {
 
         let opts = encoder_options(encoder_name);
 
-        let encoder = encoder.open_with(opts)?;
+        let encoder = encoder.open_with(opts).map_err(|error| {
+            let code: i32 = error.into();
+            format!("{encoder_name} open failed: FFmpeg code={code} error={error}; {width}x{height} input={pixel_format:?} bitrate={bitrate_bps} fps={target_fps}")
+        })?;
         log_encoder_configuration(encoder_name, &encoder);
         info!(
             width,
@@ -668,22 +670,10 @@ impl EncoderState {
         let mut h264 = H264BitstreamState::default();
         h264.refresh_parameter_sets_from_extradata(encoder_extradata(&encoder));
 
-        let scaler = if pixel_format == ffmpeg_next::format::Pixel::YUV420P {
-            Some(ffmpeg_next::software::scaling::Context::get(
-                ffmpeg_next::format::Pixel::BGRA,
-                width,
-                height,
-                ffmpeg_next::format::Pixel::YUV420P,
-                width,
-                height,
-                // 1:1 scale — the "filter" only converts colorspace, so take the fast path.
-                ffmpeg_next::software::scaling::Flags::FAST_BILINEAR,
-            )?)
-        } else {
-            None
-        };
+        let scaler = input::conversion_context(pixel_format, width, height)?;
+        let needs_conversion = scaler.is_some();
         if scaler.is_some() {
-            info!("swscale BGRA->YUV420P context created");
+            info!(output = ?pixel_format, "swscale BGRA conversion context created");
         }
 
         Ok(Self {
@@ -704,7 +694,7 @@ impl EncoderState {
             },
             encoder,
             scaler,
-            bgra_frame: (pixel_format == ffmpeg_next::format::Pixel::YUV420P).then(|| {
+            bgra_frame: needs_conversion.then(|| {
                 ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::BGRA, width, height)
             }),
             frame: ffmpeg_next::frame::Video::new(pixel_format, width, height),
@@ -737,6 +727,31 @@ impl EncoderState {
             diagnostics.observe_packet(normalized_packet, sequence, packet_is_key, is_keyframe);
         }
     }
+}
+
+/// A compiled-in encoder may have no usable device or driver. Try each other
+/// Windows backend once before using the CPU. Explicit software selection
+/// never enters this path, and non-Windows backends keep their own fallback.
+fn open_remaining_encoders<T>(
+    failed: &str,
+    mut open: impl FnMut(&str) -> Result<T, Box<dyn std::error::Error + Send + Sync>>,
+) -> Result<(&'static str, T), Box<dyn std::error::Error + Send + Sync>> {
+    let hardware: &[&str] = if matches!(failed, "h264_nvenc" | "h264_amf" | "h264_qsv") {
+        &["h264_nvenc", "h264_amf", "h264_qsv"]
+    } else {
+        &[]
+    };
+    for &name in hardware {
+        if name == failed {
+            continue;
+        }
+        match open(name) {
+            Ok(state) => return Ok((name, state)),
+            Err(error) => warn!(encoder = name, %error, "Hardware encoder did not open"),
+        }
+    }
+    warn!("No hardware encoder opened; falling back to libx264 (software)");
+    open("libx264").map(|state| ("libx264", state))
 }
 
 /// The H.265 sibling of an H.264 encoder name, if one exists.
@@ -1367,6 +1382,57 @@ fn find_ffmpeg_exe() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_tries_other_hardware_before_software() {
+        let mut attempts = Vec::new();
+        let (selected, ()) = open_remaining_encoders("h264_nvenc", |name| {
+            attempts.push(name.to_string());
+            match name {
+                "h264_qsv" => Ok(()),
+                _ => Err("device unavailable".into()),
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, ["h264_amf", "h264_qsv"]);
+        assert_eq!(selected, "h264_qsv");
+    }
+
+    #[test]
+    fn startup_uses_software_only_after_all_other_hardware_fails() {
+        for failed in ["h264_nvenc", "h264_amf", "h264_qsv"] {
+            let mut attempts = Vec::new();
+            let (selected, ()) = open_remaining_encoders(failed, |name| {
+                attempts.push(name.to_string());
+                if name == "libx264" {
+                    Ok(())
+                } else {
+                    Err("device unavailable".into())
+                }
+            })
+            .unwrap();
+            assert_eq!(selected, "libx264");
+            assert_eq!(attempts.len(), 3);
+            assert!(!attempts.iter().any(|name| name == failed));
+            assert_eq!(attempts.last().unwrap(), "libx264");
+        }
+        assert!(open_remaining_encoders::<()>("h264_amf", |_| {
+            Err("no encoder can open".into())
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn non_windows_backends_keep_their_software_fallback() {
+        let mut attempts = Vec::new();
+        let (selected, ()) = open_remaining_encoders("h264_videotoolbox", |name| {
+            attempts.push(name.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(selected, "libx264");
+        assert_eq!(attempts, ["libx264"]);
+    }
 
     #[test]
     fn software_bitrate_changes_preserve_decoding_and_reduce_packet_size() {

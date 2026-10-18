@@ -1,3 +1,14 @@
+## EternalMonitor unreleased
+
+- Windows and iPad can share diagnostics automatically with support, queue events while offline and retry after reconnecting. Automatic sharing can be disabled in Settings.
+
+- Windows and iPad now retain bounded support logs across launches, including device/build details, encoder/decoder errors and stream summaries. Export iPad reports from Settings → Diagnostics. Windows Copy logs includes native FFmpeg driver errors and removes pairing credentials.
+
+- Fix Intel Quick Sync startup by converting capture frames to its supported
+  NV12 input format for H.264 and HEVC.
+- Try the other Windows hardware encoders when the preferred encoder cannot
+  open, before falling back to CPU encoding. Record each failure in the host log.
+
 ## EternalMonitor v0.3.0
 
 v0.3.0 is the current stable release. Install the Windows app with iPad

@@ -30,6 +30,8 @@ jobs:
     timeout-minutes: 60
     env:
       LIBCLANG_PATH: C:\Program Files\LLVM\bin
+      ETERNAL_DIAGNOSTICS_ENDPOINT: ${{ secrets.ETERNAL_DIAGNOSTICS_ENDPOINT }}
+      ETERNAL_DIAGNOSTICS_INGEST_KEY: ${{ secrets.ETERNAL_DIAGNOSTICS_INGEST_KEY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -89,7 +91,11 @@ jobs:
 
       - name: Build the installer
         shell: pwsh
-        run: .\scripts\build-installer.ps1
+        run: |
+          if (!$env:ETERNAL_DIAGNOSTICS_ENDPOINT -or !$env:ETERNAL_DIAGNOSTICS_INGEST_KEY) {
+              throw "Release diagnostics endpoint and ingest credential must be configured."
+          }
+          .\scripts\build-installer.ps1
 
       - name: Compute SHA-256
         id: hash

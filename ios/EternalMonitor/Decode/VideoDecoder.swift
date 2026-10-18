@@ -20,6 +20,11 @@ private let verboseDecodeLogging = false
 final class VideoDecoder {
     var onFrameDecoded: ((_ pixelBuffer: CVPixelBuffer, _ timestampUs: UInt64) -> Void)?
     var onEvent: ((String) -> Void)?
+
+    private func reportFailure(_ message: String) {
+        SupportDiagnostics.shared.record("error", "decode", message)
+        onEvent?(message)
+    }
     /// The decoder cannot make progress until the next keyframe (session died, decode error).
     /// Protocol v2 turns this into a keyframe request to the host.
     var onNeedsKeyframe: (() -> Void)?
@@ -262,7 +267,7 @@ final class VideoDecoder {
             )
         }
         guard status == noErr, let newFormat else {
-            onEvent?("Failed to create HEVC format description status=\(status)")
+            reportFailure("Failed to create HEVC format description status=\(status)")
             return
         }
         adoptFormatDescription(
@@ -376,7 +381,7 @@ final class VideoDecoder {
 
         guard status == noErr, let newFormat else {
             print("[VideoDecoder] Failed to create format description: \(status)")
-            onEvent?("Failed to create H.264 format description status=\(status)")
+            reportFailure("Failed to create H.264 format description status=\(status)")
             return
         }
 
@@ -390,7 +395,8 @@ final class VideoDecoder {
         }
 
         formatDescription = newFormat
-        onEvent?("Updated format description \(detail)")
+        let dimensions = CMVideoFormatDescriptionGetDimensions(newFormat)
+        onEvent?("Updated format description codec=\(codec) size=\(dimensions.width)x\(dimensions.height) \(detail)")
 
         // Adopt a compatible format change without rebuilding the hardware decoder;
         // only an incompatible change (e.g. resolution switch) costs a session rebuild.
@@ -434,26 +440,29 @@ final class VideoDecoder {
 
         guard status == noErr, let session else {
             print("[VideoDecoder] Failed to create decompression session: \(status)")
-            onEvent?("Failed to create VideoToolbox session status=\(status)")
+            reportFailure("Failed to create VideoToolbox session status=\(status)")
             return
         }
 
-        VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue!)
+        let realTimeStatus = VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue!)
+        if realTimeStatus != noErr { reportFailure("VideoToolbox real-time property status=\(realTimeStatus)") }
 
-        var usingHardware: CFTypeRef?
-        VTSessionCopyProperty(
+        var usingHardware: Unmanaged<CFTypeRef>?
+        let hardwareStatus = VTSessionCopyProperty(
             session,
             key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
             allocator: kCFAllocatorDefault,
             valueOut: &usingHardware
         )
-        let hardware = (usingHardware as? Bool) == true
+        let hardware = (usingHardware?.takeRetainedValue() as? Bool) == true
+        let hardwareKind = hardwareStatus == noErr ? (hardware ? "hardware" : "software") : "unknown"
         decompressionSession = session
         recoveryGeneration &+= 1
         waitingForSyncSample = true
-        onEvent?("VideoToolbox session ready (\(hardware ? "hardware" : "software") decoder)")
+        let dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription)
+        onEvent?("VideoToolbox session ready (\(hardwareKind) decoder) hardware_query_status=\(hardwareStatus) codec=\(codec) size=\(dimensions.width)x\(dimensions.height)")
         if E2E.enabled {
-            E2E.emit("E2E_DECODER kind=\(hardware ? "hw" : "sw")")
+            E2E.emit("E2E_DECODER kind=\(hardwareStatus == noErr ? (hardware ? "hw" : "sw") : "unknown")")
         }
     }
 
@@ -489,10 +498,12 @@ final class VideoDecoder {
 
         // Create CMBlockBuffer
         var blockBuffer: CMBlockBuffer?
+        var blockStatus: OSStatus = noErr
+        var replaceStatus: OSStatus = noErr
         let totalLen = avccData.count
         avccData.withUnsafeMutableBytes { rawBuffer in
             guard let ptr = rawBuffer.baseAddress else { return }
-            CMBlockBufferCreateWithMemoryBlock(
+            blockStatus = CMBlockBufferCreateWithMemoryBlock(
                 allocator: kCFAllocatorDefault,
                 memoryBlock: nil,
                 blockLength: totalLen,
@@ -504,7 +515,7 @@ final class VideoDecoder {
                 blockBufferOut: &blockBuffer
             )
             if let blockBuffer {
-                CMBlockBufferReplaceDataBytes(
+                replaceStatus = CMBlockBufferReplaceDataBytes(
                     with: ptr,
                     blockBuffer: blockBuffer,
                     offsetIntoDestination: 0,
@@ -513,15 +524,15 @@ final class VideoDecoder {
             }
         }
 
-        guard let blockBuffer else {
-            onEvent?("Failed to allocate block buffer for access unit bytes=\(totalLen)")
+        guard blockStatus == noErr, replaceStatus == noErr, let blockBuffer else {
+            reportFailure("Failed to allocate block buffer for access unit bytes=\(totalLen) status=\(blockStatus) replace_status=\(replaceStatus)")
             return
         }
 
         // Create CMSampleBuffer
         var sampleBuffer: CMSampleBuffer?
         var sampleSize = totalLen
-        CMSampleBufferCreateReady(
+        let sampleStatus = CMSampleBufferCreateReady(
             allocator: kCFAllocatorDefault,
             dataBuffer: blockBuffer,
             formatDescription: formatDescription,
@@ -533,8 +544,8 @@ final class VideoDecoder {
             sampleBufferOut: &sampleBuffer
         )
 
-        guard let sampleBuffer else {
-            onEvent?("Failed to create sample buffer for access unit bytes=\(totalLen)")
+        guard sampleStatus == noErr, let sampleBuffer else {
+            reportFailure("Failed to create sample buffer for access unit bytes=\(totalLen) status=\(sampleStatus)")
             return
         }
 
@@ -608,7 +619,7 @@ final class VideoDecoder {
                                           onSyncSample: Bool) {
         guard !isShutdown, generation == recoveryGeneration, !waitingForSyncSample else { return }
         waitingForSyncSample = true
-        onEvent?("\(source) status=\(status); waiting for a keyframe")
+        reportFailure("\(source) status=\(status) codec=\(codec) depth=\(decodeDepth) generation=\(generation) sync=\(onSyncSample); waiting for a keyframe")
         if status == kVTInvalidSessionErr || onSyncSample {
             // The session died underneath us (typical after app backgrounding),
             // or it rejected a keyframe: a session in that state rejected every

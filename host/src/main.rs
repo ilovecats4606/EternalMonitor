@@ -32,6 +32,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(memory_layer)
         .init();
 
+    let _uploads = eternal_host::telemetry::UploadGuard::start();
+
     info!(
         path = %logging::session_log_path().display(),
         "Session log file initialized"
@@ -49,6 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
+            error!(panic = %info, backtrace = %std::backtrace::Backtrace::force_capture(), "Host panic");
             vdd::disable();
             default_hook(info);
         }));
@@ -64,6 +67,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         error!(error = %e, "FFmpeg init failed");
         return Err(e.into());
     }
+    eternal_host::diagnostics::install_ffmpeg_logging();
+    eternal_host::diagnostics::log_system_report();
 
     let gpu_info = gpu::GpuInfo::detect();
 
@@ -182,6 +187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let (supervisor_tx, supervisor_rx) = mpsc::channel();
+    let _diagnostics = eternal_host::diagnostics::Monitor::start(shared.clone());
     let gui_control = GuiControl {
         shared: shared.clone(),
         supervisor_tx: supervisor_tx.clone(),

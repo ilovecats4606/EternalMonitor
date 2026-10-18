@@ -55,6 +55,8 @@
     <array>
         <string>_eternaldisplay._udp</string>
     </array>
+    <key>DiagnosticsEndpoint</key><string>$(ETERNAL_DIAGNOSTICS_ENDPOINT)</string>
+    <key>DiagnosticsIngestKey</key><string>$(ETERNAL_DIAGNOSTICS_INGEST_KEY)</string>
     <key>NSCameraUsageDescription</key>
     <string>Scan the QR code shown in EternalMonitor on your PC to connect without typing its address.</string>
 </dict>

@@ -55,6 +55,29 @@ final class ConnectScreenTests: XCTestCase {
         waitForExpectations(timeout: 5)
     }
 
+    func testDiagnosticsCanBeCopiedAndSharedWithoutAConnection() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO"]
+        app.launch()
+        XCTAssertTrue(app.buttons["settings.button"].waitForExistence(timeout: 10))
+        app.buttons["settings.button"].tap()
+        let diagnostics = app.buttons["settings.diagnostics"]
+        for _ in 0..<5 where !diagnostics.isHittable { app.swipeUp() }
+        XCTAssertTrue(diagnostics.waitForExistence(timeout: 5))
+        diagnostics.tap()
+        let copy = app.buttons["diagnostics.copy"]
+        XCTAssertTrue(copy.waitForExistence(timeout: 5))
+        copy.tap()
+        XCTAssertTrue(app.buttons["Diagnostics copied"].waitForExistence(timeout: 5))
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "support-diagnostics"; shot.lifetime = .keepAlways; add(shot)
+        app.buttons["diagnostics.export"].tap()
+        let save = app.cells["Save to Files"]
+        XCTAssertTrue(save.waitForExistence(timeout: 5), app.debugDescription)
+        save.tap()
+        XCTAssertTrue(app.buttons["Save"].waitForExistence(timeout: 5), app.debugDescription)
+    }
+
     func testFrameRatePreference() {
         let app = XCUIApplication()
         app.launchArguments = ["-didSeeOnboarding", "YES", "-targetFPS", "60", "-allowUSB", "NO"]
