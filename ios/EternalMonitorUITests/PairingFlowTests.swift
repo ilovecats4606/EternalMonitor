@@ -29,8 +29,7 @@ final class PairingFlowTests: XCTestCase {
         XCTAssertTrue(app.buttons["display.disconnect"].waitForExistence(timeout: 10))
         XCTAssertFalse(input.exists)
         capture("pairing-connected", app: app)
-        app.buttons["display.disconnect"].tap()
-        XCTAssertTrue(app.textFields["connect.host"].waitForExistence(timeout: 5))
+        disconnect(app)
         XCTAssertTrue(app.images["recent.paired"].firstMatch.exists)
         app.terminate()
         // A new process must obtain its token from Keychain and skip the sheet.
@@ -38,6 +37,8 @@ final class PairingFlowTests: XCTestCase {
         XCTAssertTrue(app.buttons["display.disconnect"].waitForExistence(timeout: 10))
         XCTAssertFalse(input.exists)
         capture("pairing-token-reconnect", app: app)
+        if !app.buttons["display.settings"].exists { app.tap() }
+        XCTAssertTrue(app.buttons["display.settings"].waitForExistence(timeout: 5))
         app.buttons["display.settings"].tap()
         XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5))
         let forget = app.buttons["settings.forgetPairings"]
@@ -45,12 +46,26 @@ final class PairingFlowTests: XCTestCase {
         XCTAssertTrue(forget.isHittable)
         forget.tap()
         app.buttons["settings.done"].tap()
-        app.buttons["display.disconnect"].tap()
+        disconnect(app)
         app.terminate()
         app.launch()
         XCTAssertTrue(input.waitForExistence(timeout: 10), "Forget paired hosts must require a code again")
         app.buttons["pairing.cancel"].tap()
         app.terminate()
+    }
+
+    private func disconnect(_ app: XCUIApplication) {
+        let connect = app.textFields["connect.host"]
+        // Capturing evidence can outlast the HUD's auto-hide timer on CI.
+        // A tap during dismissal reveals the HUD instead of disconnecting.
+        for _ in 0..<2 {
+            let button = app.buttons["display.disconnect"]
+            if !button.exists { app.tap() }
+            XCTAssertTrue(button.waitForExistence(timeout: 5))
+            button.tap()
+            if connect.waitForExistence(timeout: 5) { return }
+        }
+        XCTFail("Disconnect did not return to the connection screen")
     }
 
     private func capture(_ name: String, app: XCUIApplication) {
