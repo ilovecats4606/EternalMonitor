@@ -72,10 +72,20 @@ final class ConnectScreenTests: XCTestCase {
         let shot = XCTAttachment(screenshot: app.screenshot())
         shot.name = "support-diagnostics"; shot.lifetime = .keepAlways; add(shot)
         app.buttons["diagnostics.export"].tap()
+        let share = app.navigationBars["UIActivityContentView"]
+        XCTAssertTrue(share.waitForExistence(timeout: 10), app.debugDescription)
+        XCTAssertTrue(share.otherElements["EternalMonitor-iPad-diagnostics"].waitForExistence(timeout: 5))
+        let documentType = share.otherElements.matching(NSPredicate(format: "label BEGINSWITH %@", "Text Document")).firstMatch
+        XCTAssertTrue(documentType.waitForExistence(timeout: 5))
         let save = app.cells["Save to Files"]
         XCTAssertTrue(save.waitForExistence(timeout: 5), app.debugDescription)
-        save.tap()
-        XCTAssertTrue(app.buttons["Save"].waitForExistence(timeout: 5), app.debugDescription)
+        XCTAssertTrue(save.isEnabled)
+        // Verify our exported attachment and share actions. The Files provider
+        // can remain uninitialized on a fresh simulator after its picker opens.
+        app.buttons["header.closeButton"].tap()
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: share)
+        waitForExpectations(timeout: 5)
+        XCTAssertTrue(app.buttons["diagnostics.export"].isEnabled)
     }
 
     func testFrameRatePreference() {
