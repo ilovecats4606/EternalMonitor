@@ -59,6 +59,10 @@ pub struct AudioStats {
     pub packets: u64,
     pub quiet_packets: u64,
     pub dropped: u64,
+    pub capture_queue_dropped: u64,
+    pub stale_dropped: u64,
+    pub oversized_dropped: u64,
+    pub send_failed: u64,
     samples: VecDeque<(Instant, usize)>,
 }
 
@@ -73,6 +77,10 @@ impl Default for AudioStats {
             packets: 0,
             quiet_packets: 0,
             dropped: 0,
+            capture_queue_dropped: 0,
+            stale_dropped: 0,
+            oversized_dropped: 0,
+            send_failed: 0,
             samples: VecDeque::with_capacity(64),
         }
     }

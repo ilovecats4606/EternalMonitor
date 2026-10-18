@@ -420,6 +420,10 @@ pub async fn start_sender(
 
                 let mut frame_pacer = FramePacer::new(frag_count_usize, Instant::now());
                 for (index, datagram) in stored.iter().enumerate() {
+                    // A busy machine can exhaust the pacing budget mid-frame.
+                    // Keep serving audio even when there are no more pauses;
+                    // otherwise a large IDR can fill its 60 ms capture queue.
+                    audio_sender.send_queued(&mut audio_rx, &links, &shared, stream_epoch).await;
                     if target_addr.link == LinkId::Udp && fault.enabled() {
                         for due in fault.push(datagram, Instant::now()) {
                             if let Err(e) = links.send_to(&due, target_addr).await {
