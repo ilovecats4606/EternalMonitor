@@ -25,7 +25,7 @@ one, update the other.
 ## Step 1: Install EternalMonitor on your PC
 
 1. Go to [eternalmonitor.dev/download.html](https://eternalmonitor.dev/download.html).
-   Click **Download for Windows** for v0.3.0, the current stable release.
+   Click **Download for Windows** for v0.3.1, the current stable release.
    Your browser saves **EternalMonitor-Setup.exe**.
 2. Open **EternalMonitor-Setup.exe**.
 3. If a blue **Windows protected your PC** window appears, click
@@ -50,7 +50,7 @@ the Start menu. To have it open whenever you sign in to Windows, go to
 
 ## Step 2: Install EternalMonitor on your iPad
 
-The iPad app installs through Apple's TestFlight app. Use v0.3.0, build 143,
+The iPad app installs through Apple's TestFlight app. Use v0.3.1, build 166,
 with the current stable Windows release. The beta is open to anyone with the
 invite link.
 
@@ -191,7 +191,7 @@ or in the controls while streaming.
 | The iPad never connects over USB | Open Apple Devices on the PC and leave it open. Unlock the iPad, accept **Trust**, and try another cable. Then unplug and plug in again. |
 | The iPad can't find the PC at all | Open the iPad's **Settings** app, then **Privacy & Security**, then **Local Network**, and turn on **EternalMonitor**. |
 | The picture stutters or freezes on Wi-Fi | Move closer to the router, or use a 5 GHz network. Connect the PC to the router with a network cable, or use USB. |
-| **Hardware encoder unavailable** on the PC | In **Settings**, select **Auto** for the encoder and **YUV420** for encoder input, then restart the stream. Update the driver from your GPU manufacturer. If this persists, use **Performance** → **Copy logs** and include the iPad report from **Settings → Diagnostics**. Some GPUs have no supported hardware encoder. |
+| **Hardware encoder unavailable** on the PC | In **Settings**, select **Auto** for the encoder and **YUV420** for encoder input, then restart the stream. Update the driver from your GPU manufacturer. If this persists, use **Performance** → **Copy logs** and include the iPad report from **Settings → Support → Diagnostics**. Some GPUs have no supported hardware encoder. |
 | **Extended display unavailable** on the PC | Run EternalMonitor-Setup.exe again to repair the install, then restart the stream. |
 
 **Using a VPN such as Tailscale?** In the PC window, open **Settings** and set
@@ -207,7 +207,7 @@ In the PC window, open **Performance** and click **Copy logs**. Paste the
 result into a [bug report on GitHub](https://github.com/sidebandstudio/EternalMonitor/issues/new/choose)
 or an email to [hello@sideband.studio](mailto:hello@sideband.studio).
 Say what you tried, what you saw, your iPad model, and whether you used Wi-Fi or
-USB. On iPad, open **Settings → Diagnostics**, then **Export diagnostics**
+USB. On iPad, open **Settings → Support → Diagnostics**, then **Export diagnostics**
 for a text file or **Copy diagnostics**. Include both reports when possible.
 
 Reports include Windows build, CPU, GPU and driver details; iPad hardware,
@@ -228,6 +228,6 @@ your home Wi-Fi.
 
 ### Automatic diagnostics
 
-Configured releases send device information, errors and stream statistics to EternalMonitor support automatically. Windows Settings and iPad Settings → Diagnostics show the current upload state and an automatic sharing control. Offline events retry after reconnection or relaunch. PC names and network addresses may be included; pairing credentials, screen frames and audio are excluded. Manual exports remain available.
+Configured releases send device information, errors and stream statistics to EternalMonitor support automatically. Windows Settings and iPad Settings → Support → Diagnostics show the current upload state and an automatic sharing control. Offline events retry after reconnection or relaunch. PC names and network addresses may be included; pairing credentials, screen frames and audio are excluded. Manual exports remain available.
 
 Uploads use encrypted HTTPS. Support history is retained for up to 30 days and may be removed sooner when storage limits are reached. Disabling sharing clears pending uploads; diagnostics already sent expire under the retention policy. Existing releases require an update to enable uploads.

@@ -21,16 +21,16 @@ https://testflight.apple.com/join/ppc9QfXc
 
 ### Current setup
 
-The App Store Connect app and CI signing credentials are already configured
-for `sidebandstudio/EternalMonitor`. iPad v0.3.0, build 143, was uploaded and
-submitted for external beta review on September 25, 2026, and Apple approved it
-on September 26, 2026. It belongs to the
-`FriendsExternal` group, whose public link and automatic tester notification
-are enabled. The feedback and review contact email is `Whois.younes@gmail.com`.
+The App Store Connect app and CI signing credentials are configured for
+`sidebandstudio/EternalMonitor`. iPad v0.3.1, build 166, is the current update.
+Apple approved it for external testing, verified on October 19, 2026. Its
+external state is `IN_BETA_TESTING`. It belongs to `FriendsExternal`, whose
+public link and automatic tester notification are enabled. The matching Windows installer is
+[v0.3.1](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.1).
 
-External installation is open. Pair it with the
-[current stable Windows release](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.0).
-The setup instructions below are for maintaining or replacing that configuration.
+Build 143 was the previous 0.3.0 release. It does not include the Intel startup
+fix or automatic support diagnostics. Verify App Store Connect's external build
+state before describing any new upload as available to external testers.
 
 ### Automated archive and upload
 
@@ -40,8 +40,8 @@ unsigned Release archive as a compile check. This archive cannot be installed
 through TestFlight. A signed workflow exports directly to App Store Connect.
 
 Every workflow run uses build number `100 + GITHUB_RUN_NUMBER`; Xcode's automatic
-build-number rewriting is disabled. A tag such as `v0.3.0-rc.1` must match
-`MARKETING_VERSION: "0.3.0"`. To upload again, start a new workflow dispatch rather
+build-number rewriting is disabled. A tag such as `v0.3.1-rc.1` must match
+`MARKETING_VERSION: "0.3.1"`. To upload again, start a new workflow dispatch rather
 than rerunning an already uploaded build number.
 
 Add these repository Actions secrets in GitHub Settings:
@@ -138,10 +138,10 @@ for people you want inside the developer account.
 
 Two links, and they must match:
 
-- The v0.3.0 Windows installer, shown as the current stable release on
-  eternalmonitor.dev/download.html. Its bytes are unchanged from v0.3.0-rc.1.
-- The TestFlight public link for iPad v0.3.0, build 143. Apple approved it for
-  external testing on September 26, 2026.
+- The v0.3.1 Windows installer from the release page or
+  eternalmonitor.dev/download.html.
+- The TestFlight public link for iPad v0.3.1, build 166. Apple approved it;
+  its external state was verified as `IN_BETA_TESTING` on October 19, 2026.
 
 Tell them where feedback goes: the form at
 https://eternalmonitor.dev/download.html#feedback (it opens their mail app
