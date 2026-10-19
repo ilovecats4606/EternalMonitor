@@ -59,8 +59,8 @@ the MIT license, and needs no account.
 
 | | Requirements | Get it |
 | --- | --- | --- |
-| **Windows** | Windows 10 (version 1809 or later) or Windows 11, 64-bit, with an NVIDIA, AMD or Intel GPU | [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.0) (v0.3.0 current stable) |
-| **iPad** | iPadOS 17 or later | [TestFlight v0.3.0, build 143](https://testflight.apple.com/join/ppc9QfXc). The public beta is open: install TestFlight, then open the link on your iPad. |
+| **Windows** | Windows 10 (version 1809 or later) or Windows 11, 64-bit, with an NVIDIA, AMD or Intel GPU | [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.1) (v0.3.1 current stable) |
+| **iPad** | iPadOS 17 or later | [TestFlight v0.3.1, build 166](https://testflight.apple.com/join/ppc9QfXc). The public beta is open: install TestFlight, then open the link on your iPad. |
 
 Install both apps from the same version. The older v0.1 releases use a different
 protocol and cannot connect to the v0.3 iPad app.
@@ -82,15 +82,19 @@ you will see.
 
 ## Status
 
-v0.3.0 is the current stable release, paired with iPad TestFlight build 143.
-Its Windows installer is unchanged from v0.3.0-rc.1. On 2026-09-24 it passed the automated tests
-on a reference PC with GeForce RTX 5080 and Radeon graphics and on a physical
-iPad Pro.
-Those included 30-minute runs at about 58 fps, one over Wi-Fi at 3440×1440 and
-one over USB at 2732×2048. Testers are now checking what needs hands on the
-device, such as drawing in Clip Studio Paint and audio sync.
-[docs/hardware-verification.md](docs/hardware-verification.md) has every result,
-including the failures.
+v0.3.1 includes Intel Quick Sync startup fixes, hardware encoder fallback,
+audio scheduling improvements and automatic support diagnostics. Install it
+with iPad TestFlight v0.3.1, build 166.
+
+Windows and iPad diagnostics include device details, app errors and stream
+statistics. Reports include PC names and network addresses, but exclude screen
+content, audio and pairing credentials. Disable automatic sharing in Settings.
+On iPad, open Settings > Support > Diagnostics to copy or export a report.
+
+All six release preparation checks passed, including Windows, macOS and iPad
+simulator streaming. The affected Windows 10 / Intel Iris Xe device and physical
+iPad Pro M5 still need customer testing. Earlier physical-device results remain
+in [docs/hardware-verification.md](docs/hardware-verification.md).
 
 Known limits:
 
