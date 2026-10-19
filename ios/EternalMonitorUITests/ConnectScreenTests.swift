@@ -73,7 +73,10 @@ final class ConnectScreenTests: XCTestCase {
         shot.name = "support-diagnostics"; shot.lifetime = .keepAlways; add(shot)
         app.buttons["diagnostics.export"].tap()
         let share = app.navigationBars["UIActivityContentView"]
-        XCTAssertTrue(share.waitForExistence(timeout: 10), app.debugDescription)
+        // On a cold simulator, Apple's remote share-sheet container can appear
+        // before its contents finish loading. Still require the document and
+        // export actions once the remote interface is ready.
+        XCTAssertTrue(share.waitForExistence(timeout: 30), app.debugDescription)
         XCTAssertTrue(share.otherElements["EternalMonitor-iPad-diagnostics"].waitForExistence(timeout: 5))
         let documentType = share.otherElements.matching(NSPredicate(format: "label BEGINSWITH %@", "Text Document")).firstMatch
         XCTAssertTrue(documentType.waitForExistence(timeout: 5))
