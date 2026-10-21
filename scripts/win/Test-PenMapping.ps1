@@ -4,8 +4,9 @@ param(
     # Also enable the Virtual Display Driver and place it left of, then above,
     # the primary. The layout is recorded first and restored afterwards.
     [switch]$WithVirtualDisplay,
-    # Also record which raw pen frame sequences Windows rejects, at the
-    # centre of the probe window on the primary display.
+    # Also record which raw pen frame sequences Windows rejects, and check
+    # that recreating the pen device ends a held contact, at the centre of
+    # the probe window on the primary display.
     [switch]$PenSequences
 )
 # Checks where Pencil and touch land on a whole monitor, for monitors whose
@@ -226,6 +227,10 @@ public sealed class EMPlacementProbe : Form {
                 message.Result = IntPtr.Zero;
                 return;
             }
+            // A destroyed device's pointer has no pen info; keep the
+            // message's own flags.
+            Samples.Add(new Sample { Kind = "pointer", Message = message.Msg,
+                Flags = (uint)((message.WParam.ToInt64() >> 16) & 0xffff), X = -1, Y = -1, Ms = clock.ElapsedMilliseconds });
         }
         if (message.Msg == 0x201 && ChildStartMs >= 0) {
             long lParam = message.LParam.ToInt64();
@@ -311,6 +316,20 @@ function Invoke-Case([string]$Name, $Display, [string]$Mode = 'mapping', $MoveDi
         }
         $case.points = $rows
         $case.passed = $ok -and !$rejected
+    } elseif ($Mode -eq 'recreate') {
+        # The held contact must end when its device is destroyed, before the
+        # new device's stroke, and that stroke must start and end normally.
+        $steps = @($probe.ChildOutput -split "`r?`n" | Where-Object { $_ -like 'REC *' })
+        $pointer = @($probe.Samples | Where-Object { $_.Kind -eq 'pen' -or $_.Kind -eq 'pointer' })
+        $downs = @(for ($i = 0; $i -lt $pointer.Count; $i++) { if ($pointer[$i].Message -eq 0x246) { $i } })
+        $ups = @(for ($i = 0; $i -lt $pointer.Count; $i++) { if ($pointer[$i].Message -eq 0x247) { $i } })
+        $endedBeforeNext = $downs.Count -eq 2 -and @($ups | Where-Object { $_ -gt $downs[0] -and $_ -lt $downs[1] }).Count -eq 1
+        $last = if ($pointer.Count) { $pointer[-1] } else { $null }
+        $case.steps = $steps
+        $case.messages = @($pointer | ForEach-Object { '{0:x} {1} {2:x} {3},{4}' -f $_.Message, $_.Kind, $_.Flags, $_.X, $_.Y })
+        $case.passed = $probe.ChildExit -eq 0 -and $steps.Count -eq 8 -and
+            @($steps | Where-Object { $_ -notlike '* ok' }).Count -eq 0 -and $endedBeforeNext -and
+            $ups.Count -eq 2 -and $last -and $last.Message -eq 0x247 -and ($last.Flags -band 4) -eq 0
     } elseif ($Mode -eq 'sequences') {
         $results = [ordered]@{}
         foreach ($line in ($probe.ChildOutput -split "`r?`n" | Where-Object { $_ -like 'SEQ *' })) {
@@ -351,6 +370,7 @@ try {
     }
     if ($PenSequences) {
         Invoke-Case 'raw pen sequences, primary' $primary 'sequences'
+        Invoke-Case 'pen device recreated mid-contact, primary' $primary 'recreate'
     }
     if ($WithVirtualDisplay) {
         if (!$vddWasPresent) {

@@ -15,6 +15,9 @@ fn main() {
     if mode == "sequences" {
         return sequences();
     }
+    if mode == "recreate" {
+        return recreate();
+    }
     let args: Vec<i32> = std::env::args()
         .skip(1)
         .map(|s| s.parse().unwrap())
@@ -181,24 +184,20 @@ fn placement(mode: &str) {
 /// every frame stays within a few pixels of the window centre.
 #[cfg(windows)]
 fn sequences() {
-    use windows::Win32::Foundation::POINT;
     use windows::Win32::UI::Controls::{
         CreateSyntheticPointerDevice, DestroySyntheticPointerDevice, POINTER_FEEDBACK_NONE,
-        POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
     };
     use windows::Win32::UI::Input::Pointer::{
-        InjectSyntheticPointerInput, POINTER_FLAGS, POINTER_FLAG_DOWN, POINTER_FLAG_FIRSTBUTTON,
-        POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE, POINTER_FLAG_PRIMARY, POINTER_FLAG_UP,
-        POINTER_FLAG_UPDATE, POINTER_INFO, POINTER_PEN_INFO,
+        POINTER_FLAGS, POINTER_FLAG_DOWN, POINTER_FLAG_FIRSTBUTTON, POINTER_FLAG_INCONTACT,
+        POINTER_FLAG_INRANGE, POINTER_FLAG_UP, POINTER_FLAG_UPDATE,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{PEN_MASK_PRESSURE, PT_PEN};
+    use windows::Win32::UI::WindowsAndMessaging::PT_PEN;
     let args: Vec<i32> = std::env::args()
         .skip(2)
         .map(|s| s.parse().unwrap())
         .collect();
     assert_eq!(args.len(), 5, "expected PID, left, top, width, height");
     let (cx, cy) = (args[1] + args[3] / 2, args[2] + args[4] / 2);
-    let screen = eternal_host::input::windows_inject::virtual_screen();
     let contact = POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_FIRSTBUTTON;
     let down = POINTER_FLAG_DOWN | contact;
     let moved = POINTER_FLAG_UPDATE | contact;
@@ -237,34 +236,110 @@ fn sequences() {
         let device = unsafe { CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_NONE) }
             .expect("native pen creation failed");
         for (index, &(flags, dx, pressure)) in frames.iter().enumerate() {
-            let (x, y) =
-                eternal_host::input::desktop_pixel_to_pointer_location(cx + dx, cy, screen);
-            let info = POINTER_TYPE_INFO {
-                r#type: PT_PEN,
-                Anonymous: POINTER_TYPE_INFO_0 {
-                    penInfo: POINTER_PEN_INFO {
-                        pointerInfo: POINTER_INFO {
-                            pointerType: PT_PEN,
-                            pointerId: 1,
-                            pointerFlags: flags | POINTER_FLAG_PRIMARY,
-                            ptPixelLocation: POINT { x, y },
-                            ..Default::default()
-                        },
-                        penMask: PEN_MASK_PRESSURE,
-                        pressure,
-                        ..Default::default()
-                    },
-                },
-            };
-            let result = match unsafe { InjectSyntheticPointerInput(device, &[info]) } {
-                Ok(()) => "ok".to_string(),
-                Err(error) => format!("{:#010x}", error.code().0),
-            };
+            let result = inject_raw(device, flags, (cx + dx, cy), pressure);
             println!("SEQ {name} {index} {result}");
             std::thread::sleep(std::time::Duration::from_millis(40));
         }
         unsafe { DestroySyntheticPointerDevice(device) };
         std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+}
+
+/// `recreate <pid> <left> <top> <width> <height>` holds a contact at the
+/// centre of the probe window, destroys the pen device without an up, then
+/// draws a stroke on a new device 20 px to the right. The host recreates
+/// its device to end a pointer it cannot end with a frame; the placement
+/// check confirms Windows ends that contact and the new device works.
+#[cfg(windows)]
+fn recreate() {
+    use windows::Win32::UI::Controls::{
+        CreateSyntheticPointerDevice, DestroySyntheticPointerDevice, POINTER_FEEDBACK_NONE,
+    };
+    use windows::Win32::UI::Input::Pointer::{
+        POINTER_FLAG_DOWN, POINTER_FLAG_FIRSTBUTTON, POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE,
+        POINTER_FLAG_UP, POINTER_FLAG_UPDATE,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::PT_PEN;
+    let args: Vec<i32> = std::env::args()
+        .skip(2)
+        .map(|s| s.parse().unwrap())
+        .collect();
+    assert_eq!(args.len(), 5, "expected PID, left, top, width, height");
+    let (cx, cy) = (args[1] + args[3] / 2, args[2] + args[4] / 2);
+    let contact = POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_FIRSTBUTTON;
+    let create = || {
+        unsafe { CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_NONE) }
+            .expect("native pen creation failed")
+    };
+    let step = |name: &str, result: String| {
+        println!("REC {name} {result}");
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    };
+    let held = create();
+    step(
+        "down",
+        inject_raw(held, POINTER_FLAG_DOWN | contact, (cx, cy), 512),
+    );
+    for dx in 1..=3 {
+        step(
+            "move",
+            inject_raw(held, POINTER_FLAG_UPDATE | contact, (cx + dx, cy), 512),
+        );
+    }
+    unsafe { DestroySyntheticPointerDevice(held) };
+    step("destroyed", "ok".to_string());
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let fresh = create();
+    let at = (cx + 20, cy);
+    step(
+        "down",
+        inject_raw(fresh, POINTER_FLAG_DOWN | contact, at, 512),
+    );
+    step(
+        "move",
+        inject_raw(fresh, POINTER_FLAG_UPDATE | contact, at, 512),
+    );
+    step("up", inject_raw(fresh, POINTER_FLAG_UP, at, 0));
+    unsafe { DestroySyntheticPointerDevice(fresh) };
+    std::thread::sleep(std::time::Duration::from_millis(150));
+}
+
+/// Inject one raw pen frame at a desktop pixel; "ok" or the error code.
+#[cfg(windows)]
+fn inject_raw(
+    device: windows::Win32::UI::Controls::HSYNTHETICPOINTERDEVICE,
+    flags: windows::Win32::UI::Input::Pointer::POINTER_FLAGS,
+    (x, y): (i32, i32),
+    pressure: u32,
+) -> String {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::Controls::{POINTER_TYPE_INFO, POINTER_TYPE_INFO_0};
+    use windows::Win32::UI::Input::Pointer::{
+        InjectSyntheticPointerInput, POINTER_FLAG_PRIMARY, POINTER_INFO, POINTER_PEN_INFO,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{PEN_MASK_PRESSURE, PT_PEN};
+    let screen = eternal_host::input::windows_inject::virtual_screen();
+    let (x, y) = eternal_host::input::desktop_pixel_to_pointer_location(x, y, screen);
+    let info = POINTER_TYPE_INFO {
+        r#type: PT_PEN,
+        Anonymous: POINTER_TYPE_INFO_0 {
+            penInfo: POINTER_PEN_INFO {
+                pointerInfo: POINTER_INFO {
+                    pointerType: PT_PEN,
+                    pointerId: 1,
+                    pointerFlags: flags | POINTER_FLAG_PRIMARY,
+                    ptPixelLocation: POINT { x, y },
+                    ..Default::default()
+                },
+                penMask: PEN_MASK_PRESSURE,
+                pressure,
+                ..Default::default()
+            },
+        },
+    };
+    match unsafe { InjectSyntheticPointerInput(device, &[info]) } {
+        Ok(()) => "ok".to_string(),
+        Err(error) => format!("{:#010x}", error.code().0),
     }
 }
 
