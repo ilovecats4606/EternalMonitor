@@ -184,6 +184,8 @@ impl UploadGuard {
 }
 impl Drop for UploadGuard {
     fn drop(&mut self) {
+        // Counts of bursts still being collapsed belong in the last upload.
+        crate::logging::flush_repeat_summaries();
         if let Some(stop) = self.0.take() {
             let _ = stop.send(());
         }

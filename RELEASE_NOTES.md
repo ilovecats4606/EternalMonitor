@@ -25,8 +25,10 @@ with these changes.
   sound packet.
 - The installer also allows display traffic on domain (work or school)
   networks.
-- Repeated log lines are written once with a count, so logs and support
-  reports keep the lines that explain a problem.
+- A log line repeated many times in a row is written once, followed by a
+  line with the repeat count and the first and last times. The count appears
+  about 30 seconds after the burst starts, or when the app quits, so logs and
+  support reports keep the lines that explain a problem.
 
 ## EternalMonitor v0.3.1
 
