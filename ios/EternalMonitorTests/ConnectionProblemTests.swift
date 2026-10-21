@@ -49,7 +49,7 @@ final class ConnectionProblemTests: XCTestCase {
         // A classified failure in the last attempt is more useful than
         // "Couldn't reconnect"; a PC that just never answered is not.
         for specific: ConnectionProblem in [.localNetworkBlocked, .noNetwork, .badAddress("pc"), .usbFailed, .noPicture,
-                                             .pcBusy] {
+                                             .pcBusy, .pcEndedSession] {
             XCTAssertEqual(ConnectionProblem.afterReconnecting(lastAttempt: specific), specific)
         }
         for generic: ConnectionProblem? in [nil, .noReply(usb: false), .reconnecting(attempt: 6, of: 6), .couldNotConnect] {

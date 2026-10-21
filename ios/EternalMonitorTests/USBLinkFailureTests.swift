@@ -351,8 +351,8 @@ final class USBLinkFailureTests: XCTestCase {
         }
     }
 
-    // MARK: Answers from the PC during the fallback. Busy passes; the cycle
-    // keeps retrying.
+    // MARK: Answers from the PC during the fallback. Busy and a restart pass;
+    // the cycle keeps retrying.
 
     /// Long enough to answer the handshake and stream within one attempt.
     private let answering = ConnectionManager.Timing(connectTimeoutSeconds: 1, reconnectGraceSeconds: 0.1,
@@ -396,5 +396,23 @@ final class USBLinkFailureTests: XCTestCase {
         XCTAssertEqual(refused, 6, "every attempt ran")
         XCTAssertEqual(manager.problem, .pcBusy)
         XCTAssertEqual(manager.problem?.actions, [.retry])
+    }
+
+    /// The PC says it is shutting down during the fallback (its stream
+    /// restarting) and comes back.
+    func testAPCRestartingDuringTheFallbackIsRetried() async throws {
+        let wifi = FakeUDPHost()
+        enableWiFiFallback(to: wifi)
+        let (manager, link) = try await connectOverCable(timing: answering)
+        defer { link.stop(); manager.cancel() }
+        injectFramingFailure()
+        let accepted = await Task.detached { wifi.acceptSession() }.value
+        XCTAssertTrue(accepted)
+        try await until("handshake") { manager.hostInfo != nil }
+        wifi.sendBye(.hostShuttingDown)
+        try await until("the goodbye ends that attempt") { manager.state == .disconnected }
+        XCTAssertEqual(manager.problem, .pcEndedSession)
+        XCTAssertEqual(manager.reconnectAttempt, 1, "a restarting PC keeps the automatic cycle")
+        try await finishConnecting(manager, to: wifi)
     }
 }

@@ -74,6 +74,11 @@ final class FakeUDPHost: @unchecked Sendable {
         }
     }
 
+    /// Ends session 41 from the PC's side.
+    func sendBye(_ reason: ByeReason) {
+        send(Wire.encodeControl(sessionId: 41, msgSeq: 2, message: .bye(reason)))
+    }
+
     /// The 64x64 H.264 keyframe fixture.
     static func keyframe() throws -> Data {
         guard let url = Bundle(for: FakeUDPHost.self).url(forResource: "single_idr_64x64", withExtension: "h264",

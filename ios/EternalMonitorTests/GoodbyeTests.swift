@@ -6,8 +6,9 @@ import XCTest
 /// is torn down, and that intentional teardown must not raise a problem.
 @MainActor
 final class GoodbyeTests: XCTestCase {
-    private func connectedManager(_ host: FakeUDPHost) async throws -> ConnectionManager {
-        let manager = ConnectionManager()
+    private func connectedManager(_ host: FakeUDPHost, timing: ConnectionManager.Timing = .init()) async throws
+        -> ConnectionManager {
+        let manager = ConnectionManager(timing: timing)
         manager.connect(host: "127.0.0.1", port: host.port)
         let accepted = await Task.detached { host.acceptSession() }.value
         XCTAssertTrue(accepted, "the iPad never sent HELLO2")
@@ -65,5 +66,56 @@ final class GoodbyeTests: XCTestCase {
         XCTAssertEqual(reasons.filter { $0 == .userDisconnect }.count, ControlChannel.byeCopies)
         XCTAssertNil(manager.problem)
         XCTAssertNil(manager.connectionError)
+    }
+
+    // MARK: Goodbyes from the PC
+
+    private func until(_ description: String, seconds: Double = 10, _ condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(seconds)
+        while !condition(), Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertTrue(condition(), description)
+    }
+
+    /// A streaming session on `host`, with automatic reconnecting on.
+    private func streaming(_ host: FakeUDPHost) async throws -> ConnectionManager {
+        let previous = UserDefaults.standard.object(forKey: "autoReconnect")
+        UserDefaults.standard.set(true, forKey: "autoReconnect")
+        addTeardownBlock { UserDefaults.standard.set(previous, forKey: "autoReconnect") }
+        let manager = try await connectedManager(host, timing: ConnectionManager.Timing(
+            connectTimeoutSeconds: 1, reconnectGraceSeconds: 0.1, reconnectBackoffSeconds: { _ in 0.05 }))
+        host.sendKeyframe(try FakeUDPHost.keyframe())
+        try await until("streaming") { manager.state == .connected }
+        return manager
+    }
+
+    /// The PC ends the stream to restart it, for a mode switch, new
+    /// settings or an update, and comes back: the iPad reconnects by itself.
+    func testAPCRestartingItsStreamIsReconnected() async throws {
+        let host = FakeUDPHost()
+        let manager = try await streaming(host)
+        defer { manager.cancel() }
+        host.sendBye(.hostShuttingDown)
+        try await until("reconnecting") { manager.reconnectAttempt == 1 }
+        let accepted = await Task.detached { host.acceptSession() }.value
+        XCTAssertTrue(accepted, "the iPad never tried the PC again")
+        try await until("handshake") { manager.hostInfo != nil }
+        host.sendKeyframe(try FakeUDPHost.keyframe())
+        try await until("streaming again") { manager.state == .connected }
+        XCTAssertNil(manager.problem)
+        XCTAssertEqual(manager.reconnectAttempt, 0)
+    }
+
+    /// Disconnected from the PC's side: the iPad stays away.
+    func testAPCDisconnectingTheIPadStaysDisconnected() async throws {
+        let host = FakeUDPHost()
+        let manager = try await streaming(host)
+        defer { manager.cancel() }
+        host.sendBye(.userDisconnect)
+        try await until("disconnected") { manager.state == .disconnected }
+        XCTAssertEqual(manager.problem, .pcEndedSession)
+        XCTAssertEqual(manager.problem?.actions, [.retry])
+        let attempts = await Task.detached { host.helloAttempts(within: 1.5) }.value
+        XCTAssertEqual(attempts, 0, "no automatic reconnecting after a disconnect from the PC")
+        XCTAssertEqual(manager.reconnectAttempt, 0)
     }
 }

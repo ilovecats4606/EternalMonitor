@@ -547,10 +547,24 @@ final class ConnectionManager: ObservableObject {
         channel.onBye = { [weak self] reason in
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
-                self.endReconnectCycle()
-                self.problem = .pcEndedSession
                 self.record(.info, "ctrl", "Host BYE (\(reason))")
-                self.disconnect()
+                switch reason {
+                case .userDisconnect, .superseded:
+                    // Disconnected from the PC, or another device took over:
+                    // stay away until the user connects again.
+                    self.endReconnectCycle()
+                    self.disconnect()
+                    self.problem = .pcEndedSession
+                default:
+                    // A PC that stops or restarts its stream may come back.
+                    // A running cycle keeps going; otherwise start one.
+                    if self.reconnectCycleID != nil {
+                        self.disconnect()
+                        self.problem = .pcEndedSession
+                    } else {
+                        self.beginReconnect(.pcStoppedResponding, failure: .pcEndedSession)
+                    }
+                }
             }
         }
         channel.onHeartbeat = { [weak self, weak assembler] heartbeat in
