@@ -50,7 +50,27 @@ fn change_at(path: &Path, enabled: bool, run: impl FnOnce() -> bool) -> bool {
 fn record(path: &Path, owner: ProcessId) -> io::Result<()> {
     let temp = path.with_extension(format!("{owner}.tmp"));
     fs::write(&temp, owner.to_string())?;
-    fs::rename(temp, path)
+    let replaced = with_retries(|| fs::rename(&temp, path));
+    if replaced.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    replaced
+}
+
+/// A reporter holds the record open for a moment while it checks and deletes
+/// it. Where Windows cannot replace an open file (FAT volumes), the replace
+/// fails meanwhile; try again for a few milliseconds.
+fn with_retries(mut attempt: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+    let mut tries = 1;
+    loop {
+        match attempt() {
+            Err(_) if tries < 10 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            result => return result,
+        }
+    }
 }
 
 fn owner_at(path: &Path) -> Option<ProcessId> {
@@ -97,34 +117,116 @@ fn disable_for_ended_at(
     // and a replacement host may have started or turned the display on.
     check(&mut other_host)?;
     let done = disable();
-    if done && !remove_if_owned(path, ended) {
-        return Err(format!(
-            "turned the virtual display off, but {} turned it on meanwhile; its record stays",
-            owner_at(path).map_or("another host".to_string(), |o| format!("host {o}"))
-        ));
+    if done {
+        delete_if_owned(path, ended, || true, true);
+        if let Some(owner) = owner_at(path) {
+            return Err(format!(
+                "turned the virtual display off, but host {owner} turned it on meanwhile; \
+                 its record stays"
+            ));
+        }
     }
     Ok(done)
 }
 
-/// Remove the record only if it still names `owner`. It is moved aside in
-/// one step first, so a record a replacement host writes meanwhile is never
-/// the one removed; a record moved aside by mistake goes back unless a newer
-/// one has taken its place.
-fn remove_if_owned(path: &Path, owner: ProcessId) -> bool {
-    let aside = path.with_extension(format!("{}.claim", ProcessId::current()));
-    if fs::rename(path, &aside).is_err() {
+/// Delete the record only if it names `owner`, reading and deleting it
+/// through one handle. A host that replaces the record meanwhile puts a new
+/// file in its place; the handle still refers to the old one, so the new
+/// record is never deleted. `before_delete` runs between the two steps and
+/// stops the deletion by returning false, for tests. `posix` asks for the
+/// deletion to take the name away at once where the volume supports it.
+/// True when the record was deleted.
+#[cfg(windows)]
+fn delete_if_owned(
+    path: &Path,
+    owner: ProcessId,
+    before_delete: impl FnOnce() -> bool,
+    posix: bool,
+) -> bool {
+    use std::io::Read;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        FileDispositionInfo, FileDispositionInfoEx, SetFileInformationByHandle,
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO,
+        FILE_DISPOSITION_INFO_EX, FILE_DISPOSITION_INFO_EX_FLAGS,
+    };
+    // GENERIC_READ | DELETE, shared with everything, so a host replacing the
+    // record is not turned away.
+    let Ok(mut file) = fs::OpenOptions::new()
+        .access_mode(0x8000_0000 | 0x0001_0000)
+        .share_mode(0x7)
+        .open(path)
+    else {
+        return false;
+    };
+    let mut text = String::new();
+    if file.read_to_string(&mut text).is_err()
+        || ProcessId::from_name(text.trim()) != Some(owner)
+        || !before_delete()
+    {
         return false;
     }
-    if owner_at(&aside) == Some(owner) {
-        let _ = fs::remove_file(&aside);
-        return true;
+    let handle = HANDLE(file.as_raw_handle());
+    let size_of = |size: usize| size as u32;
+    if posix {
+        let info = FILE_DISPOSITION_INFO_EX {
+            Flags: FILE_DISPOSITION_INFO_EX_FLAGS(
+                FILE_DISPOSITION_FLAG_DELETE.0 | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS.0,
+            ),
+        };
+        let deleted = unsafe {
+            SetFileInformationByHandle(
+                handle,
+                FileDispositionInfoEx,
+                &info as *const _ as *const core::ffi::c_void,
+                size_of(std::mem::size_of_val(&info)),
+            )
+        };
+        if deleted.is_ok() {
+            return true;
+        }
     }
-    // A hard link, unlike a rename, never replaces a newer record.
-    if fs::hard_link(&aside, path).is_err() && !path.exists() {
-        let _ = fs::rename(&aside, path);
+    // Volumes without POSIX deletion: the name goes when this handle closes.
+    let info = FILE_DISPOSITION_INFO {
+        DeleteFile: true.into(),
+    };
+    unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfo,
+            &info as *const _ as *const core::ffi::c_void,
+            size_of(std::mem::size_of_val(&info)),
+        )
     }
-    let _ = fs::remove_file(&aside);
-    false
+    .is_ok()
+}
+
+/// Unix has no deletion through a handle; the reporter runs only on Windows.
+/// For tests, this deletes the path only while it is still the opened file.
+#[cfg(not(windows))]
+fn delete_if_owned(
+    path: &Path,
+    owner: ProcessId,
+    before_delete: impl FnOnce() -> bool,
+    _posix: bool,
+) -> bool {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut text = String::new();
+    if file.read_to_string(&mut text).is_err()
+        || ProcessId::from_name(text.trim()) != Some(owner)
+        || !before_delete()
+    {
+        return false;
+    }
+    let opened = file.metadata().map(|m| (m.dev(), m.ino())).ok();
+    let named = fs::metadata(path).map(|m| (m.dev(), m.ino())).ok();
+    opened.is_some() && opened == named && fs::remove_file(path).is_ok()
 }
 
 /// A file's identity: its volume and its index on that volume. Paths that
@@ -410,15 +512,127 @@ mod tests {
             )
         );
         assert_eq!(owner_at(&path), Some(replacement));
-        // Nothing is left beside it.
-        let parent = path.parent().unwrap();
+        assert_eq!(files_beside(&path), 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// Files named like the record, the record included.
+    fn files_beside(path: &Path) -> usize {
         let prefix = path.file_name().unwrap().to_string_lossy().into_owned();
-        let aside = fs::read_dir(parent)
+        fs::read_dir(path.parent().unwrap())
             .unwrap()
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
-            .count();
-        assert_eq!(aside, 1);
+            .count()
+    }
+
+    #[test]
+    fn the_reporter_deletes_its_hosts_record() {
+        for posix in [true, false] {
+            let path = owner_file("own");
+            let ended = ProcessId { pid: 7, start: 1 };
+            record(&path, ended).unwrap();
+            assert!(delete_if_owned(&path, ended, || true, posix));
+            assert!(!path.exists());
+            // Nothing to delete, or another host's record.
+            assert!(!delete_if_owned(&path, ended, || true, posix));
+            record(&path, ProcessId { pid: 8, start: 1 }).unwrap();
+            assert!(!delete_if_owned(&path, ended, || true, posix));
+            assert!(path.exists());
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_record_replaced_between_reading_and_deleting_survives() {
+        // With POSIX deletion and without it, as on FAT volumes.
+        for posix in [true, false] {
+            let path = owner_file("replaced");
+            let ended = ProcessId { pid: 7, start: 1 };
+            let replacement = ProcessId { pid: 8, start: 1 };
+            record(&path, ended).unwrap();
+            delete_if_owned(
+                &path,
+                ended,
+                || {
+                    record(&path, replacement).unwrap();
+                    true
+                },
+                posix,
+            );
+            assert_eq!(owner_at(&path), Some(replacement), "posix={posix}");
+            assert_eq!(files_beside(&path), 1, "posix={posix}");
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_reporter_stopped_midway_leaves_every_record() {
+        let path = owner_file("stopped");
+        let ended = ProcessId { pid: 7, start: 1 };
+        let replacement = ProcessId { pid: 8, start: 1 };
+        record(&path, ended).unwrap();
+        // Ended, as by Task Manager, after reading its host's record.
+        assert!(!delete_if_owned(&path, ended, || false, true));
+        assert_eq!(owner_at(&path), Some(ended));
+        // Ended after a replacement host wrote its record.
+        assert!(!delete_if_owned(
+            &path,
+            ended,
+            || {
+                record(&path, replacement).unwrap();
+                false
+            },
+            true
+        ));
+        assert_eq!(owner_at(&path), Some(replacement));
+        // Ended while handling a record that names another host.
+        assert!(!delete_if_owned(&path, ended, || false, true));
+        assert_eq!(owner_at(&path), Some(replacement));
+        assert_eq!(files_beside(&path), 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn writing_a_record_tries_again_for_a_few_milliseconds() {
+        let mut failures = 3;
+        let started = std::time::Instant::now();
+        assert!(with_retries(|| {
+            if failures == 0 {
+                Ok(())
+            } else {
+                failures -= 1;
+                Err(io::ErrorKind::PermissionDenied.into())
+            }
+        })
+        .is_ok());
+        let mut attempts = 0;
+        let result = with_retries(|| {
+            attempts += 1;
+            Err(io::ErrorKind::PermissionDenied.into())
+        });
+        assert!(result.is_err());
+        assert_eq!(attempts, 10);
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_host_replaces_its_record_while_a_reporter_holds_the_old_one() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let path = owner_file("held");
+        record(&path, ProcessId { pid: 7, start: 1 }).unwrap();
+        // Opened as the reporter opens it.
+        let held = fs::OpenOptions::new()
+            .access_mode(0x8000_0000 | 0x0001_0000)
+            .share_mode(0x7)
+            .open(&path)
+            .unwrap();
+        let replacement = ProcessId { pid: 8, start: 1 };
+        record(&path, replacement).unwrap();
+        assert_eq!(owner_at(&path), Some(replacement));
+        drop(held);
+        assert_eq!(owner_at(&path), Some(replacement));
         fs::remove_file(path).unwrap();
     }
 
