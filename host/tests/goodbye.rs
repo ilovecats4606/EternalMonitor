@@ -139,9 +139,10 @@ fn udp_goodbyes(stop: Stop) -> usize {
     })
 }
 
+/// One lost datagram must not turn a planned update into a lost connection.
 #[test]
-fn udp_shutdown_says_goodbye() {
-    assert!(udp_goodbyes(Stop::Shutdown) >= 1);
+fn udp_goodbye_is_a_short_burst() {
+    assert_eq!(udp_goodbyes(Stop::Shutdown), 3);
 }
 
 /// The encoder can close its channel before the next liveness tick while the
