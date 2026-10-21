@@ -7,8 +7,11 @@ import Foundation
 final class FakeUDPHost: @unchecked Sendable {
     let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
     private(set) var port: UInt16 = 0
-    /// The iPad whose HELLO2 was accepted.
+    /// The iPad whose HELLO2 was answered last.
     private var client: (address: sockaddr_storage, length: socklen_t)?
+    /// HELLO2 nonces already answered, so a late copy of one isn't taken
+    /// for the iPad's next attempt.
+    private var answered = Set<UInt32>()
 
     init() {
         var address = sockaddr_in()
@@ -42,13 +45,15 @@ final class FakeUDPHost: @unchecked Sendable {
         return count > 0 ? (Data(buffer.prefix(count)), from, length) : nil
     }
 
-    /// Answers the first HELLO2 with session 41. False after ten quiet seconds.
-    func acceptSession() -> Bool {
+    /// Answers the next HELLO2 attempt, with session 41 unless `status`
+    /// refuses it. False after ten quiet seconds.
+    func acceptSession(status: HelloStatus = .ok) -> Bool {
         for _ in 0..<33 {
             guard let (data, from, length) = receive() else { continue }
-            guard case .hello2(let hello) = Wire.parseControl(data)?.message else { continue }
+            guard case .hello2(let hello) = Wire.parseControl(data)?.message,
+                  answered.insert(hello.clientNonce).inserted else { continue }
             let ack = Wire.encodeControl(sessionId: 0, msgSeq: 1, message: .helloAck(HelloAck(
-                status: .ok, acceptedVersion: 2, clientNonce: hello.clientNonce, sessionId: 41,
+                status: status, acceptedVersion: 2, clientNonce: hello.clientNonce, sessionId: status == .ok ? 41 : 0,
                 heartbeatIntervalMs: 1000, reportIntervalMs: 500, livenessTimeoutMs: 3000,
                 streamConfig: StreamConfig(), hostName: "Test PC", authToken: Data(17...32), hostCaps: 0)))
             client = (from, length)
@@ -69,6 +74,13 @@ final class FakeUDPHost: @unchecked Sendable {
         }
     }
 
+    /// The 64x64 H.264 keyframe fixture.
+    static func keyframe() throws -> Data {
+        guard let url = Bundle(for: FakeUDPHost.self).url(forResource: "single_idr_64x64", withExtension: "h264",
+                                                          subdirectory: "Fixtures") else { throw CocoaError(.fileNoSuchFile) }
+        return try Data(contentsOf: url)
+    }
+
     /// Streams `frame` to the accepted iPad as the session's first keyframe.
     func sendKeyframe(_ frame: Data) {
         let size = MediaHeader.maxPayload
@@ -82,13 +94,16 @@ final class FakeUDPHost: @unchecked Sendable {
     }
 
     /// The BYE reasons received until the iPad has been quiet for 300 ms.
-    /// HELLO2 attempts (distinct client nonces) received within `seconds`.
+    /// Unanswered HELLO2 attempts (distinct client nonces) received within
+    /// `seconds`.
     func helloAttempts(within seconds: Double) -> Int {
         var nonces = Set<UInt32>()
         let deadline = Date().addingTimeInterval(seconds)
         while Date() < deadline {
             guard let (data, _, _) = receive() else { continue }
-            if case .hello2(let hello) = Wire.parseControl(data)?.message { nonces.insert(hello.clientNonce) }
+            if case .hello2(let hello) = Wire.parseControl(data)?.message, !answered.contains(hello.clientNonce) {
+                nonces.insert(hello.clientNonce)
+            }
         }
         return nonces.count
     }

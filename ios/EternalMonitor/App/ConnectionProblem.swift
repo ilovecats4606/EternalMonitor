@@ -23,6 +23,8 @@ enum ConnectionProblem: Equatable {
     case reconnecting(attempt: Int, of: Int)
     case reconnectFailed
     case pcEndedSession
+    /// The PC is streaming to another device, or still to this iPad's cable.
+    case pcBusy
 
     enum LostReason: Equatable {
         case pcStoppedResponding
@@ -52,6 +54,7 @@ enum ConnectionProblem: Equatable {
         case .reconnecting: return "Reconnecting to your PC…"
         case .reconnectFailed: return "Couldn't reconnect to your PC"
         case .pcEndedSession: return "Your PC ended the session"
+        case .pcBusy: return "Your PC is already streaming to another device"
         }
     }
 
@@ -90,6 +93,8 @@ enum ConnectionProblem: Equatable {
             return "Check that the PC is awake and EternalMonitor is open on it, then try again."
         case .pcEndedSession:
             return "Someone clicked Stop on the PC, changed a setting that restarts the stream, or closed EternalMonitor. Try again when the PC says Ready for your iPad."
+        case .pcBusy:
+            return "Disconnect the other iPad first, then try again."
         }
     }
 
@@ -116,7 +121,7 @@ enum ConnectionProblem: Equatable {
     /// never answered.
     static func afterReconnecting(lastAttempt: ConnectionProblem?) -> ConnectionProblem {
         switch lastAttempt {
-        case .localNetworkBlocked, .noNetwork, .badAddress, .usbFailed, .noPicture:
+        case .localNetworkBlocked, .noNetwork, .badAddress, .usbFailed, .noPicture, .pcBusy:
             return lastAttempt ?? .reconnectFailed
         default:
             return .reconnectFailed

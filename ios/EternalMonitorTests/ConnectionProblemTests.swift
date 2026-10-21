@@ -48,7 +48,8 @@ final class ConnectionProblemTests: XCTestCase {
     func testGivingUpOnReconnectingKeepsASpecificLastFailure() {
         // A classified failure in the last attempt is more useful than
         // "Couldn't reconnect"; a PC that just never answered is not.
-        for specific: ConnectionProblem in [.localNetworkBlocked, .noNetwork, .badAddress("pc"), .usbFailed, .noPicture] {
+        for specific: ConnectionProblem in [.localNetworkBlocked, .noNetwork, .badAddress("pc"), .usbFailed, .noPicture,
+                                             .pcBusy] {
             XCTAssertEqual(ConnectionProblem.afterReconnecting(lastAttempt: specific), specific)
         }
         for generic: ConnectionProblem? in [nil, .noReply(usb: false), .reconnecting(attempt: 6, of: 6), .couldNotConnect] {
@@ -61,6 +62,7 @@ final class ConnectionProblemTests: XCTestCase {
             .noReply(usb: false), .noReply(usb: true), .noPicture, .receiverNotReady, .badAddress("pc"),
             .noNetwork, .localNetworkBlocked, .couldNotConnect, .usbFailed, .lost(.pcStoppedResponding), .lost(.cableUnplugged),
             .lost(.usbTurnedOff), .reconnecting(attempt: 2, of: 6), .reconnectFailed, .pcEndedSession,
+            .pcBusy,
         ]
         for problem in all {
             XCTAssertFalse(problem.title.isEmpty)

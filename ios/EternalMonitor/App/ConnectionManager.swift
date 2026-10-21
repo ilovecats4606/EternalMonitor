@@ -495,9 +495,11 @@ final class ConnectionManager: ObservableObject {
         channel.onRejected = { [weak self] status in
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
-                // The PC answered: retrying on a timer won't change that, and
-                // would replace its reason with reconnect progress.
-                self.endReconnectCycle()
+                // Busy passes: the PC is streaming elsewhere, often to this
+                // iPad's own cable session that hasn't closed yet. An
+                // automatic cycle keeps retrying and shows it if it runs out.
+                // Pairing and a version mismatch need the user, so they end it.
+                if status != .busy { self.endReconnectCycle() }
                 if status == .unauthorized || status == .rateLimited {
                     self.timeoutTask?.cancel()
                     self.didExtendTimeout = true
@@ -514,13 +516,13 @@ final class ConnectionManager: ObservableObject {
                 }
                 switch status {
                 case .busy:
-                    self.connectionError = "Your PC is already streaming to another device."
+                    self.problem = .pcBusy
                 case .versionUnsupported:
                     self.connectionError = "This app and EternalMonitor on your PC are different versions. Update both, then try again."
                 default:
                     self.connectionError = "Your PC turned down the connection."
                 }
-                self.record(.error, "ctrl", self.connectionError ?? "rejected")
+                self.record(.error, "ctrl", self.connectionError ?? self.problem?.title ?? "rejected")
                 self.disconnect()
             }
         }

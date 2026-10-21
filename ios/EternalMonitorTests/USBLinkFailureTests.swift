@@ -217,12 +217,6 @@ final class USBLinkFailureTests: XCTestCase {
         XCTAssertEqual(invalid.withUnsafeBytes { Darwin.send(peer, $0.baseAddress, $0.count, 0) }, 2)
     }
 
-    private func keyframe() throws -> Data {
-        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "single_idr_64x64", withExtension: "h264",
-            subdirectory: "Fixtures"))
-        return try Data(contentsOf: url)
-    }
-
     /// A cable failure starts the fallback to `wifi`, which never answers.
     /// Returns once its first attempt has timed out and offers Try again.
     private func failCableIntoFallback(to wifi: FakeUDPHost, timing: ConnectionManager.Timing) async throws
@@ -289,7 +283,7 @@ final class USBLinkFailureTests: XCTestCase {
         let accepted = await Task.detached { Thread.sleep(forTimeInterval: 1); return other.acceptSession() }.value
         XCTAssertTrue(accepted, "the iPad never sent HELLO2 to the other PC")
         try await until("handshake") { manager.hostInfo != nil }
-        other.sendKeyframe(try keyframe())
+        other.sendKeyframe(try FakeUDPHost.keyframe())
         try await until("streaming") { manager.state == .connected }
         try await Task.sleep(for: .milliseconds(500))
         XCTAssertEqual(manager.state, .connected)
@@ -355,5 +349,52 @@ final class USBLinkFailureTests: XCTestCase {
             XCTAssertEqual(manager.problem, .noReply(usb: true), "under way: \(underWay)")
             XCTAssertEqual(manager.reconnectAttempt, 0)
         }
+    }
+
+    // MARK: Answers from the PC during the fallback. Busy passes; the cycle
+    // keeps retrying.
+
+    /// Long enough to answer the handshake and stream within one attempt.
+    private let answering = ConnectionManager.Timing(connectTimeoutSeconds: 1, reconnectGraceSeconds: 0.1,
+        reconnectBackoffSeconds: { _ in 0.05 })
+
+    private func finishConnecting(_ manager: ConnectionManager, to host: FakeUDPHost) async throws {
+        let accepted = await Task.detached { host.acceptSession() }.value
+        XCTAssertTrue(accepted, "the cycle never tried the PC again")
+        try await until("handshake") { manager.hostInfo != nil }
+        host.sendKeyframe(try FakeUDPHost.keyframe())
+        try await until("streaming") { manager.state == .connected }
+        XCTAssertNil(manager.problem)
+        XCTAssertEqual(manager.reconnectAttempt, 0)
+    }
+
+    /// The PC still holds this iPad's cable session and answers the Wi-Fi
+    /// fallback with Busy, then frees up.
+    func testBusyDuringTheFallbackRetriesUntilThePCIsFree() async throws {
+        let wifi = FakeUDPHost()
+        enableWiFiFallback(to: wifi)
+        let (manager, link) = try await connectOverCable(timing: answering)
+        defer { link.stop(); manager.cancel() }
+        injectFramingFailure()
+        let refused = await Task.detached { wifi.acceptSession(status: .busy) }.value
+        XCTAssertTrue(refused)
+        try await until("the refusal shows") { manager.state == .disconnected && manager.problem == .pcBusy }
+        XCTAssertEqual(manager.reconnectAttempt, 1, "Busy keeps the automatic cycle")
+        try await finishConnecting(manager, to: wifi)
+    }
+
+    /// A PC that stays busy: the user ends on its reason and Try again.
+    func testBusyThroughoutTheFallbackEndsOnTheRefusal() async throws {
+        let wifi = FakeUDPHost()
+        enableWiFiFallback(to: wifi)
+        let (manager, link) = try await connectOverCable(timing: fast)
+        defer { link.stop(); manager.cancel() }
+        let refusals = Task.detached { (0..<6).filter { _ in wifi.acceptSession(status: .busy) }.count }
+        injectFramingFailure()
+        try await waitForFallbackToGiveUp(manager)
+        let refused = await refusals.value
+        XCTAssertEqual(refused, 6, "every attempt ran")
+        XCTAssertEqual(manager.problem, .pcBusy)
+        XCTAssertEqual(manager.problem?.actions, [.retry])
     }
 }
