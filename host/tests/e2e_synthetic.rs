@@ -1576,6 +1576,8 @@ fn input_relay_maps_touches_end_to_end() {
         phase: PenPhase::Down,
         x: 0,
         y: 0,
+        x_norm: 0,
+        y_norm: 0,
         pressure: 256,
         tilt_x: -40,
         tilt_y: 30,

@@ -217,6 +217,8 @@ mod tests {
             phase,
             x,
             y,
+            x_norm: 0,
+            y_norm: 0,
             pressure: if matches!(phase, PenPhase::Down | PenPhase::Move) {
                 512
             } else {

@@ -122,6 +122,10 @@ pub struct PenSample {
     pub phase: PenPhase,
     pub x: i32,
     pub y: i32,
+    /// The wire position `x` and `y` were mapped from, so a sample injected
+    /// later can be mapped again onto the capture rect current by then.
+    pub x_norm: u16,
+    pub y_norm: u16,
     pub pressure: u32,
     pub tilt_x: i32,
     pub tilt_y: i32,
@@ -278,6 +282,8 @@ pub fn resolve(
                 phase,
                 x: px,
                 y: py,
+                x_norm: event.x_norm,
+                y_norm: event.y_norm,
                 pressure: if matches!(phase, PenPhase::Down | PenPhase::Move) {
                     (u32::from(event.pressure_x1000.min(1000)) * 1024 + 500) / 1000
                 } else {
@@ -400,9 +406,6 @@ pub struct InputRelay {
     held: HeldInputs,
     pen_sequence: Option<u32>,
     last_pen_input: Option<std::time::Instant>,
-    /// Normalised source of the held pen sample, so a refresh can remap it
-    /// when the captured display moves or changes mode under a still Pencil.
-    pen_norm: Option<(u16, u16)>,
     /// The capture rect the last batch was mapped onto.
     output: Option<CaptureGeometry>,
     logged_mapping: Option<InputMapping>,
@@ -534,7 +537,6 @@ impl InputRelay {
         self.session = None;
         self.pen_sequence = None;
         self.last_pen_input = None;
-        self.pen_norm = None;
         self.logged_mapping = None;
     }
 
@@ -608,9 +610,8 @@ impl InputRelay {
             PenPhase::Hover => PenPhase::Hover,
             _ => return None,
         };
-        if let Some((x_norm, y_norm)) = self.pen_norm {
-            (sample.x, sample.y) = norm_to_output_pixel(x_norm, y_norm, output);
-        }
+        // Follow the display if it moved or changed mode under a still Pencil.
+        (sample.x, sample.y) = norm_to_output_pixel(sample.x_norm, sample.y_norm, output);
         self.held.record(&[Injection::Pen(sample)]);
         self.last_pen_input = Some(now);
         Some(Injection::Pen(sample))
@@ -699,7 +700,6 @@ impl InputRelay {
         self.held.record(&injections);
         if event.kind == KIND_PENCIL {
             self.last_pen_input = Some(std::time::Instant::now());
-            self.pen_norm = self.held.pen.map(|_| (event.x_norm, event.y_norm));
         }
         self.inject(&injections);
     }
@@ -858,6 +858,8 @@ mod tests {
                 phase: PenPhase::Down,
                 x: -1,
                 y: -200,
+                x_norm: 65_535,
+                y_norm: 0,
                 pressure: 768,
                 tilt_x: -37,
                 tilt_y: 62,
@@ -1358,6 +1360,8 @@ mod tests {
             phase,
             x: -2360,
             y: 1639,
+            x_norm: 0,
+            y_norm: 65_535,
             pressure: 512,
             tilt_x: 0,
             tilt_y: 0,
