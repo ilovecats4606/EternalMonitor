@@ -16,17 +16,7 @@ use serde::{Deserialize, Serialize};
 
 /// Where people can always get the installer by hand.
 pub const WEBSITE_DOWNLOAD: &str = "https://eternalmonitor.dev/download.html";
-/// Inno Setup flags for an in-place upgrade: a progress window and the UAC
-/// prompt, no wizard pages and no message boxes. Setup does not relaunch the
-/// app in silent mode (`skipifsilent`); the helper does that.
-pub const SETUP_FLAGS: &[&str] = &[
-    "/SP-",
-    "/SILENT",
-    "/SUPPRESSMSGBOXES",
-    "/NORESTART",
-    "/CLOSEAPPLICATIONS",
-    "/NORESTARTAPPLICATIONS",
-];
+pub use eternal_updater::SETUP_FLAGS;
 const INSTALLER_NAME: &str = "EternalMonitor-Setup.exe";
 const CHECK_INTERVAL: u64 = 24 * 60 * 60;
 /// A relaunch checks again only when the last check is this old, so a crash
@@ -327,26 +317,33 @@ pub fn fetch_manifest(endpoints: &Endpoints) -> Result<Release, UpdateError> {
     parse_manifest(&data, endpoints)
 }
 
-/// Downloads into `dir`, verifies, and returns the installer path. A failed or
-/// unverified download leaves no installer behind.
+/// Downloads into a new, randomly named folder under `root`, verifies, and
+/// returns the installer path. A failed or unverified download leaves no
+/// installer behind.
 pub fn download(
     endpoints: &Endpoints,
     release: &Release,
-    dir: &Path,
+    root: &Path,
     progress: impl FnMut(u64, u64),
 ) -> Result<PathBuf, UpdateError> {
+    let io = |error: std::io::Error| UpdateError::Network(error.to_string());
     let api = format!("{}v{}", endpoints.release_api, release.version);
     let github = get_json(&api, "application/vnd.github+json")?;
     let size = check_github_release(&github, release)?;
-    let _ = std::fs::remove_dir_all(dir);
-    std::fs::create_dir_all(dir).map_err(|error| UpdateError::Network(error.to_string()))?;
+    // Earlier updates are finished; their folders can go.
+    let _ = std::fs::remove_dir_all(root);
+    std::fs::create_dir_all(root).map_err(io)?;
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).map_err(|error| UpdateError::Network(error.to_string()))?;
+    let dir = root.join(hex(&random));
+    // A fresh folder: nothing another process prepared is reused.
+    std::fs::create_dir(&dir).map_err(io)?;
     let target = dir.join(format!("EternalMonitor-Setup-{}.exe", release.version));
     let partial = target.with_extension("part");
-    let result = fetch_verified(endpoints, release, size, &partial, progress).and_then(|()| {
-        std::fs::rename(&partial, &target).map_err(|error| UpdateError::Network(error.to_string()))
-    });
+    let result = fetch_verified(endpoints, release, size, &partial, progress)
+        .and_then(|()| std::fs::rename(&partial, &target).map_err(io));
     if result.is_err() {
-        let _ = std::fs::remove_file(&partial);
+        let _ = std::fs::remove_dir_all(&dir);
     }
     result.map(|()| target)
 }
@@ -436,119 +433,118 @@ fn resolve_redirect(from: &str, location: &str) -> Option<String> {
     None
 }
 
-/// Hashes a file on disk; used again right before Setup starts.
-pub fn verify_file(path: &Path, sha256: &str) -> Result<(), UpdateError> {
-    let mut file =
-        std::fs::File::open(path).map_err(|error| UpdateError::Launch(error.to_string()))?;
-    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
-    let mut buffer = vec![0u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| UpdateError::Launch(error.to_string()))?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    if hex(digest.finish().as_ref()) == sha256 {
-        Ok(())
-    } else {
-        Err(UpdateError::UnsafeDownload(
-            "SHA-256 changed on disk".into(),
-        ))
-    }
-}
-
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ── Installing ──────────────────────────────────────────────────────────────
 
-/// Waits for this process to exit, runs Setup, then starts whichever version is
-/// installed, so a failed or cancelled update still leaves the app running.
-const HELPER_SCRIPT: &str = r#"param([int]$HostPid, [string]$Setup, [string]$App, [string]$Log, [string]$SetupLog)
-function Note($text) { Add-Content -LiteralPath $Log -Value ((Get-Date).ToString('o') + ' ' + $text) }
-Wait-Process -Id $HostPid -Timeout 60 -ErrorAction SilentlyContinue
-Note 'EternalMonitor closed'
-$code = -1
-try {
-    $flags = @(__FLAGS__, ('/LOG="' + $SetupLog + '"'))
-    $setupProcess = Start-Process -FilePath $Setup -ArgumentList $flags -PassThru -Wait
-    $code = $setupProcess.ExitCode
-} catch { Note ('Setup did not start: ' + $_) }
-Note ('Setup exit code ' + $code)
-Start-Process -FilePath $App -WorkingDirectory (Split-Path -Parent $App)
-Note 'EternalMonitor started'
-"#;
+/// How long the helper may take to lock and verify the installer.
+const HELPER_READY: Duration = Duration::from_secs(30);
 
-pub fn helper_script() -> String {
-    let flags = SETUP_FLAGS
-        .iter()
-        .map(|flag| format!("'{flag}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    HELPER_SCRIPT.replace("__FLAGS__", &flags)
-}
-
-/// PowerShell arguments for the helper. Rust quotes each one for Windows.
-pub fn helper_args(script: &Path, setup: &Path, app: &Path, pid: u32) -> Vec<String> {
-    let dir = setup.parent().unwrap_or(Path::new("."));
-    vec![
-        "-NoProfile".into(),
-        "-NonInteractive".into(),
-        "-ExecutionPolicy".into(),
-        "Bypass".into(),
-        "-WindowStyle".into(),
-        "Hidden".into(),
-        "-File".into(),
-        script.display().to_string(),
-        "-HostPid".into(),
-        pid.to_string(),
-        "-Setup".into(),
-        setup.display().to_string(),
-        "-App".into(),
-        app.display().to_string(),
-        "-Log".into(),
-        dir.join("update.log").display().to_string(),
-        "-SetupLog".into(),
-        dir.join("setup.log").display().to_string(),
+/// The installed helper, next to the host (`eternal-updater` in a cargo build).
+fn installed_helper(app: &Path) -> Option<PathBuf> {
+    let dir = app.parent()?;
+    [
+        "EternalMonitor-updater.exe",
+        "eternal-updater.exe",
+        "eternal-updater",
     ]
+    .iter()
+    .map(|name| dir.join(name))
+    .find(|path| path.is_file())
 }
 
-#[cfg(windows)]
-fn launch_helper(setup: &Path) -> Result<(), UpdateError> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-    let launch = |error: std::io::Error| UpdateError::Launch(error.to_string());
-    let app = std::env::current_exe().map_err(launch)?;
-    let script = setup.with_file_name("install-update.ps1");
-    std::fs::write(&script, helper_script()).map_err(launch)?;
-    let windows =
-        std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+/// Copies the helper out of the install folder, which Setup replaces, and
+/// returns the copy held open so it cannot change before it starts. The copy
+/// must hash the same as the installed helper.
+pub fn stage_helper(source: &Path, dir: &Path) -> Result<(PathBuf, std::fs::File), UpdateError> {
+    let launch = |error: &dyn std::fmt::Display| UpdateError::Launch(error.to_string());
+    let name = source
+        .file_name()
+        .ok_or_else(|| launch(&"no helper name"))?;
+    let copy = dir.join(name);
+    std::fs::copy(source, &copy).map_err(|e| launch(&e))?;
+    let mut original = std::fs::File::open(source).map_err(|e| launch(&e))?;
+    let mut held = eternal_updater::open_locked(&copy).map_err(|e| launch(&e))?;
+    let expected = eternal_updater::sha256_hex(&mut original).map_err(|e| launch(&e))?;
+    let actual = eternal_updater::sha256_hex(&mut held).map_err(|e| launch(&e))?;
+    if expected != actual {
+        return Err(UpdateError::UnsafeDownload(
+            "the update helper changed".into(),
+        ));
+    }
+    Ok((copy, held))
+}
+
+/// Waits for the helper's `ready`: it holds the verified installer and owns
+/// the relaunch. Anything else (it exits, reports an error or stays silent)
+/// means this process must stay open.
+pub fn await_ready(mut child: std::process::Child, timeout: Duration) -> Result<(), UpdateError> {
+    use std::io::BufRead;
+    let stdout = child.stdout.take();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        if let Some(stdout) = stdout {
+            let _ = std::io::BufReader::new(stdout).read_line(&mut line);
+        }
+        let _ = tx.send(line.trim().to_string());
+    });
+    let line = rx.recv_timeout(timeout).unwrap_or_default();
+    if line == eternal_updater::READY {
+        return Ok(());
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    tracing::warn!(%line, "The update helper did not start the update");
+    if line.contains("SHA-256") {
+        Err(UpdateError::UnsafeDownload(line))
+    } else if line.is_empty() {
+        Err(UpdateError::Launch("the update helper stopped".into()))
+    } else {
+        Err(UpdateError::Launch(line))
+    }
+}
+
+/// Starts the helper for `setup` and returns once it has taken over.
+fn start_install(setup: &Path, release: &Release) -> Result<(), UpdateError> {
+    let launch = |error: &dyn std::fmt::Display| UpdateError::Launch(error.to_string());
+    let app = std::env::current_exe().map_err(|e| launch(&e))?;
+    let source = installed_helper(&app).ok_or_else(|| launch(&"the update helper is missing"))?;
+    let dir = setup.parent().ok_or_else(|| launch(&"no update folder"))?;
+    let (helper, _held) = stage_helper(&source, dir)?;
+    let args = eternal_updater::HelperArgs {
+        installer: setup.to_path_buf(),
+        sha256: release.sha256.clone(),
+        app,
+        host_pid: std::process::id(),
+        log: dir.join("update.log"),
+    };
     let spawn = |flags: u32| {
-        std::process::Command::new(windows.join(r"System32\WindowsPowerShell\v1.0\powershell.exe"))
-            .args(helper_args(&script, setup, &app, std::process::id()))
-            .creation_flags(flags)
-            .spawn()
+        let mut command = std::process::Command::new(&helper);
+        command
+            .args(args.to_args())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(flags);
+        }
+        #[cfg(not(windows))]
+        let _ = flags;
+        command.spawn()
     };
     // The helper must outlive this process. Leave our job object when the
-    // job allows it; otherwise stay in it.
-    let flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
-    spawn(flags | CREATE_BREAKAWAY_FROM_JOB)
-        .or_else(|_| spawn(flags))
-        .map(drop)
-        .map_err(launch)
-}
-
-#[cfg(not(windows))]
-fn launch_helper(_setup: &Path) -> Result<(), UpdateError> {
-    Err(UpdateError::Launch(
-        "updates install on Windows only".into(),
-    ))
+    // job allows it (CREATE_BREAKAWAY_FROM_JOB); otherwise stay in it.
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    let child = spawn(CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB)
+        .or_else(|_| spawn(CREATE_NEW_PROCESS_GROUP))
+        .map_err(|e| launch(&e))?;
+    await_ready(child, HELPER_READY)
 }
 
 // ── State ───────────────────────────────────────────────────────────────────
@@ -604,6 +600,7 @@ pub enum Notice {
 pub enum Command {
     Check { manual: bool },
     Download(Release),
+    Install(PathBuf, Release),
 }
 
 pub struct State {
@@ -618,6 +615,8 @@ pub struct State {
     force: bool,
     /// As of the last GUI frame.
     streaming: bool,
+    /// The helper has taken over; the GUI should close.
+    close: bool,
 }
 
 impl State {
@@ -633,6 +632,7 @@ impl State {
             idle_since: None,
             force: false,
             streaming: false,
+            close: false,
         };
         // A previous run started Setup. The relaunched version tells us how it went.
         if let Some((from, to)) = state.saved.pending.take() {
@@ -863,8 +863,16 @@ impl State {
         Some((path, release))
     }
 
+    /// The helper said `ready`.
+    fn install_started(&mut self) {
+        if self.phase == Phase::Installing {
+            self.close = true;
+        }
+    }
+
     fn install_failed(&mut self, error: &UpdateError) {
         tracing::warn!(%error, "Could not start the update");
+        self.close = false;
         self.saved.pending = None;
         self.phase = Phase::Failed(error.message().into());
     }
@@ -1118,24 +1126,15 @@ impl Updater {
         self.with(|state| state.later(now_secs()));
     }
 
-    /// Advances a queued update and, when the installer is ready and nobody
-    /// is streaming, starts the helper. `true` means: close the app now.
+    /// Advances a queued update and hands a ready installer to the worker,
+    /// which starts the helper. `true` means the helper has taken over: close
+    /// the app now. Until then the app stays open, whatever the helper does.
     pub fn tick(&self, streaming: bool) -> bool {
         let command = self.with(|state| state.tick(streaming, Instant::now()));
         self.send(command);
-        let Some((path, release)) = self.with(|state| state.take_ready(streaming)) else {
-            return false;
-        };
-        match verify_file(&path, &release.sha256).and_then(|()| launch_helper(&path)) {
-            Ok(()) => {
-                tracing::info!(version = %release.version, "Update installer started; closing");
-                true
-            }
-            Err(error) => {
-                self.with(|state| state.install_failed(&error));
-                false
-            }
-        }
+        let ready = self.with(|state| state.take_ready(streaming));
+        self.send(ready.map(|(path, release)| Command::Install(path, release)));
+        self.with(|state| std::mem::take(&mut state.close))
     }
 }
 
@@ -1185,6 +1184,17 @@ impl Worker {
                         },
                     );
                     self.update(|state| state.download_finished(result));
+                    (self.wake)(None);
+                }
+                Command::Install(path, release) => {
+                    let result = start_install(&path, &release);
+                    self.update(|state| match &result {
+                        Ok(()) => {
+                            tracing::info!(version = %release.version, "Update helper took over; closing");
+                            state.install_started();
+                        }
+                        Err(error) => state.install_failed(error),
+                    });
                     (self.wake)(None);
                 }
             }

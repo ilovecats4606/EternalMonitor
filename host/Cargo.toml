@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 eternal-wire = { path = "../proto" }
+eternal-updater = { path = "../updater" }
 ffmpeg-next = { version = "7", features = ["codec", "format", "software-scaling", "software-resampling"] }
 libc = "0.2"
 getrandom = { version = "0.3.4", features = ["std"] }

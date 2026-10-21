@@ -26,7 +26,7 @@ function Resolve-FfmpegDir {
 }
 
 Write-Host "[1/5] Building release binary..."
-cargo build --release --locked -p eternal-host
+cargo build --release --locked -p eternal-host -p eternal-updater
 if ($LASTEXITCODE -ne 0) { exit 1 }
 
 Write-Host "[2/5] Preparing dist/..."
@@ -35,6 +35,7 @@ New-Item -ItemType Directory -Path $distDir | Out-Null
 
 Write-Host "[3/5] Copying files..."
 Copy-Item "target\release\eternal-host.exe" "$distDir\EternalMonitor-host.exe"
+Copy-Item "target\release\eternal-updater.exe" "$distDir\EternalMonitor-updater.exe"
 $ffmpegBin = Join-Path (Resolve-FfmpegDir) "bin"
 Copy-Item "$ffmpegBin\*.dll" "$distDir\"
 Copy-Item "$ffmpegBin\ffmpeg.exe" "$distDir\"

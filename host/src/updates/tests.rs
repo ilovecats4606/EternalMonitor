@@ -336,13 +336,14 @@ fn download_follows_redirects_and_verifies_the_installer() {
     .unwrap();
     assert_eq!(progress.last(), Some(&(17, 17)));
     assert_eq!(std::fs::read(&path).unwrap(), payload);
-    assert!(verify_file(&path, &release.sha256).is_ok());
-    // The file is checked again right before Setup starts.
-    std::fs::write(&path, b"MZ swapped").unwrap();
-    assert!(matches!(
-        verify_file(&path, &release.sha256),
-        Err(UpdateError::UnsafeDownload(_))
-    ));
+    // Each update gets a fresh, randomly named folder.
+    let folder = path.parent().unwrap();
+    assert_eq!(folder.parent(), Some(dir.as_path()));
+    assert_eq!(folder.file_name().unwrap().len(), 16);
+    let again = download(&endpoints, &release, &dir, |_, _| {}).unwrap();
+    assert_ne!(again.parent(), path.parent());
+    assert!(!path.exists(), "the previous update's folder is removed");
+    assert!(eternal_updater::open_verified(&again, &release.sha256).is_ok());
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -648,36 +649,107 @@ fn relaunch_reports_whether_the_update_finished() {
 }
 
 #[test]
-fn helper_runs_setup_silently_then_relaunches_the_app() {
-    let script = helper_script();
-    for flag in SETUP_FLAGS {
-        assert!(script.contains(&format!("'{flag}'")), "{flag}");
+fn setup_runs_silently_with_a_progress_window() {
+    for flag in [
+        "/SILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+        "/CLOSEAPPLICATIONS",
+        "/SP-",
+    ] {
+        assert!(SETUP_FLAGS.contains(&flag), "{flag}");
     }
-    assert!(script.contains("Wait-Process -Id $HostPid"));
-    // The app is started again whatever Setup's exit code.
-    let relaunch = script.find("Start-Process -FilePath $App").unwrap();
-    assert!(relaunch > script.find("Setup exit code").unwrap());
     assert!(
-        !script.contains("/VERYSILENT"),
+        !SETUP_FLAGS.contains(&"/VERYSILENT"),
         "people see a progress window"
     );
+}
 
-    let args = helper_args(
-        Path::new(r"C:\Users\A B\AppData\Local\EternalMonitor\updates\install-update.ps1"),
-        Path::new(
-            r"C:\Users\A B\AppData\Local\EternalMonitor\updates\EternalMonitor-Setup-0.3.2.exe",
-        ),
-        Path::new(r"C:\Program Files\EternalMonitor\EternalMonitor-host.exe"),
-        42,
-    );
-    let at = |name: &str| &args[args.iter().position(|a| a == name).unwrap() + 1];
-    assert_eq!(at("-HostPid"), "42");
+/// A stand-in helper: a shell script with the given body.
+#[cfg(unix)]
+fn fake_helper(body: &str) -> std::process::Child {
+    std::process::Command::new("/bin/sh")
+        .args(["-c", body])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn the_app_closes_only_after_the_helper_takes_over() {
+    let quick = Duration::from_millis(500);
     assert_eq!(
-        at("-App"),
-        r"C:\Program Files\EternalMonitor\EternalMonitor-host.exe"
+        await_ready(fake_helper("echo ready; sleep 1"), quick),
+        Ok(())
     );
-    assert!(at("-File").ends_with("install-update.ps1"));
-    assert!(args.contains(&"-NoProfile".to_string()));
+    // Exits without a word, as when a policy blocks the helper.
+    assert_eq!(
+        await_ready(fake_helper("exit 1"), quick),
+        Err(UpdateError::Launch("the update helper stopped".into()))
+    );
+    // The installer changed before the helper could lock it.
+    assert!(matches!(
+        await_ready(
+            fake_helper("echo 'error: installer SHA-256 is 00'; exit 3"),
+            quick
+        ),
+        Err(UpdateError::UnsafeDownload(_))
+    ));
+    // Silent and still running: it is stopped, and the app stays.
+    let stuck = fake_helper("sleep 30");
+    let pid = stuck.id() as i32;
+    assert!(await_ready(stuck, quick).is_err());
+    assert_ne!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "the stuck helper is stopped"
+    );
+}
+
+#[test]
+fn a_failed_helper_keeps_the_app_open_with_a_message() {
+    let mut s = state(Saved::default());
+    s.finish_check(1000, false, Ok(release("0.3.2")));
+    s.update_now(false);
+    s.download_finished(Ok(PathBuf::from("setup.exe")));
+    s.take_ready(false).unwrap();
+    assert!(!s.close, "nothing closes before the helper answers");
+    assert_eq!(s.notice(1000), Some(Notice::Installing("0.3.2".into())));
+    s.install_failed(&UpdateError::Launch("the update helper stopped".into()));
+    assert!(!s.close);
+    assert_eq!(s.saved.pending, None);
+    assert_eq!(
+        s.notice(1000),
+        Some(Notice::Failed("The update could not start.".into()))
+    );
+    // Try again, and this time the helper answers.
+    s.update_now(false);
+    s.download_finished(Ok(PathBuf::from("setup.exe")));
+    s.take_ready(false).unwrap();
+    s.install_started();
+    assert!(s.close);
+}
+
+#[test]
+fn the_helper_is_copied_out_and_held_unchanged() {
+    let dir = std::env::temp_dir().join(format!("eternal-stage-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("install")).unwrap();
+    std::fs::create_dir_all(dir.join("update")).unwrap();
+    let source = dir.join("install/EternalMonitor-updater.exe");
+    std::fs::write(&source, b"MZ helper").unwrap();
+    let (copy, held) = stage_helper(&source, &dir.join("update")).unwrap();
+    assert_eq!(copy, dir.join("update/EternalMonitor-updater.exe"));
+    assert_eq!(std::fs::read(&copy).unwrap(), b"MZ helper");
+    #[cfg(windows)]
+    assert!(
+        std::fs::write(&copy, b"MZ evil").is_err(),
+        "held while it starts"
+    );
+    drop(held);
+    assert!(stage_helper(&dir.join("install/missing.exe"), &dir.join("update")).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

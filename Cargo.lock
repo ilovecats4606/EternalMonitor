@@ -1174,6 +1174,7 @@ dependencies = [
  "cc",
  "eframe",
  "egui_kittest",
+ "eternal-updater",
  "eternal-wire",
  "ffmpeg-next",
  "getrandom 0.3.4",
@@ -1198,6 +1199,15 @@ dependencies = [
  "ureq",
  "windows 0.58.0",
  "winresource",
+]
+
+[[package]]
+name = "eternal-updater"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "ring",
+ "windows 0.58.0",
 ]
 
 [[package]]
