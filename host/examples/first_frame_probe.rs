@@ -1,8 +1,10 @@
 //! Connects to a running host as a minimal H.264 client and prints the colour
 //! of one pixel in the first decoded frame, to check what a newly connecting
-//! iPad sees first. Usage: first_frame_probe <host:port> <x> <y> [frame.ppm]
+//! iPad sees first. Usage:
+//! first_frame_probe <host:port> <x> <y> [frame.ppm|-] [preferred_fps]
 //! Pairing must be off on the host. The optional path receives the first
-//! frame, downscaled 4x, as a binary PPM.
+//! frame, downscaled 4x, as a binary PPM. A preferred frame rate other than
+//! the previous viewer's makes the host reopen its encoder for this viewer.
 
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
@@ -18,11 +20,13 @@ use eternal_wire::v2::{classify, Classified};
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     assert!(
-        (3..=4).contains(&args.len()),
-        "usage: first_frame_probe <host:port> <x> <y> [frame.ppm]"
+        (3..=5).contains(&args.len()),
+        "usage: first_frame_probe <host:port> <x> <y> [frame.ppm|-] [preferred_fps]"
     );
     let host = args[0].clone();
     let (x, y): (usize, usize) = (args[1].parse().unwrap(), args[2].parse().unwrap());
+    let ppm = args.get(3).filter(|path| *path != "-");
+    let preferred_fps: u8 = args.get(4).map_or(60, |fps| fps.parse().unwrap());
     ffmpeg_next::init().unwrap();
     ffmpeg_next::util::log::set_level(ffmpeg_next::util::log::Level::Quiet);
 
@@ -48,7 +52,7 @@ fn main() {
             refresh_hz: 60,
             device_name: "first-frame probe".into(),
             device_id: 0,
-            preferred_fps: 60,
+            preferred_fps,
             auth_token: [0; 16],
             pairing_code: 0,
         }),
@@ -126,7 +130,7 @@ fn main() {
                 }
                 if decoder.receive_frame(&mut frame).is_ok() {
                     let (r, g, b) = rgb_at(&frame, x, y);
-                    if let Some(path) = args.get(3) {
+                    if let Some(path) = ppm {
                         write_ppm(&frame, path);
                     }
                     println!(
