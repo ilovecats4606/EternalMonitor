@@ -122,6 +122,7 @@ impl StatsSnapshot {
 struct ClientSnapshot {
     info: Option<ClientInfo>,
     peer: Option<PeerId>,
+    session_id: Option<u32>,
     report: Option<ReceiverReport>,
 }
 
@@ -131,6 +132,7 @@ impl ClientSnapshot {
         Self {
             info: session.client_info(),
             peer: session.peer(),
+            session_id: session.session_id(),
             report: session.last_report(),
         }
     }
@@ -286,6 +288,7 @@ pub struct AnalyzerApp {
     qr_cache: Option<(String, QrCode)>,
     copied: Option<(Copied, Instant)>,
     history: History,
+    quality: QualityMeter,
     logo: Option<(f32, egui::TextureHandle)>,
 }
 
@@ -406,6 +409,7 @@ impl AnalyzerApp {
             qr_cache: None,
             copied: None,
             history: History::new(),
+            quality: QualityMeter::default(),
             logo: None,
         }
     }
@@ -1117,18 +1121,16 @@ fn friendly_codec(name: &str) -> String {
     format!("{codec} · {engine}")
 }
 
-/// One word for how well the stream is getting through, from the iPad's
-/// last report: lost fragments and round-trip time.
-fn connection_quality(report: Option<&ReceiverReport>) -> &'static str {
-    let Some(r) = report else {
-        return "Measuring";
-    };
-    let total = f64::from(r.frags_received) + f64::from(r.frags_repaired) + f64::from(r.frags_lost);
+/// One word for how well the stream is getting through, from one interval
+/// of the iPad's reports: fragments received, repaired and lost, and the
+/// round-trip time.
+fn connection_quality(received: u32, repaired: u32, lost: u32, rtt_ms_x10: u16) -> &'static str {
+    let total = f64::from(received) + f64::from(repaired) + f64::from(lost);
     if total == 0.0 {
         return "Measuring";
     }
-    let loss = 100.0 * f64::from(r.frags_lost) / total;
-    let rtt_ms = f64::from(r.rtt_ms_x10) / 10.0;
+    let loss = 100.0 * f64::from(lost) / total;
+    let rtt_ms = f64::from(rtt_ms_x10) / 10.0;
     if loss < 0.5 && rtt_ms < 20.0 {
         "Excellent"
     } else if loss < 2.0 && rtt_ms < 50.0 {
@@ -1137,6 +1139,54 @@ fn connection_quality(report: Option<&ReceiverReport>) -> &'static str {
         "Fair"
     } else {
         "Poor"
+    }
+}
+
+/// Rates the stream from the change between consecutive iPad reports, as the
+/// bitrate controller does. The report counters are cumulative for a stream
+/// epoch, so a long healthy session would otherwise hide a bad minute.
+#[derive(Default)]
+struct QualityMeter {
+    previous: Option<(u32, ReceiverReport)>,
+    rating: Option<&'static str>,
+}
+
+impl QualityMeter {
+    fn update(&mut self, session_id: Option<u32>, report: Option<&ReceiverReport>) -> &'static str {
+        let (Some(session_id), Some(report)) = (session_id, report) else {
+            *self = Self::default();
+            return "Measuring";
+        };
+        if self.previous == Some((session_id, *report)) {
+            return self.rating.unwrap_or("Measuring");
+        }
+        // A new session or stream epoch restarts the counters: rate what the
+        // new counters say, as the bitrate controller does.
+        let (received, repaired, lost) = match self.previous {
+            Some((session, prev))
+                if session == session_id
+                    && prev.stream_epoch == report.stream_epoch
+                    && report.frags_received >= prev.frags_received =>
+            {
+                (
+                    report.frags_received - prev.frags_received,
+                    report.frags_repaired.saturating_sub(prev.frags_repaired),
+                    report.frags_lost.saturating_sub(prev.frags_lost),
+                )
+            }
+            _ => (
+                report.frags_received,
+                report.frags_repaired,
+                report.frags_lost,
+            ),
+        };
+        self.previous = Some((session_id, *report));
+        let rating = connection_quality(received, repaired, lost, report.rtt_ms_x10);
+        // An interval with no fragments (a static screen) keeps the last word.
+        if rating != "Measuring" || self.rating.is_none() {
+            self.rating = Some(rating);
+        }
+        self.rating.unwrap_or("Measuring")
     }
 }
 

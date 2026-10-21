@@ -140,6 +140,28 @@ fn connect_named(shared: &SharedControl, device_name: &str, frags_lost: u32, fra
     );
 }
 
+/// Another receiver report from the connected iPad, with cumulative counters.
+fn report(shared: &SharedControl, frags_received: u32, frags_lost: u32) {
+    let mut session = shared.session.lock();
+    let session_id = session.session_id().unwrap();
+    session.handle_control(
+        PeerId::usb(7),
+        session_id,
+        ControlMessage::ReceiverReport(ReceiverReport {
+            stream_epoch: 1,
+            frags_received,
+            frags_lost,
+            decode_fps_x10: 599,
+            e2e_latency_ms_x10: 184,
+            rtt_ms_x10: 32,
+            audio_buffer_ms: 60,
+            ..Default::default()
+        }),
+        &Fixture,
+        Instant::now(),
+    );
+}
+
 fn pipeline_stats() -> PipelineStats {
     let mut stats = PipelineStats::new();
     stats.listen_addr = "192.0.2.10:9876".into();
@@ -334,6 +356,16 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
         .query_by_label("Restart the stream to apply your changes")
         .is_none());
     harness.get_by_label_contains("as soon as it connects");
+
+    // The Connection rating follows the latest interval. After a million
+    // clean fragments, 8,000 received and 2,000 lost is a bad interval even
+    // though the session total is 0.2% loss.
+    report(&shared, 1_000_000, 10);
+    harness.run_steps(4);
+    harness.get_by_label("Excellent");
+    report(&shared, 1_008_000, 2_010);
+    harness.run_steps(4);
+    harness.get_by_label("Poor");
     std::fs::remove_dir_all(dir).unwrap();
 }
 

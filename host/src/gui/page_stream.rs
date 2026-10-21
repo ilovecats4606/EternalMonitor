@@ -6,9 +6,8 @@ use super::icons::Icon;
 use super::theme::*;
 use super::widgets::{self, Tone, GAP};
 use super::{
-    connection_quality, value_or_unknown, AnalyzerApp, ClientSnapshot, Copied, StatsSnapshot,
-    StreamState, CAPTURE_AUTO_LABEL, CAPTURE_VIRTUAL_LABEL, CAPTURE_VIRTUAL_SENTINEL,
-    ENCODER_AUTO_LABEL,
+    value_or_unknown, AnalyzerApp, ClientSnapshot, Copied, StatsSnapshot, StreamState,
+    CAPTURE_AUTO_LABEL, CAPTURE_VIRTUAL_LABEL, CAPTURE_VIRTUAL_SENTINEL, ENCODER_AUTO_LABEL,
 };
 use crate::control::VddStatus;
 
@@ -192,6 +191,9 @@ impl AnalyzerApp {
 
     fn status_header(&mut self, ui: &mut Ui, snap: &StatsSnapshot, client: &ClientSnapshot) {
         let state = StreamState::of(snap, client);
+        let quality = self
+            .quality
+            .update(client.session_id, client.report.as_ref());
         let device = client
             .info
             .as_ref()
@@ -326,14 +328,7 @@ impl AnalyzerApp {
                     .on_hover_text("Pictures per second. 60 looks smooth.");
                     widgets::metric(&mut cols[1], "Delay", &latency, "ms", 22.0)
                         .on_hover_text("Time from this PC's screen to the picture on the iPad.");
-                    widgets::metric(
-                        &mut cols[2],
-                        "Connection",
-                        connection_quality(client.report.as_ref()),
-                        "",
-                        22.0,
-                    )
-                    .on_hover_text(
+                    widgets::metric(&mut cols[2], "Connection", quality, "", 22.0).on_hover_text(
                         "How well the picture is getting through. Performance has the details.",
                     );
                 });
