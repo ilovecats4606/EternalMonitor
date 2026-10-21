@@ -1,6 +1,6 @@
 //! Windows mouse/keyboard and native Windows Ink pen injection.
 
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use windows::Win32::Foundation::{ERROR_NOT_READY, POINT, RECT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::Controls::{
@@ -31,9 +31,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
-use super::pen_contact::{
-    pointer_flag, NotReadyRetry, Outcome, PenContact, PenTarget, PointerFrame, PointerKind,
-};
+use super::pen_contact::{pointer_flag, NotReadyRetry, Outcome, PointerFrame, PointerKind};
+use super::pen_device::PenApi;
 use super::{CaptureGeometry, Injection, PenSample, VirtualScreen};
 
 // Frames are built, and tested, without the SDK.
@@ -48,46 +47,62 @@ const _: () = {
     assert!(POINTER_FLAG_UP.0 == pointer_flag::UP);
 };
 
-/// One device per relay, retained across samples and destroyed at shutdown.
-#[derive(Debug)]
-pub struct PenDevice {
-    device: Device,
-    /// What Windows believes about the pen; chooses every frame.
-    contact: PenContact,
-}
-
-#[derive(Debug)]
-struct Device {
-    handle: Option<HSYNTHETICPOINTERDEVICE>,
+/// The Win32 calls behind the native pen device.
+#[derive(Debug, Default)]
+pub(crate) struct Win32Pen {
     /// Error codes already logged, so a repeated refusal logs once.
     warned: Vec<windows::core::HRESULT>,
     retry: NotReadyRetry,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Win32Handle(HSYNTHETICPOINTERDEVICE);
+
 // This is a process-owned User32 handle, not a pointer we dereference. Tokio
 // may move the relay between threads; &mut self serializes every API call.
-unsafe impl Send for PenDevice {}
+unsafe impl Send for Win32Handle {}
 
-impl Default for PenDevice {
-    fn default() -> Self {
-        Self {
-            device: Device {
-                handle: create_device(),
-                warned: Vec::new(),
-                retry: NotReadyRetry::default(),
-            },
-            contact: PenContact::default(),
-        }
+impl PenApi for Win32Pen {
+    type Handle = Win32Handle;
+    type Error = windows::core::Error;
+
+    fn create(&mut self) -> Result<Win32Handle, windows::core::Error> {
+        unsafe { CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_NONE) }.map(Win32Handle)
+    }
+
+    fn destroy(&mut self, handle: Win32Handle) {
+        unsafe { DestroySyntheticPointerDevice(handle.0) };
+    }
+
+    fn screen(&self) -> VirtualScreen {
+        virtual_screen()
+    }
+
+    fn inject(
+        &mut self,
+        handle: Win32Handle,
+        frame: PenSample,
+        from: PointerKind,
+        screen: VirtualScreen,
+        output: Option<CaptureGeometry>,
+    ) -> Outcome {
+        let context = FrameContext { screen, output };
+        inject_frame(
+            handle.0,
+            frame,
+            from,
+            context,
+            &mut self.warned,
+            &mut self.retry,
+        )
     }
 }
 
-fn create_device() -> Option<HSYNTHETICPOINTERDEVICE> {
-    match unsafe { CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_NONE) } {
-        Ok(handle) => Some(handle),
-        Err(error) => {
-            warn!(%error, "Native Windows pen input unavailable");
-            None
-        }
+pub(crate) type PenDevice = super::pen_device::PenDevice<Win32Pen>;
+
+impl Default for PenDevice {
+    fn default() -> Self {
+        Self::new(Win32Pen::default())
     }
 }
 
@@ -96,89 +111,6 @@ fn create_device() -> Option<HSYNTHETICPOINTERDEVICE> {
 struct FrameContext {
     screen: VirtualScreen,
     output: Option<CaptureGeometry>,
-}
-
-/// The device as `PenContact` sees it for one batch.
-struct Target<'a> {
-    device: &'a mut Device,
-    context: FrameContext,
-}
-
-impl PenTarget for Target<'_> {
-    fn screen(&self) -> VirtualScreen {
-        self.context.screen
-    }
-
-    fn inject(&mut self, frame: PenSample, from: PointerKind) -> Outcome {
-        let Device {
-            handle,
-            warned,
-            retry,
-        } = self.device;
-        match *handle {
-            Some(handle) => inject_frame(handle, frame, from, self.context, warned, retry),
-            None => Outcome::Rejected,
-        }
-    }
-
-    fn recreate(&mut self) {
-        if let Some(handle) = self.device.handle.take() {
-            unsafe { DestroySyntheticPointerDevice(handle) };
-        }
-        self.device.handle = create_device();
-        info!(
-            available = self.device.handle.is_some(),
-            "Recreated the native pen device to end a pointer Windows may still hold"
-        );
-    }
-}
-
-impl PenDevice {
-    pub fn available(&self) -> bool {
-        self.device.handle.is_some()
-    }
-
-    fn inject(&mut self, sample: PenSample, context: FrameContext) {
-        if !self.available() {
-            return;
-        }
-        let mut target = Target {
-            device: &mut self.device,
-            context,
-        };
-        self.contact.deliver(sample, context.output, &mut target);
-    }
-
-    /// The session ended or was taken over; see `PenContact::reset`.
-    pub fn reset(&mut self) {
-        if !self.available() {
-            return;
-        }
-        let mut target = Target {
-            device: &mut self.device,
-            context: FrameContext {
-                screen: virtual_screen(),
-                output: None,
-            },
-        };
-        self.contact.reset(&mut target);
-    }
-
-    /// Deliver samples Windows was not ready for, mapped onto `output`, the
-    /// current capture rect. Called on every refresh tick.
-    pub fn flush(&mut self, output: Option<CaptureGeometry>) {
-        if !self.available() || self.contact.pending().is_none() {
-            return;
-        }
-        let mut target = Target {
-            device: &mut self.device,
-            context: FrameContext {
-                screen: virtual_screen(),
-                output,
-            },
-        };
-        self.contact.flush(output, &mut target);
-    }
 }
 
 fn inject_frame(
@@ -263,14 +195,6 @@ fn inject_frame(
     }
 }
 
-impl Drop for PenDevice {
-    fn drop(&mut self) {
-        if let Some(handle) = self.device.handle.take() {
-            unsafe { DestroySyntheticPointerDevice(handle) };
-        }
-    }
-}
-
 /// The Windows virtual screen (all monitors' bounding box) for absolute
 /// pointer mapping. Queried per batch — display topology can change under us.
 pub fn virtual_screen() -> VirtualScreen {
@@ -346,9 +270,13 @@ pub fn become_per_monitor_dpi_aware() {
     let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 }
 
-/// Execute a resolved injection batch. `output` is the captured display the
-/// batch was mapped onto, for diagnostics.
-pub fn inject(injections: &[Injection], pen: &mut PenDevice, output: Option<CaptureGeometry>) {
+/// Execute a resolved injection batch, after `PenDevice::route`. `output` is
+/// the captured display the batch was mapped onto, for diagnostics.
+pub(crate) fn inject(
+    injections: &[Injection],
+    pen: &mut PenDevice,
+    output: Option<CaptureGeometry>,
+) {
     if !probe_guard_allows(injections) {
         warn!("Input probe guard rejected an injection batch");
         return;
@@ -363,7 +291,7 @@ pub fn inject(injections: &[Injection], pen: &mut PenDevice, output: Option<Capt
                     unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
                     inputs.clear();
                 }
-                pen.inject(sample, FrameContext { screen, output });
+                pen.inject(sample, screen, output);
                 continue;
             }
             Injection::KeyDown { scan, extended } | Injection::KeyUp { scan, extended } => {

@@ -16,6 +16,8 @@ pub mod windows_inject;
 #[cfg(any(windows, test))]
 mod pen_contact;
 #[cfg(any(windows, test))]
+mod pen_device;
+#[cfg(any(windows, test))]
 mod probe_guard;
 
 /// Desktop-space rectangle of the captured output (from DXGI's
@@ -524,25 +526,25 @@ impl InputRelay {
     fn inject(&mut self, injections: &[Injection]) {
         #[cfg(windows)]
         {
-            if self.pen_device.available() {
-                windows_inject::inject(injections, &mut self.pen_device, self.output);
-            } else {
-                let screen = windows_inject::virtual_screen();
-                let mouse: Vec<_> = injections
-                    .iter()
-                    .flat_map(|injection| match *injection {
-                        Injection::Pen(sample) => pen_to_mouse(sample, screen),
-                        other => vec![other],
-                    })
-                    .collect();
-                windows_inject::inject(&mouse, &mut self.pen_device, self.output);
-            }
+            // Pen samples go to the native device, or to the mouse while
+            // Windows refuses to create one.
+            let screen = windows_inject::virtual_screen();
+            let now = std::time::Instant::now();
+            let routed = self.pen_device.route(injections, screen, now);
+            windows_inject::inject(&routed, &mut self.pen_device, self.output);
         }
         #[cfg(not(windows))]
         {
             recorder::record(injections);
             log_injections(injections);
         }
+    }
+
+    /// A session is starting: ask again for a pen device Windows refused, so
+    /// the session can be offered native pen input if it is back.
+    pub fn revive_pen(&mut self) {
+        #[cfg(windows)]
+        self.pen_device.revive(std::time::Instant::now());
     }
 
     /// Release keys/buttons when a session ends, expires, or is superseded.
