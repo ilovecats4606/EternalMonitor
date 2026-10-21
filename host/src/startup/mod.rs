@@ -27,7 +27,7 @@ static WINDOW_SHOWN: AtomicBool = AtomicBool::new(false);
 static SHOWN_AT: OnceLock<Instant> = OnceLock::new();
 
 /// Test hook for the failure paths. Set `ETERNAL_SIMULATE_STARTUP_FAILURE` to
-/// `error`, `panic`, `hang` (30 s) or, on Windows,
+/// `error`, `error-later` (after 10 s), `panic`, `hang` (30 s) or, on Windows,
 /// `crash`, `crash-thread` (on another thread), `crash-heap` (while another
 /// thread holds the heap lock) or `fail-fast` (past the exception filter) to
 /// fail while the window renderer starts; `early-error` to fail right after the failure reporter
@@ -59,7 +59,7 @@ pub fn install_failure_hooks() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if std::thread::current().name() == Some("main") {
-            after_main_panic(|| save(&panic_detail(info)), crate::vdd::disable, show);
+            in_report_order(|| save(&panic_detail(info)), crate::vdd::disable, show);
         } else {
             tracing::error!(panic = %info, backtrace = %std::backtrace::Backtrace::force_capture(), "Host panic");
             crate::vdd::disable();
@@ -102,9 +102,9 @@ fn prepare_crash_reporting() {
     reporter::start(&directory, owner, &launch_id);
 }
 
-/// Save the report, turn the virtual display off, then ask for the message:
-/// the dialog never holds the cleanup, and killing a stuck app cannot skip it.
-fn after_main_panic(
+/// Save the report, clean up, then ask for the message: the dialog never
+/// holds the cleanup, and killing a stuck app cannot skip it.
+fn in_report_order(
     save: impl FnOnce() -> Option<(&'static str, String)>,
     disable_virtual_display: impl FnOnce(),
     show: impl FnOnce(&str, &str),
@@ -301,6 +301,12 @@ pub fn report(detail: &str) {
     }
 }
 
+/// Record a failure that ended the window, run `cleanup`, then tell the user,
+/// as for a panic.
+pub fn report_after(detail: &str, cleanup: impl FnOnce()) {
+    in_report_order(|| save(detail), cleanup, show);
+}
+
 /// Write the failure to the log and the outbox now. Only the first failure
 /// per process is saved, so a panic that turns into an abort is not reported
 /// twice. Returns the message to show.
@@ -325,7 +331,15 @@ fn save(detail: &str) -> Option<(&'static str, String)> {
 /// The reporter shows the message; without one, this process does, after
 /// everything else is saved and cleaned up.
 fn show(title: &str, body: &str) {
-    if dialogs_wanted() && !reporter::request_message(title, body) {
+    if !dialogs_wanted() {
+        // Automation still sees when the message would have appeared.
+        let _ = crate::logging::append_now(&timestamped(
+            " INFO",
+            &format!("Message not shown in automation: {title}"),
+        ));
+        return;
+    }
+    if !reporter::request_message(title, body) {
         show_message(title, body);
     }
 }
@@ -419,6 +433,10 @@ fn simulated() -> String {
 pub(crate) fn simulate_renderer_failure() -> Result<(), String> {
     match simulated().as_str() {
         "error" => Err(format!("Simulated renderer failure from {SIMULATE_ENV}")),
+        "error-later" => {
+            std::thread::sleep(Duration::from_secs(10));
+            Err(format!("Simulated renderer failure from {SIMULATE_ENV}"))
+        }
         "panic" => panic!("Simulated renderer panic from {SIMULATE_ENV}"),
         "hang" => {
             std::thread::sleep(Duration::from_secs(30));
@@ -760,7 +778,7 @@ mod tests {
     #[test]
     fn a_gui_panic_turns_the_virtual_display_off_before_the_message() {
         let steps = std::cell::RefCell::new(Vec::new());
-        after_main_panic(
+        in_report_order(
             || {
                 steps.borrow_mut().push("saved");
                 Some(("EternalMonitor stopped unexpectedly", "body".to_string()))
@@ -774,7 +792,7 @@ mod tests {
         assert_eq!(*steps.borrow(), ["saved", "virtual display off", "message"]);
         // An already reported failure still cleans up, without a second message.
         steps.borrow_mut().clear();
-        after_main_panic(
+        in_report_order(
             || None,
             || steps.borrow_mut().push("virtual display off"),
             |_, _| steps.borrow_mut().push("message"),

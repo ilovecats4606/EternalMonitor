@@ -225,6 +225,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // a window): stream until SIGTERM/SIGINT, then fall through to the same
     // clean teardown as a GUI quit — mDNS goodbye, VDD disable, bounded
     // supervisor join. (Previously a kill skipped all of that.)
+    let mut window_error = None;
     if std::env::var("ETERNAL_HEADLESS").is_ok_and(|v| v.trim() == "1") {
         info!("ETERNAL_HEADLESS=1 — running without GUI until terminated");
         #[cfg(unix)]
@@ -265,15 +266,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Termination signal received — shutting down cleanly");
     } else if let Err(e) = gui::run_gui(gui_control.clone()) {
         error!(error = %e, "GUI exited with error");
-        eternal_host::startup::report(&format!("Window error: {e}"));
+        window_error = Some(format!("Window error: {e}"));
     }
 
-    gui_control.shared.stop();
-    gui_control.request_shutdown();
+    let stop_streaming = || {
+        gui_control.shared.stop();
+        gui_control.request_shutdown();
 
-    // Never leave the virtual display attached after we exit — it should only exist while
-    // EternalMonitor is actively using it.
-    vdd::disable();
+        // Never leave the virtual display attached after we exit — it should only exist while
+        // EternalMonitor is actively using it.
+        vdd::disable();
+    };
+    // A window error is saved first and shown after the cleanup, as a panic is.
+    match window_error {
+        Some(detail) => eternal_host::startup::report_after(&detail, stop_streaming),
+        None => stop_streaming(),
+    }
 
     // Give the supervisor a bounded amount of time to shut down cleanly,
     // exiting the moment it finishes instead of always burning the full
