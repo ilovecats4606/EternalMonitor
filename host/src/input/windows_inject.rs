@@ -99,12 +99,13 @@ impl PenDevice {
         else {
             return;
         };
-        contact.deliver(sample, &mut |frame, from| {
+        contact.deliver(sample, context.output, &mut |frame, from| {
             inject_frame(*handle, frame, from, context, warned)
         });
     }
 
-    /// Retry a frame Windows was not ready for. Called on every refresh tick.
+    /// Deliver samples Windows was not ready for, mapped onto `output`, the
+    /// current capture rect. Called on every refresh tick.
     pub fn flush(&mut self, output: Option<CaptureGeometry>) {
         let Self {
             handle: Some(handle),
@@ -121,7 +122,9 @@ impl PenDevice {
             screen: virtual_screen(),
             output,
         };
-        contact.flush(&mut |frame, from| inject_frame(*handle, frame, from, context, warned));
+        contact.flush(output, &mut |frame, from| {
+            inject_frame(*handle, frame, from, context, warned)
+        });
     }
 }
 

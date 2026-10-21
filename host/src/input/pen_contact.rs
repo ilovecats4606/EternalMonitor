@@ -11,7 +11,13 @@
 //! cancels every injected contact. ERROR_NOT_READY applies nothing; the same
 //! frame must be retried.
 
-use super::{PenPhase, PenSample, VirtualScreen};
+use std::collections::VecDeque;
+
+use super::{CaptureGeometry, PenPhase, PenSample, VirtualScreen};
+
+/// Samples that may wait for Windows. Positions coalesce, so this bounds
+/// strokes that start and end while Windows stays not ready.
+const QUEUE_LIMIT: usize = 8;
 
 /// `POINTER_FLAG_*` values from winuser.h, so frames can be built and checked
 /// off Windows. `windows_inject.rs` asserts that they match the SDK's.
@@ -100,9 +106,13 @@ pub enum Outcome {
 #[derive(Debug, Default)]
 pub struct PenContact {
     state: PointerState,
-    /// A state-changing frame that hit ERROR_NOT_READY. It is retried, as
-    /// the same frame, before anything else.
-    pending: Option<PenSample>,
+    /// Samples Windows has not been brought to yet, oldest first: one that
+    /// hit ERROR_NOT_READY and those that arrived behind it. Each is planned
+    /// from the accepted state when its turn comes, so a frame deferred part
+    /// way through a sample (the final move before an up) is retried before
+    /// the rest of it, and mapped from its wire position onto the capture
+    /// rect current at that moment.
+    queue: VecDeque<PenSample>,
 }
 
 impl PenContact {
@@ -111,25 +121,73 @@ impl PenContact {
         self.state
     }
 
+    /// The oldest sample still waiting for Windows.
     pub fn pending(&self) -> Option<PenSample> {
-        self.pending
+        self.queue.front().copied()
     }
 
-    /// Bring Windows to the state `sample` asks for. `inject` performs one
+    /// Bring Windows to the state `sample` asks for, after anything still
+    /// waiting. `output` is the current capture rect. `inject` performs one
     /// frame and reports its outcome, given the state the frame starts from.
     pub fn deliver(
         &mut self,
         sample: PenSample,
+        output: Option<CaptureGeometry>,
         inject: &mut impl FnMut(PenSample, PointerKind) -> Outcome,
     ) {
-        if self.pending.is_some() && self.flush(inject) == Some(Outcome::NotReady) {
-            // Windows is still not ready. A frame planned now would start from
-            // the wrong state; the refresh tick or the next sample retries.
-            if !matches!(sample.phase, PenPhase::Move | PenPhase::Hover) {
-                self.pending = Some(self.merge_pending(sample));
+        self.enqueue(sample);
+        self.flush(output, inject);
+    }
+
+    /// Deliver waiting samples in order until Windows is not ready. Call on
+    /// every refresh tick so an end of contact is not left waiting for the
+    /// next Pencil sample.
+    pub fn flush(
+        &mut self,
+        output: Option<CaptureGeometry>,
+        inject: &mut impl FnMut(PenSample, PointerKind) -> Outcome,
+    ) {
+        while let Some(mut sample) = self.pending() {
+            if let Some(output) = output {
+                (sample.x, sample.y) =
+                    super::norm_to_output_pixel(sample.x_norm, sample.y_norm, output);
             }
-            return;
+            if !self.bring(sample, inject) {
+                return;
+            }
+            self.queue.pop_front();
         }
+    }
+
+    fn enqueue(&mut self, sample: PenSample) {
+        let update = |sample: &PenSample| matches!(sample.phase, PenPhase::Move | PenPhase::Hover);
+        match self.queue.back_mut() {
+            // Only the latest position matters.
+            Some(last) if update(last) && update(&sample) => *last = sample,
+            _ => {
+                // Drop the oldest waiting sample, but never the first, which
+                // may be part way through, the first end of contact, which
+                // the contact Windows has is owed, or this one.
+                if self.queue.len() == QUEUE_LIMIT {
+                    let owed = self
+                        .queue
+                        .iter()
+                        .position(|s| matches!(s.phase, PenPhase::Up | PenPhase::Cancel));
+                    let oldest = if owed == Some(1) { 2 } else { 1 };
+                    self.queue.remove(oldest);
+                }
+                self.queue.push_back(sample);
+            }
+        }
+    }
+
+    /// Plan and send the frames for one sample. Returns false if Windows was
+    /// not ready, leaving the rest to be planned again from where it stopped.
+    fn bring(
+        &mut self,
+        sample: PenSample,
+        inject: &mut impl FnMut(PenSample, PointerKind) -> Outcome,
+    ) -> bool {
         // A rejection cancels the contact; resume it from this same, freshly
         // mapped sample once rather than waiting for the next one.
         for _ in 0..2 {
@@ -137,7 +195,7 @@ impl PenContact {
             for frame in self.plan(sample) {
                 match self.send(frame, inject) {
                     Outcome::Injected => {}
-                    Outcome::NotReady => return,
+                    Outcome::NotReady => return false,
                     Outcome::Rejected => {
                         rejected = true;
                         break;
@@ -145,37 +203,10 @@ impl PenContact {
                 }
             }
             if !rejected || !matches!(sample.phase, PenPhase::Move | PenPhase::Hover) {
-                return;
+                break;
             }
         }
-    }
-
-    /// Retry a pending frame. Returns its outcome, or `None` with nothing
-    /// pending. Call on every refresh tick so an end of contact is not left
-    /// waiting for the next Pencil sample.
-    pub fn flush(
-        &mut self,
-        inject: &mut impl FnMut(PenSample, PointerKind) -> Outcome,
-    ) -> Option<Outcome> {
-        let frame = self.pending.take()?;
-        if !self.valid(frame) {
-            // Superseded: a later accepted frame already moved Windows on.
-            return None;
-        }
-        Some(self.send(frame, inject))
-    }
-
-    /// While Windows refuses everything, keep only the latest edge, but never
-    /// replace a pending end of contact with the start of another.
-    fn merge_pending(&self, sample: PenSample) -> PenSample {
-        match (self.pending, sample.phase) {
-            (Some(pending), PenPhase::Down | PenPhase::Hover)
-                if matches!(pending.phase, PenPhase::Up | PenPhase::Cancel) =>
-            {
-                pending
-            }
-            _ => sample,
-        }
+        true
     }
 
     fn send(
@@ -186,38 +217,16 @@ impl PenContact {
         let outcome = inject(frame, self.state.kind());
         match outcome {
             Outcome::Injected => {
-                self.pending = None;
                 self.state = match frame.phase {
                     PenPhase::Down | PenPhase::Move => PointerState::Contact(frame),
                     PenPhase::Hover => PointerState::Hover(frame),
                     PenPhase::Up | PenPhase::Cancel | PenPhase::Leave => PointerState::Out,
                 };
             }
-            // Moves and hovers are superseded by the next sample or refresh.
-            Outcome::NotReady => {
-                if !matches!(frame.phase, PenPhase::Move | PenPhase::Hover) {
-                    self.pending = Some(frame);
-                }
-            }
-            Outcome::Rejected => {
-                self.pending = None;
-                self.state = PointerState::Out;
-            }
+            Outcome::NotReady => {}
+            Outcome::Rejected => self.state = PointerState::Out,
         }
         outcome
-    }
-
-    /// Whether `frame` is a legal transition from the current state.
-    fn valid(&self, frame: PenSample) -> bool {
-        match (self.state, frame.phase) {
-            (PointerState::Out | PointerState::Hover(_), PenPhase::Down | PenPhase::Hover) => true,
-            (PointerState::Hover(_), PenPhase::Leave) => true,
-            (PointerState::Contact(_), PenPhase::Move) => true,
-            (PointerState::Contact(last), PenPhase::Up | PenPhase::Cancel) => {
-                (last.x, last.y) == (frame.x, frame.y)
-            }
-            _ => false,
-        }
     }
 
     /// The frames that take Windows from its current state to `sample`'s.
@@ -264,8 +273,8 @@ mod tests {
             phase,
             x,
             y,
-            x_norm: 0,
-            y_norm: 0,
+            x_norm: (x - OUTPUT.left) as u16,
+            y_norm: (y - OUTPUT.top) as u16,
             pressure: if matches!(phase, PenPhase::Down | PenPhase::Move) {
                 512
             } else {
@@ -276,12 +285,19 @@ mod tests {
         }
     }
 
-    /// A virtual screen with room for negative desktop coordinates.
+    /// A capture rect on which wire positions are desktop pixels offset by
+    /// its origin, with room for negative desktop coordinates.
+    const OUTPUT: CaptureGeometry = CaptureGeometry {
+        left: -8192,
+        top: -8192,
+        width: 65_536,
+        height: 65_536,
+    };
     const SCREEN: VirtualScreen = VirtualScreen {
         left: -8192,
         top: -8192,
-        width: 32_768,
-        height: 32_768,
+        width: 65_536,
+        height: 65_536,
     };
 
     /// Microsoft's documented transitions for one injected pointer
@@ -384,7 +400,9 @@ mod tests {
     }
 
     fn deliver(contact: &mut PenContact, windows: &mut FakeWindows, sample: PenSample) {
-        contact.deliver(sample, &mut |frame, from| windows.inject(frame, from));
+        contact.deliver(sample, Some(OUTPUT), &mut |frame, from| {
+            windows.inject(frame, from)
+        });
     }
 
     use Outcome::{Injected, NotReady, Rejected};
@@ -450,7 +468,7 @@ mod tests {
                 .push((frame.phase, frame.x, frame.y, Rejected));
             Rejected
         };
-        contact.deliver(pen(Move, 20, 10), &mut refuse);
+        contact.deliver(pen(Move, 20, 10), Some(OUTPUT), &mut refuse);
         assert_eq!(
             windows.take(),
             [(Move, 20, 10, Rejected), (Down, 20, 10, Rejected)]
@@ -468,7 +486,7 @@ mod tests {
         // The move is rejected, then the replacement DOWN is not ready.
         windows.take();
         let mut first = true;
-        contact.deliver(pen(Move, 20, 10), &mut |frame, from| {
+        contact.deliver(pen(Move, 20, 10), Some(OUTPUT), &mut |frame, from| {
             if first {
                 first = false;
                 windows.inject(frame, from)
@@ -480,9 +498,10 @@ mod tests {
             }
         });
         assert_eq!(contact.state(), PointerState::Out);
-        assert_eq!(contact.pending().map(|p| p.phase), Some(Down));
+        // The move waits; planned again from Out, it retries the same down.
+        assert_eq!(contact.pending().map(|p| p.phase), Some(Move));
         // A refresh tick retries the same frame; the stroke then continues.
-        contact.flush(&mut |frame, from| windows.inject(frame, from));
+        contact.flush(Some(OUTPUT), &mut |frame, from| windows.inject(frame, from));
         deliver(&mut contact, &mut windows, pen(Move, 21, 10));
         deliver(&mut contact, &mut windows, pen(Up, 21, 10));
         assert_eq!(
@@ -510,11 +529,11 @@ mod tests {
         windows.not_ready = 1;
         deliver(&mut contact, &mut windows, pen(Up, 30, 30));
         // Still unready when the next stroke arrives: the pending up is
-        // retried first and stays pending; the new down cannot start over it.
+        // retried first and stays pending; the new down waits behind it.
         windows.not_ready = 1;
         deliver(&mut contact, &mut windows, pen(Down, 40, 40));
         assert_eq!(contact.pending().map(|p| p.phase), Some(Up));
-        contact.flush(&mut |frame, from| windows.inject(frame, from));
+        contact.flush(Some(OUTPUT), &mut |frame, from| windows.inject(frame, from));
         assert_eq!(
             windows.take(),
             [
@@ -525,10 +544,12 @@ mod tests {
                 (Up, 30, 30, NotReady),
                 (Up, 30, 30, NotReady),
                 (Up, 30, 30, Injected),
+                (Down, 40, 40, Injected),
             ]
         );
         assert!(windows.illegal.is_empty());
-        assert_eq!(contact.state(), PointerState::Out);
+        assert_eq!(contact.state().kind(), PointerKind::Contact);
+        assert!(contact.pending().is_none());
     }
 
     #[test]
@@ -541,7 +562,7 @@ mod tests {
         windows.cancel();
         windows.take();
         let mut refuse = |_: PenSample, _| Rejected;
-        contact.deliver(pen(Move, 6, 5), &mut refuse);
+        contact.deliver(pen(Move, 6, 5), Some(OUTPUT), &mut refuse);
         deliver(&mut contact, &mut windows, pen(Up, 6, 5));
         deliver(&mut contact, &mut windows, pen(Cancel, 6, 5));
         assert!(windows.take().is_empty());
@@ -623,5 +644,254 @@ mod tests {
         let frame = PointerFrame::new(pen(Down, 0, 0), screen);
         assert_ne!(frame.flags & PRIMARY, 0);
         assert_eq!((frame.pressure, frame.tilt_x, frame.tilt_y), (512, 0, 0));
+    }
+
+    #[test]
+    fn a_release_survives_a_deferred_final_position_update() {
+        // The tip lifted away from the last move: the up needs a move first,
+        // and Windows is not ready for that move.
+        let (mut contact, mut windows) = (PenContact::default(), FakeWindows::default());
+        deliver(&mut contact, &mut windows, pen(Down, 10, 10));
+        windows.not_ready = 1;
+        deliver(&mut contact, &mut windows, pen(Up, 20, 10));
+        assert_eq!(contact.pending().map(|p| p.phase), Some(Up));
+        // The relay holds no pen now; only the refresh tick finishes it.
+        contact.flush(Some(OUTPUT), &mut |frame, from| windows.inject(frame, from));
+        assert_eq!(
+            windows.take(),
+            [
+                (Down, 10, 10, Injected),
+                (Move, 20, 10, NotReady),
+                (Move, 20, 10, Injected),
+                (Up, 20, 10, Injected),
+            ]
+        );
+        assert_eq!(contact.state(), PointerState::Out);
+        assert!(contact.pending().is_none());
+        assert!(windows.illegal.is_empty());
+    }
+
+    #[test]
+    fn a_later_stroke_cannot_discard_the_release_windows_is_owed() {
+        let (mut contact, mut windows) = (PenContact::default(), FakeWindows::default());
+        deliver(&mut contact, &mut windows, pen(Down, 10, 10));
+        for sample in [pen(Up, 10, 10), pen(Down, 20, 10), pen(Up, 20, 10)] {
+            windows.not_ready = 1;
+            deliver(&mut contact, &mut windows, sample);
+        }
+        contact.flush(Some(OUTPUT), &mut |frame, from| windows.inject(frame, from));
+        assert_eq!(
+            windows.take(),
+            [
+                (Down, 10, 10, Injected),
+                (Up, 10, 10, NotReady),
+                (Up, 10, 10, NotReady),
+                (Up, 10, 10, NotReady),
+                (Up, 10, 10, Injected),
+                (Down, 20, 10, Injected),
+                (Up, 20, 10, Injected),
+            ]
+        );
+        assert_eq!(contact.state(), PointerState::Out);
+        assert!(windows.illegal.is_empty());
+    }
+
+    #[test]
+    fn a_full_queue_keeps_the_owed_release_and_the_latest_sample() {
+        let (mut contact, mut windows) = (PenContact::default(), FakeWindows::default());
+        deliver(&mut contact, &mut windows, pen(Down, 10, 10));
+        windows.take();
+        windows.not_ready = usize::MAX;
+        // A move waits ahead of the release; neither may be dropped.
+        deliver(&mut contact, &mut windows, pen(Move, 12, 10));
+        deliver(&mut contact, &mut windows, pen(Up, 12, 10));
+        for x in 20..40 {
+            deliver(&mut contact, &mut windows, pen(Down, x, 10));
+            deliver(&mut contact, &mut windows, pen(Move, x, 11));
+            deliver(&mut contact, &mut windows, pen(Up, x, 11));
+            assert!(contact.queue.len() <= QUEUE_LIMIT);
+        }
+        windows.not_ready = 0;
+        windows.take();
+        contact.flush(Some(OUTPUT), &mut |frame, from| windows.inject(frame, from));
+        let frames = windows.take();
+        assert_eq!(
+            frames[..2],
+            [(Move, 12, 10, Injected), (Up, 12, 10, Injected)]
+        );
+        assert_eq!(frames.last(), Some(&(Up, 39, 11, Injected)));
+        assert_eq!(contact.state(), PointerState::Out);
+        assert!(windows.illegal.is_empty());
+    }
+
+    #[test]
+    fn waiting_samples_land_where_the_display_is_when_they_are_sent() {
+        // The reviewer's case: a 2360x1640 output moves from left=2560 to
+        // left=-2360 while a down, and later an up, wait for Windows.
+        let before = CaptureGeometry {
+            left: 2560,
+            top: 0,
+            width: 2360,
+            height: 1640,
+        };
+        let after = CaptureGeometry {
+            left: -2360,
+            ..before
+        };
+        let at = |phase, output| {
+            let (x, y) = super::super::norm_to_output_pixel(32_768, 32_768, output);
+            PenSample {
+                x_norm: 32_768,
+                y_norm: 32_768,
+                ..pen(phase, x, y)
+            }
+        };
+        assert_eq!((at(Down, before).x, at(Down, after).x), (3739, -1181));
+        let (mut contact, mut windows) = (PenContact::default(), FakeWindows::default());
+        windows.not_ready = 1;
+        contact.deliver(at(Down, before), Some(before), &mut |frame, from| {
+            windows.inject(frame, from)
+        });
+        // The keepalive flushes onto the new rect, then refreshes the hold.
+        contact.flush(Some(after), &mut |frame, from| windows.inject(frame, from));
+        contact.deliver(at(Move, after), Some(after), &mut |frame, from| {
+            windows.inject(frame, from)
+        });
+        // An up waiting across the move back is sent where the contact is
+        // now, after a move to it.
+        windows.not_ready = 1;
+        contact.deliver(at(Up, after), Some(after), &mut |frame, from| {
+            windows.inject(frame, from)
+        });
+        contact.flush(Some(before), &mut |frame, from| windows.inject(frame, from));
+        assert_eq!(
+            windows.take(),
+            [
+                (Down, 3739, 819, NotReady),
+                (Down, -1181, 819, Injected),
+                (Move, -1181, 819, Injected),
+                (Up, -1181, 819, NotReady),
+                (Move, 3739, 819, Injected),
+                (Up, 3739, 819, Injected),
+            ]
+        );
+        assert!(windows.illegal.is_empty());
+    }
+
+    #[test]
+    fn random_strokes_end_every_contact_in_order_on_the_current_display() {
+        // Relay-shaped streams with Windows not ready at random, refresh
+        // ticks between samples and the display moving or changing mode.
+        let outputs = [
+            OUTPUT,
+            CaptureGeometry {
+                left: 2560,
+                top: 0,
+                width: 2360,
+                height: 1640,
+            },
+            CaptureGeometry {
+                left: -2732,
+                top: -2048,
+                width: 2732,
+                height: 2048,
+            },
+        ];
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut random = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for _ in 0..2000 {
+            let (mut contact, mut windows) = (PenContact::default(), FakeWindows::default());
+            let mut output = outputs[0];
+            let mut accepted = Vec::new();
+            let mut intent = PointerKind::Out;
+            let mut last = None;
+            for index in 0..random(40) as u16 {
+                if random(10) == 0 {
+                    output = outputs[random(3) as usize];
+                }
+                use PointerKind as K;
+                let phase = match (intent, random(10)) {
+                    (K::Out, 0..=5) | (K::Hover, 0..=3) => Down,
+                    (K::Out | K::Hover, 0..=7) => Hover,
+                    (K::Hover, _) => Leave,
+                    (K::Out, _) => Hover,
+                    (K::Contact, 0..=5) => Move,
+                    (K::Contact, 6..=8) => Up,
+                    (K::Contact, _) => Cancel,
+                };
+                intent = match phase {
+                    Down | Move => K::Contact,
+                    Hover => K::Hover,
+                    Up | Cancel | Leave => K::Out,
+                };
+                // The index records each sample's order in y_norm.
+                let (x_norm, y_norm) = (random(65_536) as u16, index);
+                let (x, y) = super::super::norm_to_output_pixel(x_norm, y_norm, output);
+                let sample = PenSample {
+                    x_norm,
+                    y_norm,
+                    ..pen(phase, x, y)
+                };
+                last = Some(sample);
+                let tick = random(2) == 0;
+                let mut inject = |frame: PenSample, from| {
+                    windows.not_ready = usize::from(random(3) == 0);
+                    let outcome = windows.inject(frame, from);
+                    if !matches!(frame.phase, Cancel | Leave) {
+                        assert_eq!(
+                            (frame.x, frame.y),
+                            super::super::norm_to_output_pixel(frame.x_norm, frame.y_norm, output),
+                            "{frame:?} was not mapped onto {output:?}"
+                        );
+                    }
+                    if outcome == Injected {
+                        accepted.push(frame);
+                    }
+                    outcome
+                };
+                contact.deliver(sample, Some(output), &mut inject);
+                if tick {
+                    contact.flush(Some(output), &mut inject);
+                }
+            }
+            windows.not_ready = 0;
+            contact.flush(Some(output), &mut |frame, from| {
+                let outcome = windows.inject(frame, from);
+                if outcome == Injected {
+                    accepted.push(frame);
+                }
+                outcome
+            });
+            assert!(windows.illegal.is_empty(), "{:?}", windows.illegal);
+            assert!(contact.pending().is_none());
+            // Every contact Windows accepted ended exactly once; frames went
+            // out in sample order, and ends sit where Windows had the pen.
+            let mut open = false;
+            let mut previous: Option<PenSample> = None;
+            for frame in &accepted {
+                match frame.phase {
+                    Down => assert!(!std::mem::replace(&mut open, true)),
+                    Up | Cancel => assert!(std::mem::replace(&mut open, false)),
+                    _ => {}
+                }
+                if let Some(previous) = previous {
+                    if matches!(frame.phase, Cancel | Leave) {
+                        assert_eq!(frame.y_norm, previous.y_norm);
+                    } else {
+                        assert!(frame.y_norm >= previous.y_norm, "{accepted:?}");
+                    }
+                }
+                previous = Some(*frame);
+            }
+            assert_eq!(windows.state, intent);
+            if let (Some(last), true) = (last, intent != PointerKind::Out) {
+                assert_eq!(windows.at, (last.x, last.y));
+            }
+        }
     }
 }

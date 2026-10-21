@@ -1570,4 +1570,98 @@ mod tests {
         assert!(relay.logged_mapping.is_none(), "a new session logs again");
         recorder::take();
     }
+
+    /// Send the relay's recorded pen batch the way `windows_inject.rs` does,
+    /// without Win32: the refresh tick flushes first, as `keep_pen_alive`
+    /// does, then each sample goes through `PenContact` and every frame is
+    /// built against the virtual screen at injection.
+    #[cfg(not(windows))]
+    fn inject_like_windows(
+        contact: &mut pen_contact::PenContact,
+        output: CaptureGeometry,
+        screen: VirtualScreen,
+        outcome: pen_contact::Outcome,
+        tick: bool,
+    ) -> Vec<pen_contact::PointerFrame> {
+        let mut frames = Vec::new();
+        let mut inject = |frame, _| {
+            frames.push(pen_contact::PointerFrame::new(frame, screen));
+            outcome
+        };
+        if tick {
+            contact.flush(Some(output), &mut inject);
+        }
+        for injection in recorder::take() {
+            let Injection::Pen(sample) = injection else {
+                panic!("expected only pen input, got {injection:?}");
+            };
+            contact.deliver(sample, Some(output), &mut inject);
+        }
+        frames
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_down_windows_was_not_ready_for_starts_where_the_display_moved() {
+        use pen_contact::{pointer_flag as flag, Outcome, PenContact, PointerFrame};
+        // A 2360x1640 output right of a 2560x1440 primary moves to its left
+        // while Windows is not ready for the down.
+        let primary = rect(0, 0, 2560, 1440);
+        let (before, after) = (rect(2560, 0, 2360, 1640), rect(-2360, 0, 2360, 1640));
+        let (screen_before, screen_after) =
+            (bounding(&[primary, before]), bounding(&[after, primary]));
+        let mut relay = InputRelay::default();
+        let mut contact = PenContact::default();
+        let mut e = event(KIND_PENCIL, PHASE_BEGAN, 32_768, 32_768);
+        e.input_ver = 2;
+        e.pressure_x1000 = 500;
+        relay.relay(1, &e, before);
+        let mut frames = inject_like_windows(
+            &mut contact,
+            before,
+            screen_before,
+            Outcome::NotReady,
+            false,
+        );
+        relay.last_pen_input =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_millis(60));
+        relay.keep_pen_alive(Some(after));
+        frames.extend(inject_like_windows(
+            &mut contact,
+            after,
+            screen_after,
+            Outcome::Injected,
+            true,
+        ));
+        e.event_id = 2;
+        e.phase = PHASE_ENDED;
+        relay.relay(1, &e, after);
+        frames.extend(inject_like_windows(
+            &mut contact,
+            after,
+            screen_after,
+            Outcome::Injected,
+            false,
+        ));
+        let contact_flags = flag::INRANGE | flag::INCONTACT | flag::FIRSTBUTTON | flag::PRIMARY;
+        let frame = |flags, location, pressure| PointerFrame {
+            flags,
+            location,
+            pressure,
+            tilt_x: 0,
+            tilt_y: 0,
+        };
+        // Desktop (3739, 819) before the move, (-1181, 819) after it, which
+        // is (1179, 819) on the virtual screen that now starts at -2360.
+        assert_eq!(
+            frames,
+            [
+                frame(flag::DOWN | contact_flags, (3739, 819), 512),
+                frame(flag::DOWN | contact_flags, (1179, 819), 512),
+                frame(flag::UPDATE | contact_flags, (1179, 819), 512),
+                frame(flag::UP | flag::PRIMARY, (1179, 819), 0),
+            ]
+        );
+        assert!(contact.pending().is_none());
+    }
 }

@@ -78,10 +78,14 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
 - Disconnect, backgrounding and view cancellation release contact. If Windows
   rejects a sample or cancels the contact after a display change, the host
   starts a new contact at that same sample instead of losing the rest of the
-  stroke. `ERROR_NOT_READY` frames are retried unchanged on the next sample or
-  refresh tick. `host/src/input/pen_contact.rs` chooses every frame from what
+  stroke. `host/src/input/pen_contact.rs` chooses every frame from what
   Windows last accepted, so an end of contact or hover is never sent for a
   pointer Windows does not have.
+- After `ERROR_NOT_READY`, that sample and any behind it wait in order, and
+  the next sample or refresh tick retries the same frame first. A release
+  is never dropped for a later stroke. Each waiting sample is mapped again
+  from its normalised position when it is sent, so it lands on the display
+  where it is at that moment.
 - A held contact remembers its normalised position. The refresh tick remaps it
   onto the current capture rect, so a still Pencil follows a display that
   moved or changed mode.
