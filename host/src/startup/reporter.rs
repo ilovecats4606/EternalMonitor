@@ -326,7 +326,7 @@ fn run(args: &[String]) -> i32 {
                 Ok(true) => Some("turned the virtual display off".to_string()),
                 Ok(false) => Some("could not turn the virtual display off".to_string()),
                 Err(reason) if reason == super::display::NO_OWNER => None,
-                Err(reason) => Some(format!("left the virtual display on: {reason}")),
+                Err(note) => Some(note),
             };
             if let Some(note) = note {
                 let _ = crate::logging::append_now(&super::info_line(&format!(

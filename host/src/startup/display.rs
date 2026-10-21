@@ -59,7 +59,7 @@ fn owner_at(path: &Path) -> Option<ProcessId> {
 
 /// Turn the display off after `ended` exited abnormally, if it owned the
 /// display and no other host of this install runs. `Ok` says whether
-/// `disable` succeeded; `Err` why it did not run.
+/// `disable` succeeded; `Err` says what happened instead, as a log note.
 pub(crate) fn disable_for_ended(
     ended: ProcessId,
     other_host: impl FnMut() -> Option<ProcessId>,
@@ -78,11 +78,17 @@ fn disable_for_ended_at(
     let check = |other_host: &mut dyn FnMut() -> Option<ProcessId>| {
         match owner_at(path) {
             None => return Err(NO_OWNER.to_string()),
-            Some(owner) if owner != ended => return Err(format!("host {owner} turned it on")),
+            Some(owner) if owner != ended => {
+                return Err(format!(
+                    "left the virtual display on: host {owner} turned it on"
+                ))
+            }
             Some(_) => {}
         }
         match other_host() {
-            Some(other) => Err(format!("EternalMonitor host {other} is running")),
+            Some(other) => Err(format!(
+                "left the virtual display on: EternalMonitor host {other} is running"
+            )),
             None => Ok(()),
         }
     };
@@ -93,7 +99,7 @@ fn disable_for_ended_at(
     let done = disable();
     if done && !remove_if_owned(path, ended) {
         return Err(format!(
-            "turned it off, but {} turned it on meanwhile",
+            "turned the virtual display off, but {} turned it on meanwhile; its record stays",
             owner_at(path).map_or("another host".to_string(), |o| format!("host {o}"))
         ));
     }
@@ -331,13 +337,13 @@ mod tests {
         record(&path, other).unwrap();
         assert_eq!(
             disable_for_ended_at(&path, ended, || None, || panic!("disabled")),
-            Err("host 8-1 turned it on".to_string())
+            Err("left the virtual display on: host 8-1 turned it on".to_string())
         );
         // The ended host turned it on, but another host is running.
         record(&path, ended).unwrap();
         assert_eq!(
             disable_for_ended_at(&path, ended, || Some(other), || panic!("disabled")),
-            Err("EternalMonitor host 8-1 is running".to_string())
+            Err("left the virtual display on: EternalMonitor host 8-1 is running".to_string())
         );
         assert_eq!(owner_at(&path), Some(ended));
         assert_eq!(
@@ -373,7 +379,10 @@ mod tests {
             },
             || panic!("disabled"),
         );
-        assert_eq!(result, Err("host 8-1 turned it on".to_string()));
+        assert_eq!(
+            result,
+            Err("left the virtual display on: host 8-1 turned it on".to_string())
+        );
         assert_eq!(owner_at(&path), Some(replacement));
         fs::remove_file(path).unwrap();
     }
@@ -395,7 +404,10 @@ mod tests {
         );
         assert_eq!(
             result,
-            Err("turned it off, but host 8-1 turned it on meanwhile".to_string())
+            Err(
+                "turned the virtual display off, but host 8-1 turned it on meanwhile; its record stays"
+                    .to_string()
+            )
         );
         assert_eq!(owner_at(&path), Some(replacement));
         // Nothing is left beside it.
