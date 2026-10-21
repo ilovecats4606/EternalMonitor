@@ -161,9 +161,11 @@ impl PenContact {
 
     fn enqueue(&mut self, sample: PenSample) {
         let update = |sample: &PenSample| matches!(sample.phase, PenPhase::Move | PenPhase::Hover);
+        let waiting = self.queue.len() > 1;
         match self.queue.back_mut() {
-            // Only the latest position matters.
-            Some(last) if update(last) && update(&sample) => *last = sample,
+            // Only the latest position matters, but the first sample is
+            // being retried: Windows must get that same frame again.
+            Some(last) if waiting && update(last) && update(&sample) => *last = sample,
             _ => {
                 // Drop the oldest waiting sample, but never the first, which
                 // may be part way through, the first end of contact, which
@@ -323,16 +325,19 @@ mod tests {
     };
 
     /// Windows as documented: a frame in the table is applied, anything else
-    /// is rejected and cancels the contact. Tests can script NOT_READY
-    /// results and cancel the contact behind the injector's back (a display
-    /// change). Positions are where Windows resolves each frame's location
-    /// on the virtual screen current at injection.
+    /// is rejected and cancels the contact. After ERROR_NOT_READY the next
+    /// frame must be the same one, unless the display changed. Tests can
+    /// script NOT_READY results and cancel the contact behind the injector's
+    /// back (a display change). Positions are where Windows resolves each
+    /// frame's location on the virtual screen current at injection.
     struct FakeWindows {
         state: PointerKind,
         /// Desktop pixel of the last applied frame.
         at: (i32, i32),
         screen: VirtualScreen,
         not_ready: usize,
+        /// The frame that last hit NOT_READY, which must be retried.
+        retry: Option<PointerFrame>,
         frames: Vec<(PenPhase, i32, i32, Outcome)>,
         illegal: Vec<(PenPhase, PointerKind)>,
     }
@@ -344,6 +349,7 @@ mod tests {
                 at: (0, 0),
                 screen: SCREEN,
                 not_ready: 0,
+                retry: None,
                 frames: Vec::new(),
                 illegal: Vec::new(),
             }
@@ -354,6 +360,9 @@ mod tests {
         fn inject(&mut self, frame: PenSample, from: PointerKind) -> Outcome {
             assert_eq!(from, self.belief_of(from), "injector state diverged");
             let pointer = PointerFrame::new(frame, self.screen);
+            if let Some(retry) = self.retry.take() {
+                assert_eq!(pointer, retry, "{frame:?} replaced a frame being retried");
+            }
             let at = (
                 pointer.location.0 + self.screen.left,
                 pointer.location.1 + self.screen.top,
@@ -376,8 +385,17 @@ mod tests {
                 self.state = PointerKind::Out;
                 Outcome::Rejected
             };
+            if outcome == Outcome::NotReady {
+                self.retry = Some(pointer);
+            }
             self.frames.push((frame.phase, at.0, at.1, outcome));
             outcome
+        }
+
+        /// The display moved or changed mode: a retried frame may be mapped
+        /// somewhere else now.
+        fn display_changed(&mut self) {
+            self.retry = None;
         }
 
         /// Windows ends the contact without telling the injector.
@@ -753,6 +771,7 @@ mod tests {
             windows.inject(frame, from)
         });
         // The keepalive flushes onto the new rect, then refreshes the hold.
+        windows.display_changed();
         contact.flush(Some(after), &mut |frame, from| windows.inject(frame, from));
         contact.deliver(at(Move, after), Some(after), &mut |frame, from| {
             windows.inject(frame, from)
@@ -763,6 +782,7 @@ mod tests {
         contact.deliver(at(Up, after), Some(after), &mut |frame, from| {
             windows.inject(frame, from)
         });
+        windows.display_changed();
         contact.flush(Some(before), &mut |frame, from| windows.inject(frame, from));
         assert_eq!(
             windows.take(),
@@ -813,6 +833,7 @@ mod tests {
             for index in 0..random(40) as u16 {
                 if random(10) == 0 {
                     output = outputs[random(3) as usize];
+                    windows.display_changed();
                 }
                 use PointerKind as K;
                 let phase = match (intent, random(10)) {
@@ -892,6 +913,35 @@ mod tests {
             if let (Some(last), true) = (last, intent != PointerKind::Out) {
                 assert_eq!(windows.at, (last.x, last.y));
             }
+        }
+    }
+
+    #[test]
+    fn a_position_windows_was_not_ready_for_is_retried_before_a_newer_one() {
+        // The reviewer's case, for moves and for hover.
+        for (phase, start) in [(Move, Down), (Hover, Hover)] {
+            let (mut contact, mut windows) = (PenContact::default(), FakeWindows::default());
+            deliver(&mut contact, &mut windows, pen(start, 10, 10));
+            windows.not_ready = 1;
+            deliver(&mut contact, &mut windows, pen(phase, 585, 10));
+            assert_eq!(contact.pending().map(|p| p.x), Some(585));
+            // Later positions wait behind it and coalesce.
+            windows.not_ready = 2;
+            deliver(&mut contact, &mut windows, pen(phase, 878, 10));
+            deliver(&mut contact, &mut windows, pen(phase, 900, 10));
+            assert_eq!(contact.queue.len(), 2);
+            contact.flush(Some(OUTPUT), &mut |frame, from| windows.inject(frame, from));
+            assert_eq!(
+                windows.take()[1..],
+                [
+                    (phase, 585, 10, NotReady),
+                    (phase, 585, 10, NotReady),
+                    (phase, 585, 10, NotReady),
+                    (phase, 585, 10, Injected),
+                    (phase, 900, 10, Injected),
+                ]
+            );
+            assert!(windows.illegal.is_empty());
         }
     }
 }
