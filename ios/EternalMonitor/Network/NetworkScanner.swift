@@ -2,10 +2,30 @@ import Foundation
 
 /// Discovered host on the local network.
 struct DiscoveredHost: Identifiable, Equatable {
-    var id: String { "\(name)|\(address)|\(port)" }
+    var id: String { "\(name)|\(port)" }
     let name: String
-    let address: String
+    /// The PC's IPv4 address. The host listens on IPv4 only, and Bonjour's
+    /// IPv6 answers are often link-local without their interface scope, so
+    /// an IPv6-only answer leaves this nil until IPv4 resolves.
+    let address: String?
     let port: UInt16
+    /// Still resolving. False once resolution gave up without IPv4.
+    var finding = false
+
+    init(name: String, address: String?, port: UInt16, finding: Bool = false) {
+        self.name = name
+        self.address = address
+        self.port = port
+        self.finding = finding
+    }
+
+    /// The service as far as it has resolved: its first IPv4 address, or a
+    /// PC still being found when only IPv6 (or nothing usable) came back.
+    static func resolved(name: String, port: Int, addresses: [Data]) -> DiscoveredHost {
+        let port = port > 0 ? UInt16(clamping: port) : 9876
+        let ipv4 = addresses.lazy.compactMap { NetworkScanner.ipAddress(from: $0, family: AF_INET) }.first
+        return DiscoveredHost(name: name, address: ipv4, port: port, finding: ipv4 == nil)
+    }
 }
 
 /// Scans the local network for EternalMonitor hosts using Bonjour service discovery.
@@ -19,6 +39,8 @@ final class NetworkScanner: NSObject, ObservableObject {
 
     private let browser = NetServiceBrowser()
     private var resolvingServices: [String: NetService] = [:]
+    /// Services whose IPv4 address is being looked up by host name.
+    private var ipv4Lookups: Set<String> = []
     private var scanTask: Task<Void, Never>?
     // track auto-retry state so we don't bounce forever when discovery is broken.
     private var didAutoRetry = false
@@ -63,6 +85,9 @@ final class NetworkScanner: NSObject, ObservableObject {
         scanTask?.cancel()
         scanTask = nil
         isScanning = false
+        for index in hosts.indices where hosts[index].address == nil && !ipv4Lookups.contains(hosts[index].name) {
+            hosts[index].finding = false
+        }
 
         if hosts.isEmpty {
             if !didAutoRetry {
@@ -137,34 +162,76 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
     nonisolated func netServiceDidResolveAddress(_ sender: NetService) {
         Task { @MainActor in
             let key = Self.serviceKey(sender)
-            defer { resolvingServices.removeValue(forKey: key) }
-
-            guard let host = Self.discoveredHost(from: sender) else { return }
+            guard sender.addresses?.isEmpty == false else { return }
+            let host = DiscoveredHost.resolved(name: sender.name, port: sender.port, addresses: sender.addresses ?? [])
             // discovery diagnostic — surface every resolved host so we
             // can tell whether mDNS is finding the right machine.
-            print("[mDNS] Found: \(host.name) at \(host.address):\(host.port)")
-            hosts.removeAll { $0.name == host.name || $0.address == host.address }
-            hosts.append(host)
-            // Resolve the local subnet ONCE per sort — the old comparator called
-            // getifaddrs() for every comparison, a syscall storm on the MainActor.
-            let subnet = Self.primaryIPv4Subnet()
-            hosts.sort { Self.hostQualityCompare($0, $1, ourSubnet: subnet) }
-            statusMessage = "Found \(hosts.count) PC\(hosts.count == 1 ? "" : "s")"
+            print("[mDNS] Found: \(host.name) at \(host.address ?? "no IPv4 yet"):\(host.port)")
+            merge(host)
+            if host.address != nil {
+                resolvingServices.removeValue(forKey: key)
+                sender.stop()
+            } else if let hostName = sender.hostName {
+                // Only IPv6 so far. Keep the resolve running for more answers,
+                // and ask for the name's IPv4 address directly as well.
+                lookUpIPv4(hostName: hostName, service: host)
+            }
         }
+    }
+
+    /// Adds or updates one PC. A PC still being found never replaces one
+    /// that already has an address.
+    func merge(_ host: DiscoveredHost) {
+        if host.address == nil, hosts.contains(where: { $0.name == host.name && $0.address != nil }) { return }
+        hosts.removeAll { $0.name == host.name || (host.address != nil && $0.address == host.address) }
+        hosts.append(host)
+        // Resolve the local subnet ONCE per sort — the old comparator called
+        // getifaddrs() for every comparison, a syscall storm on the MainActor.
+        let subnet = Self.primaryIPv4Subnet()
+        hosts.sort { Self.hostQualityCompare($0, $1, ourSubnet: subnet) }
+        statusMessage = "Found \(hosts.count) PC\(hosts.count == 1 ? "" : "s")"
+    }
+
+    private func lookUpIPv4(hostName: String, service: DiscoveredHost) {
+        guard ipv4Lookups.insert(service.name).inserted else { return }
+        Task.detached {
+            let address = Self.ipv4Address(hostName: hostName)
+            await MainActor.run {
+                self.ipv4Lookups.remove(service.name)
+                if let address {
+                    self.merge(DiscoveredHost(name: service.name, address: address, port: service.port))
+                } else if !self.isScanning, let index = self.hosts.firstIndex(where: { $0.name == service.name && $0.address == nil }) {
+                    self.hosts[index].finding = false
+                }
+            }
+        }
+    }
+
+    /// The host name's IPv4 address through the system resolver, which
+    /// answers `.local` names over multicast DNS.
+    nonisolated static func ipv4Address(hostName: String) -> String? {
+        var hints = addrinfo()
+        hints.ai_family = AF_INET
+        hints.ai_socktype = SOCK_DGRAM
+        var result: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(hostName, nil, &hints, &result) == 0, let first = result else { return nil }
+        defer { freeaddrinfo(first) }
+        guard let address = first.pointee.ai_addr else { return nil }
+        return ipAddress(from: Data(bytes: address, count: Int(first.pointee.ai_addrlen)), family: AF_INET)
     }
 
     /// Prefer IPv4 over IPv6, then prefer same-subnet over different-subnet, then alpha by name.
     private static func hostQualityCompare(
         _ a: DiscoveredHost, _ b: DiscoveredHost, ourSubnet: String?
     ) -> Bool {
-        let aV4 = a.address.contains(".")
-        let bV4 = b.address.contains(".")
+        let aV4 = a.address != nil
+        let bV4 = b.address != nil
         if aV4 != bV4 {
-            return aV4 // IPv4 first
+            return aV4 // PCs with an address first
         }
         if let prefix = ourSubnet {
-            let aSame = a.address.hasPrefix(prefix)
-            let bSame = b.address.hasPrefix(prefix)
+            let aSame = a.address?.hasPrefix(prefix) == true
+            let bSame = b.address?.hasPrefix(prefix) == true
             if aSame != bSame {
                 return aSame
             }
@@ -211,37 +278,33 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
     nonisolated func netService(_ sender: NetService, didNotResolve errorDict: [String: NSNumber]) {
         Task { @MainActor in
             resolvingServices.removeValue(forKey: Self.serviceKey(sender))
+            resolveEnded(name: sender.name)
             if hosts.isEmpty {
                 statusMessage = "Found a PC…"
             }
         }
     }
 
+    nonisolated func netServiceDidStop(_ sender: NetService) {
+        Task { @MainActor in
+            resolvingServices.removeValue(forKey: Self.serviceKey(sender))
+            resolveEnded(name: sender.name)
+        }
+    }
+
+    /// The resolve timed out or stopped. A PC that never gave an IPv4
+    /// address, with no lookup left running, stops showing as being found.
+    private func resolveEnded(name: String) {
+        guard !ipv4Lookups.contains(name),
+              let index = hosts.firstIndex(where: { $0.name == name && $0.address == nil }) else { return }
+        hosts[index].finding = false
+    }
+
     private static func serviceKey(_ service: NetService) -> String {
         "\(service.name)|\(service.type)|\(service.domain)"
     }
 
-    private static func discoveredHost(from service: NetService) -> DiscoveredHost? {
-        guard let addresses = service.addresses else { return nil }
-
-        for data in addresses {
-            if let address = ipAddress(from: data, family: AF_INET) {
-                let port = service.port > 0 ? UInt16(service.port) : 9876
-                return DiscoveredHost(name: service.name, address: address, port: port)
-            }
-        }
-
-        for data in addresses {
-            if let address = ipAddress(from: data) {
-                let port = service.port > 0 ? UInt16(service.port) : 9876
-                return DiscoveredHost(name: service.name, address: address, port: port)
-            }
-        }
-
-        return nil
-    }
-
-    private static func ipAddress(from data: Data, family expectedFamily: Int32? = nil) -> String? {
+    nonisolated static func ipAddress(from data: Data, family expectedFamily: Int32? = nil) -> String? {
         data.withUnsafeBytes { rawBuffer in
             guard let base = rawBuffer.baseAddress else { return nil }
             let sockaddr = base.assumingMemoryBound(to: sockaddr.self)

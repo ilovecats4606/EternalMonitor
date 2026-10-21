@@ -87,7 +87,10 @@ struct ConnectView: View {
                             usbCard
                                 .entrance(appeared, delay: 0.2)
 
-                            if !recentStore.connections.isEmpty && scanner.hosts.isEmpty {
+                            // Saved PCs stay visible while discovery runs: Bonjour can
+                            // miss them (a VPN address, another subnet) and can find
+                            // someone else's PC on a shared network.
+                            if !unlistedRecents.isEmpty {
                                 recentSection
                                     .entrance(appeared, delay: 0.26)
                             }
@@ -557,21 +560,23 @@ struct ConnectView: View {
                 ForEach(Array(scanner.hosts.enumerated()), id: \.element.id) { index, host in
                     if index > 0 { rowDivider }
                     Button {
-                        hostIP = host.address
+                        // Only an IPv4 address reaches the PC; see DiscoveredHost.
+                        guard let address = host.address else { return }
+                        hostIP = address
                         port = "\(host.port)"
-                        connectionManager.connect(host: host.address, port: host.port)
+                        connectionManager.connect(host: address, port: host.port)
                     } label: {
                         hostRow(
                             icon: "desktopcomputer",
-                            title: host.name != host.address ? host.name : host.address,
-                            subtitle: "Tap to connect · \(host.address)",
+                            title: host.name,
+                            subtitle: Self.discoveredSubtitle(host),
                             badge: nil,
                             paired: false
                         )
                     }
                     .buttonStyle(RowButtonStyle())
-                    .disabled(isConnecting)
-                    .accessibilityHint("Connects to this PC")
+                    .disabled(isConnecting || host.address == nil)
+                    .accessibilityHint(host.address == nil ? "" : "Connects to this PC")
                 }
             }
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -580,13 +585,24 @@ struct ConnectView: View {
         .transition(.opacity.combined(with: .move(edge: .bottom)))
     }
 
+    static func discoveredSubtitle(_ host: DiscoveredHost) -> String {
+        if let address = host.address { return "Tap to connect · \(address)" }
+        return host.finding
+            ? "Finding…"
+            : "Couldn't get its address. Type the Address shown on the PC."
+    }
+
+    private var unlistedRecents: [RecentConnection] {
+        RecentConnection.unlisted(recentStore.connections, discovered: scanner.hosts)
+    }
+
     private var recentSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             SectionHeader(title: "Recent")
                 .padding(.horizontal, 4)
 
             VStack(spacing: 0) {
-                ForEach(Array(recentStore.connections.enumerated()), id: \.element.id) { index, conn in
+                ForEach(Array(unlistedRecents.enumerated()), id: \.element.id) { index, conn in
                     if index > 0 { rowDivider }
                     Button {
                         if conn.isUSB {

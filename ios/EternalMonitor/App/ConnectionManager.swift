@@ -1161,6 +1161,16 @@ struct RecentConnection: Codable, Identifiable {
     let isUSB: Bool
 }
 
+extension RecentConnection {
+    /// Recent PCs that discovery has not already listed at the same address
+    /// and port. Cable entries always stay; they connect another way.
+    static func unlisted(_ recents: [RecentConnection], discovered: [DiscoveredHost]) -> [RecentConnection] {
+        recents.filter { recent in
+            recent.isUSB || !discovered.contains { $0.address == recent.host && $0.port == recent.port }
+        }
+    }
+}
+
 final class RecentConnectionStore: ObservableObject {
     static let shared = RecentConnectionStore()
 
