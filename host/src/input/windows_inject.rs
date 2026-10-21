@@ -31,7 +31,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
-use super::pen_contact::{pointer_flag, Outcome, PenContact, PointerFrame, PointerKind};
+use super::pen_contact::{
+    pointer_flag, NotReadyRetry, Outcome, PenContact, PointerFrame, PointerKind,
+};
 use super::{CaptureGeometry, Injection, PenSample, VirtualScreen};
 
 // Frames are built, and tested, without the SDK.
@@ -54,6 +56,7 @@ pub struct PenDevice {
     warned: Vec<windows::core::HRESULT>,
     /// What Windows believes about the pen; chooses every frame.
     contact: PenContact,
+    retry: NotReadyRetry,
 }
 
 // This is a process-owned User32 handle, not a pointer we dereference. Tokio
@@ -74,6 +77,7 @@ impl Default for PenDevice {
             handle,
             warned: Vec::new(),
             contact: PenContact::default(),
+            retry: NotReadyRetry::default(),
         }
     }
 }
@@ -95,12 +99,13 @@ impl PenDevice {
             handle: Some(handle),
             warned,
             contact,
+            retry,
         } = self
         else {
             return;
         };
         contact.deliver(sample, context.output, &mut |frame, from| {
-            inject_frame(*handle, frame, from, context, warned)
+            inject_frame(*handle, frame, from, context, warned, retry)
         });
     }
 
@@ -111,6 +116,7 @@ impl PenDevice {
             handle: Some(handle),
             warned,
             contact,
+            retry,
         } = self
         else {
             return;
@@ -123,7 +129,7 @@ impl PenDevice {
             output,
         };
         contact.flush(output, &mut |frame, from| {
-            inject_frame(*handle, frame, from, context, warned)
+            inject_frame(*handle, frame, from, context, warned, retry)
         });
     }
 }
@@ -134,6 +140,7 @@ fn inject_frame(
     from: PointerKind,
     context: FrameContext,
     warned: &mut Vec<windows::core::HRESULT>,
+    retry: &mut NotReadyRetry,
 ) -> Outcome {
     let screen = context.screen;
     let pointer = PointerFrame::new(frame, screen);
@@ -157,23 +164,12 @@ fn inject_frame(
             },
         },
     };
-    // Windows timestamps injection at 0.1 ms resolution. Coalesced UIKit
-    // samples can arrive together; retry that same frame if the OS clock has
-    // not advanced. Past 2 ms, PenContact keeps it pending for the next tick.
-    let started = std::time::Instant::now();
+    // Past the retry window, PenContact keeps the frame for the next tick.
     let not_ready = windows::core::HRESULT::from_win32(ERROR_NOT_READY.0);
-    let result = loop {
-        let result = unsafe { InjectSyntheticPointerInput(handle, &[info]) };
-        if result
-            .as_ref()
-            .is_err_and(|error| error.code() == not_ready)
-            && started.elapsed() < std::time::Duration::from_millis(2)
-        {
-            std::thread::yield_now();
-            continue;
-        }
-        break result;
-    };
+    let result = retry.call(
+        || unsafe { InjectSyntheticPointerInput(handle, &[info]) },
+        |error| error.code() == not_ready,
+    );
     let error = match result {
         Ok(()) => {
             super::log_injections(&[Injection::Pen(frame)]);

@@ -12,6 +12,7 @@
 //! frame must be retried.
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use super::{CaptureGeometry, PenPhase, PenSample, VirtualScreen};
 
@@ -101,6 +102,40 @@ pub enum Outcome {
     NotReady,
     /// Any other refusal. Windows has cancelled our contact.
     Rejected,
+}
+
+/// How long to retry a frame Windows was not ready for. Windows timestamps
+/// injection at 0.1 ms resolution, so coalesced samples sent back to back
+/// can be refused until its clock advances.
+const NOT_READY_WINDOW: Duration = Duration::from_millis(2);
+
+/// Retries ERROR_NOT_READY briefly while Windows is accepting frames. A frame
+/// still refused after that means Windows' input queue is stuck; later
+/// frames get one attempt each until one is accepted, so a stuck queue costs
+/// one call per sample or refresh tick rather than stalling the transport.
+#[derive(Debug, Default)]
+pub struct NotReadyRetry {
+    stalled: bool,
+}
+
+impl NotReadyRetry {
+    pub fn call<T, E>(
+        &mut self,
+        mut attempt: impl FnMut() -> Result<T, E>,
+        not_ready: impl Fn(&E) -> bool,
+    ) -> Result<T, E> {
+        let started = Instant::now();
+        loop {
+            let result = attempt();
+            let refused = result.as_ref().is_err_and(&not_ready);
+            if refused && !self.stalled && started.elapsed() < NOT_READY_WINDOW {
+                std::thread::yield_now();
+                continue;
+            }
+            self.stalled = refused;
+            return result;
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -943,5 +978,37 @@ mod tests {
             );
             assert!(windows.illegal.is_empty());
         }
+    }
+
+    #[test]
+    fn a_stuck_windows_queue_costs_one_attempt_per_frame() {
+        let mut retry = NotReadyRetry::default();
+        let attempts = std::cell::Cell::new(0);
+        let refuse = || {
+            attempts.set(attempts.get() + 1);
+            Err::<(), _>(NotReady)
+        };
+        // Back-to-back frames are retried until Windows' clock advances.
+        let started = Instant::now();
+        assert_eq!(retry.call(refuse, |e| *e == NotReady), Err(NotReady));
+        assert!(started.elapsed() >= NOT_READY_WINDOW);
+        // Still refused after that window: Windows is stuck, so later frames
+        // are tried once each.
+        for _ in 0..240 {
+            attempts.set(0);
+            assert_eq!(retry.call(refuse, |e| *e == NotReady), Err(NotReady));
+            assert_eq!(attempts.get(), 1);
+        }
+        // Any other answer means Windows is responding again.
+        assert_eq!(
+            retry.call(|| Err::<(), _>(Rejected), |e| *e == NotReady),
+            Err(Rejected)
+        );
+        let mut answers = [Err(NotReady), Ok(())].into_iter();
+        assert_eq!(
+            retry.call(|| answers.next().unwrap(), |e| *e == NotReady),
+            Ok(())
+        );
+        assert!(!retry.stalled);
     }
 }
