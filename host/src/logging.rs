@@ -28,6 +28,7 @@ static OUTPUT_ERRORS: Lazy<Mutex<Option<tracing_appender::non_blocking::ErrorCou
 static STORAGE_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAST_STORAGE_ERROR: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 static SESSION_LOG_PATH: Lazy<PathBuf> = Lazy::new(resolve_session_log_path);
+static REPEATS: Lazy<Mutex<crate::log_repeat::RepeatCollapser>> = Lazy::new(Default::default);
 fn open_session_log() -> Option<RollingLogFile> {
     let path = SESSION_LOG_PATH.clone();
     if let Some(parent) = path.parent() {
@@ -198,6 +199,17 @@ impl MemoryLogWriter {
             .to_string();
         self.current_line.clear();
         let line = redact_support_text(&line);
+        if Arc::ptr_eq(&self.shared, &LOG_BUFFER) {
+            let lines = REPEATS.lock().push(&line, std::time::Instant::now());
+            for line in lines {
+                self.emit(line);
+            }
+        } else {
+            self.emit(line);
+        }
+    }
+
+    fn emit(&mut self, line: String) {
         crate::telemetry::record(&line);
 
         if line.is_empty() {

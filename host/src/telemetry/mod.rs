@@ -205,6 +205,27 @@ pub fn record(line: &str) {
         }
     }
 }
+/// Lines drained at shutdown keep their level: an error logged just before
+/// exit is usually the one that explains the exit.
+fn event(sequence: u64, line: &str) -> Event {
+    let level = if line.contains(" ERROR ") {
+        "error"
+    } else if line.contains(" WARN ") {
+        "warning"
+    } else {
+        "info"
+    };
+    Event {
+        sequence,
+        at_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        level: level.into(),
+        category: "host".into(),
+        message: crate::logging::redact_support_text(line),
+    }
+}
 fn files(directory: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut paths: Vec<_> = fs::read_dir(directory)?
         .filter_map(Result::ok)
@@ -306,23 +327,7 @@ fn run(
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(line) => {
                 sequence += 1;
-                let level = if line.contains(" ERROR ") {
-                    "error"
-                } else if line.contains(" WARN ") {
-                    "warning"
-                } else {
-                    "info"
-                };
-                pending.push(Event {
-                    sequence,
-                    at_ms: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                    level: level.into(),
-                    category: "host".into(),
-                    message: crate::logging::redact_support_text(&line),
-                });
+                pending.push(event(sequence, &line));
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -382,16 +387,7 @@ fn run(
             // Drain already accepted events to disk before returning.
             while let Ok(line) = receiver.try_recv() {
                 sequence += 1;
-                pending.push(Event {
-                    sequence,
-                    at_ms: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                    level: "info".into(),
-                    category: "host".into(),
-                    message: crate::logging::redact_support_text(&line),
-                });
+                pending.push(event(sequence, &line));
                 if pending.len() >= BATCH_SIZE {
                     persist(
                         &directory,
@@ -432,6 +428,25 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn events_keep_their_level_on_every_path() {
+        let warn = event(
+            1,
+            "2026-10-21T03:10:19.347613Z  WARN Desktop duplication access lost",
+        );
+        let error = event(
+            2,
+            "2026-10-21T03:04:31.464409Z ERROR Capture loop exited with error",
+        );
+        let info = event(
+            3,
+            "2026-10-21T03:04:31.478265Z  INFO Pipeline ended generation=7",
+        );
+        assert_eq!(
+            [warn.level, error.level, info.level],
+            ["warning", "error", "info"]
+        );
+    }
     #[test]
     fn retains_batch_until_http_200_and_matching_acknowledgement() {
         use std::io::{Read, Write};
