@@ -37,7 +37,9 @@ fn change_at(path: &Path, enabled: bool, run: impl FnOnce() -> bool) -> bool {
     }
     let done = run();
     if done && !enabled {
-        delete_if_owned(path, ProcessId::current(), || true, true);
+        if let Err(error) = delete_if_owned(path, ProcessId::current(), || true, true) {
+            tracing::warn!(%error, "Could not delete the virtual display's owner record");
+        }
     }
     done
 }
@@ -114,7 +116,11 @@ fn disable_for_ended_at(
     check(&mut other_host)?;
     let done = disable();
     if done {
-        delete_if_owned(path, ended, || true, true);
+        if let Err(error) = delete_if_owned(path, ended, || true, true) {
+            return Err(format!(
+                "turned the virtual display off, but could not delete its owner record: {error}"
+            ));
+        }
         if let Some(owner) = owner_at(path) {
             return Err(format!(
                 "turned the virtual display off, but host {owner} turned it on meanwhile; \
@@ -125,21 +131,31 @@ fn disable_for_ended_at(
     Ok(done)
 }
 
+/// What `delete_if_owned` did when it could read the record, or knew there
+/// was none. An I/O failure is its `Err` instead.
+#[derive(Debug, PartialEq, Eq)]
+enum Removal {
+    Deleted,
+    Missing,
+    /// The record names another process, or was replaced before deletion.
+    OtherOwner,
+    /// `before_delete` stopped the deletion.
+    Stopped,
+}
+
 /// Delete the record only if it names `owner`, reading and deleting it
 /// through one handle. A host that replaces the record meanwhile puts a new
 /// file in its place; the handle still refers to the old one, so the new
 /// record is never deleted. `before_delete` runs between the two steps and
 /// stops the deletion by returning false, for tests. `posix` asks for the
 /// deletion to take the name away at once where the volume supports it.
-/// True when the record was deleted.
 #[cfg(windows)]
 fn delete_if_owned(
     path: &Path,
     owner: ProcessId,
     before_delete: impl FnOnce() -> bool,
     posix: bool,
-) -> bool {
-    use std::io::Read;
+) -> io::Result<Removal> {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;
@@ -150,19 +166,17 @@ fn delete_if_owned(
     };
     // GENERIC_READ | DELETE, shared with everything, so a host replacing the
     // record is not turned away.
-    let Ok(mut file) = fs::OpenOptions::new()
+    let mut file = match fs::OpenOptions::new()
         .access_mode(0x8000_0000 | 0x0001_0000)
         .share_mode(0x7)
         .open(path)
-    else {
-        return false;
-    };
-    let mut text = String::new();
-    if file.read_to_string(&mut text).is_err()
-        || ProcessId::from_name(text.trim()) != Some(owner)
-        || !before_delete()
     {
-        return false;
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Removal::Missing),
+        Err(error) => return Err(error),
+    };
+    if let Some(kept) = check_owner(&mut file, owner, before_delete)? {
+        return Ok(kept);
     }
     let handle = HANDLE(file.as_raw_handle());
     let size_of = |size: usize| size as u32;
@@ -181,7 +195,7 @@ fn delete_if_owned(
             )
         };
         if deleted.is_ok() {
-            return true;
+            return Ok(Removal::Deleted);
         }
     }
     // Volumes without POSIX deletion: the name goes when this handle closes.
@@ -196,7 +210,26 @@ fn delete_if_owned(
             size_of(std::mem::size_of_val(&info)),
         )
     }
-    .is_ok()
+    .map(|()| Removal::Deleted)
+    .map_err(io::Error::from)
+}
+
+/// Read the opened record. `None` when it names `owner` and may be deleted.
+fn check_owner(
+    file: &mut fs::File,
+    owner: ProcessId,
+    before_delete: impl FnOnce() -> bool,
+) -> io::Result<Option<Removal>> {
+    use std::io::Read;
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(if ProcessId::from_name(text.trim()) != Some(owner) {
+        Some(Removal::OtherOwner)
+    } else if !before_delete() {
+        Some(Removal::Stopped)
+    } else {
+        None
+    })
 }
 
 /// Unix has no deletion through a handle; the reporter runs only on Windows.
@@ -207,22 +240,22 @@ fn delete_if_owned(
     owner: ProcessId,
     before_delete: impl FnOnce() -> bool,
     _posix: bool,
-) -> bool {
-    use std::io::Read;
+) -> io::Result<Removal> {
     use std::os::unix::fs::MetadataExt;
-    let Ok(mut file) = fs::File::open(path) else {
-        return false;
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Removal::Missing),
+        Err(error) => return Err(error),
     };
-    let mut text = String::new();
-    if file.read_to_string(&mut text).is_err()
-        || ProcessId::from_name(text.trim()) != Some(owner)
-        || !before_delete()
-    {
-        return false;
+    if let Some(kept) = check_owner(&mut file, owner, before_delete)? {
+        return Ok(kept);
     }
-    let opened = file.metadata().map(|m| (m.dev(), m.ino())).ok();
+    let opened = file.metadata().map(|m| (m.dev(), m.ino()))?;
     let named = fs::metadata(path).map(|m| (m.dev(), m.ino())).ok();
-    opened.is_some() && opened == named && fs::remove_file(path).is_ok()
+    if named != Some(opened) {
+        return Ok(Removal::OtherOwner);
+    }
+    fs::remove_file(path).map(|()| Removal::Deleted)
 }
 
 /// A file's identity: its volume and its index on that volume. Paths that
@@ -539,15 +572,82 @@ mod tests {
             let path = owner_file("own");
             let ended = ProcessId { pid: 7, start: 1 };
             record(&path, ended).unwrap();
-            assert!(delete_if_owned(&path, ended, || true, posix));
+            assert_eq!(
+                delete_if_owned(&path, ended, || true, posix).unwrap(),
+                Removal::Deleted
+            );
             assert!(!path.exists());
             // Nothing to delete, or another host's record.
-            assert!(!delete_if_owned(&path, ended, || true, posix));
+            assert_eq!(
+                delete_if_owned(&path, ended, || true, posix).unwrap(),
+                Removal::Missing
+            );
             record(&path, ProcessId { pid: 8, start: 1 }).unwrap();
-            assert!(!delete_if_owned(&path, ended, || true, posix));
+            assert_eq!(
+                delete_if_owned(&path, ended, || true, posix).unwrap(),
+                Removal::OtherOwner
+            );
             assert!(path.exists());
             fs::remove_file(path).unwrap();
         }
+    }
+
+    /// A record in its own folder that this process can read but not delete.
+    /// Returns a closure that makes it deletable again.
+    fn undeletable_record(name: &str, owner: ProcessId) -> (PathBuf, impl FnOnce()) {
+        let folder = owner_file(name);
+        fs::create_dir(&folder).unwrap();
+        let path = folder.join(OWNER_FILE);
+        record(&path, owner).unwrap();
+        let set_locked = |path: &Path, locked: bool| {
+            // Windows refuses to delete a read-only file; Unix needs the
+            // folder's write permission instead.
+            #[cfg(windows)]
+            let target = path.to_path_buf();
+            #[cfg(not(windows))]
+            let target = path.parent().unwrap().to_path_buf();
+            let mut permissions = fs::metadata(&target).unwrap().permissions();
+            #[cfg(not(windows))]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                permissions.set_mode(if locked { 0o555 } else { 0o755 });
+            }
+            #[cfg(windows)]
+            permissions.set_readonly(locked);
+            fs::set_permissions(&target, permissions).unwrap();
+        };
+        set_locked(&path, true);
+        let unlock_path = path.clone();
+        (path, move || {
+            set_locked(&unlock_path, false);
+            fs::remove_dir_all(unlock_path.parent().unwrap()).unwrap();
+        })
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_deleted_is_an_error_not_another_owner() {
+        let ended = ProcessId { pid: 7, start: 1 };
+        for posix in [true, false] {
+            let (path, unlock) = undeletable_record("locked", ended);
+            assert!(
+                delete_if_owned(&path, ended, || true, posix).is_err(),
+                "posix={posix}"
+            );
+            assert_eq!(owner_at(&path), Some(ended));
+            unlock();
+        }
+        // The reporter says the deletion failed, not that a host turned the
+        // display on meanwhile.
+        let (path, unlock) = undeletable_record("locked-reporter", ended);
+        let result = disable_for_ended_at(&path, ended, || None, || true);
+        unlock();
+        let note = result.unwrap_err();
+        assert!(
+            note.starts_with(
+                "turned the virtual display off, but could not delete its owner record: "
+            ),
+            "{note}"
+        );
     }
 
     #[test]
@@ -558,7 +658,7 @@ mod tests {
             let ended = ProcessId { pid: 7, start: 1 };
             let replacement = ProcessId { pid: 8, start: 1 };
             record(&path, ended).unwrap();
-            delete_if_owned(
+            let _ = delete_if_owned(
                 &path,
                 ended,
                 || {
@@ -580,21 +680,31 @@ mod tests {
         let replacement = ProcessId { pid: 8, start: 1 };
         record(&path, ended).unwrap();
         // Ended, as by Task Manager, after reading its host's record.
-        assert!(!delete_if_owned(&path, ended, || false, true));
+        assert_eq!(
+            delete_if_owned(&path, ended, || false, true).unwrap(),
+            Removal::Stopped
+        );
         assert_eq!(owner_at(&path), Some(ended));
         // Ended after a replacement host wrote its record.
-        assert!(!delete_if_owned(
-            &path,
-            ended,
-            || {
-                record(&path, replacement).unwrap();
-                false
-            },
-            true
-        ));
+        assert_eq!(
+            delete_if_owned(
+                &path,
+                ended,
+                || {
+                    record(&path, replacement).unwrap();
+                    false
+                },
+                true
+            )
+            .unwrap(),
+            Removal::Stopped
+        );
         assert_eq!(owner_at(&path), Some(replacement));
         // Ended while handling a record that names another host.
-        assert!(!delete_if_owned(&path, ended, || false, true));
+        assert_eq!(
+            delete_if_owned(&path, ended, || false, true).unwrap(),
+            Removal::OtherOwner
+        );
         assert_eq!(owner_at(&path), Some(replacement));
         assert_eq!(files_beside(&path), 1);
         fs::remove_file(path).unwrap();
