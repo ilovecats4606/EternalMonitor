@@ -38,6 +38,11 @@ regex = "1"
 # Socket options (send-buffer sizing) before handing the socket to tokio
 socket2 = "0.5"
 
+[features]
+# Lets a release build obey ETERNAL_SIMULATE_STARTUP_FAILURE, for native
+# failure-path checks. Debug builds always do; shipped builds never do.
+fault-injection = []
+
 [build-dependencies]
 winresource = "0.1"
 cc = "1"

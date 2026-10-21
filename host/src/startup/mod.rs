@@ -34,6 +34,8 @@ static SHOWN_AT: OnceLock<Instant> = OnceLock::new();
 /// starts; `panic-later` or, on Windows, `fail-fast-later` to fail 15 s after
 /// the window works; or `surface-error` to report a surface error on every
 /// frame of the first two seconds. A `-quiet` suffix skips the message box.
+/// Only debug builds and builds with the `fault-injection` feature read it;
+/// a release build ignores it.
 pub const SIMULATE_ENV: &str = "ETERNAL_SIMULATE_STARTUP_FAILURE";
 
 /// Called once the window works, so later failures read as a stop, not a
@@ -347,7 +349,7 @@ fn show(title: &str, body: &str) {
 /// Automation runs without a desktop to dismiss a dialog.
 pub(crate) fn dialogs_wanted() -> bool {
     !(std::env::var("ETERNAL_HEADLESS").is_ok_and(|v| v.trim() == "1")
-        || std::env::var(SIMULATE_ENV).is_ok_and(|v| v.trim().ends_with("-quiet")))
+        || simulation_requested().trim().ends_with("-quiet"))
 }
 
 fn summary(window_shown: bool) -> &'static str {
@@ -424,9 +426,19 @@ fn native_detail(record: record::Record, module: Option<(&str, u64)>) -> String 
     )
 }
 
+/// The value of [`SIMULATE_ENV`], in builds that may simulate failures.
+fn simulation_requested() -> String {
+    #[cfg(any(debug_assertions, feature = "fault-injection"))]
+    return std::env::var(SIMULATE_ENV).unwrap_or_default();
+    #[cfg(not(any(debug_assertions, feature = "fault-injection")))]
+    String::new()
+}
+
 fn simulated() -> String {
-    let requested = std::env::var(SIMULATE_ENV).unwrap_or_default();
-    requested.trim().trim_end_matches("-quiet").to_string()
+    simulation_requested()
+        .trim()
+        .trim_end_matches("-quiet")
+        .to_string()
 }
 
 /// Fail on purpose where the window renderer starts, when [`SIMULATE_ENV`] asks.
@@ -798,6 +810,17 @@ mod tests {
             |_, _| steps.borrow_mut().push("message"),
         );
         assert_eq!(*steps.borrow(), ["virtual display off"]);
+    }
+
+    /// `cargo test --release` runs this; other builds may simulate.
+    #[cfg(not(any(debug_assertions, feature = "fault-injection")))]
+    #[test]
+    fn release_builds_ignore_the_simulation_request() {
+        std::env::set_var(SIMULATE_ENV, "error-quiet");
+        assert_eq!(simulated(), "");
+        assert!(simulate_renderer_failure().is_ok());
+        assert_eq!(simulation_requested(), "");
+        std::env::remove_var(SIMULATE_ENV);
     }
 
     #[test]
