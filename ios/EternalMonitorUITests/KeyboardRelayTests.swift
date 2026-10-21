@@ -38,7 +38,7 @@ final class KeyboardRelayTests: XCTestCase {
         // vanish mid-tap. Let the HUD hide, reveal it, and tap at once.
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: keyboard)
         waitForExpectations(timeout: 6)
-        app.tap(withNumberOfTaps: 1, numberOfTouches: 3)
+        revealHUD(app: app)
         XCTAssertTrue(keyboard.waitForExistence(timeout: 5))
         keyboard.tap()
         XCTAssertTrue(app.buttons["keyboard.done"].waitForExistence(timeout: 5))
@@ -56,10 +56,24 @@ final class KeyboardRelayTests: XCTestCase {
         // timeout first, then bring the controls back before checking state.
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: keyboard)
         waitForExpectations(timeout: 6)
-        app.tap(withNumberOfTaps: 1, numberOfTouches: 3)
+        revealHUD(app: app)
         XCTAssertTrue(keyboard.waitForExistence(timeout: 5))
         XCTAssertEqual(keyboard.label, "Keyboard")
         XCTAssertTrue(app.buttons["display.disconnect"].exists)
+    }
+
+    /// XCTest spreads a three-finger tap from the top edge to the bottom
+    /// edge. Its bottom finger lands where the sliding bar's Keyboard button
+    /// is near the end of the hide animation, which opened the keyboard
+    /// again in CI. Tap with three fingers together in the middle instead.
+    private func revealHUD(app: XCUIApplication) {
+        let frame = app.frame
+        let tapped = expectation(description: "Three-finger tap")
+        EMTapFingers([-60.0, 0, 60].map { NSValue(cgPoint: CGPoint(x: frame.midX + $0, y: frame.midY)) }) { success, error in
+            XCTAssertTrue(success, error?.localizedDescription ?? "Touch synthesis failed")
+            tapped.fulfill()
+        }
+        wait(for: [tapped], timeout: 10)
     }
 
     private func capture(_ name: String, app: XCUIApplication) {

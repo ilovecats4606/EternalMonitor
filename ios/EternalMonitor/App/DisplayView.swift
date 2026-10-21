@@ -62,10 +62,16 @@ struct DisplayView: View {
                         .accessibilityLabel("Show or hide drawing controls")
                         .accessibilityIdentifier("display.drawingControls")
                     }
-                    if showHUD && settings.showHUD {
-                        hudOverlay
-                            .transition(.opacity.combined(with: .move(edge: .top)))
+                    // A hiding HUD slides out for a moment. Touches and
+                    // VoiceOver go to the stream as soon as it starts.
+                    Group {
+                        if showHUD && settings.showHUD {
+                            hudOverlay
+                                .transition(.opacity.combined(with: .move(edge: .top)))
+                        }
                     }
+                    .allowsHitTesting(showHUD)
+                    .accessibilityHidden(!showHUD)
                 }
                 .padding(.top, 12)
                 .padding(.trailing, 16)
@@ -82,12 +88,16 @@ struct DisplayView: View {
 
                 Spacer()
 
-                if showHUD {
-                    bottomBar
-                        .padding(.horizontal, 16)
-                        .padding(.bottom, 12)
-                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                Group {
+                    if showHUD {
+                        bottomBar
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 12)
+                            .transition(.opacity.combined(with: .move(edge: .bottom)))
+                    }
                 }
+                .allowsHitTesting(showHUD)
+                .accessibilityHidden(!showHUD)
             }
         }
         .statusBarHidden(true)
@@ -384,6 +394,15 @@ struct DisplayView: View {
         }
     }
 
+    /// UI tests launch with `-hudHideSeconds 10` to tap the HUD while it leaves.
+    private var hudHideSeconds: Double {
+        #if DEBUG
+        let slowed = UserDefaults.standard.double(forKey: "hudHideSeconds")
+        if slowed > 0 { return slowed }
+        #endif
+        return 0.3
+    }
+
     private func scheduleHUDDismiss() {
         hudDismissTask?.cancel()
         withAnimation(Motion.gentle) { showHUD = true }
@@ -391,7 +410,7 @@ struct DisplayView: View {
         hudDismissTask = Task {
             try? await Task.sleep(for: .seconds(5))
             if !Task.isCancelled {
-                withAnimation(.easeOut(duration: 0.3)) {
+                withAnimation(.easeOut(duration: hudHideSeconds)) {
                     showHUD = false
                 }
             }
