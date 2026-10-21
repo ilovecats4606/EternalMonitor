@@ -71,7 +71,7 @@ struct DisplayView: View {
                 .padding(.trailing, 16)
 
                 if connectionManager.sessionDrawingMode && !connectionManager.sessionHasPen {
-                    Text("Native Pencil input is unavailable. Check that your Windows host supports Windows Ink.")
+                    Text("Apple Pencil can't draw on this PC. Update EternalMonitor on the PC; Windows 10 needs version 1809 or later.")
                         .font(.app(14, relativeTo: .footnote))
                         .foregroundStyle(Theme.text)
                         .padding(12)
@@ -350,7 +350,7 @@ struct DisplayView: View {
             Text("Reconnecting to your PC")
                 .font(.app(18, .semibold, relativeTo: .headline))
                 .foregroundStyle(Theme.text)
-            Text("The picture comes back as soon as the PC answers.")
+            Text("The picture comes back as soon as the PC answers. If the PC went to sleep, wake it.")
                 .font(.app(14, relativeTo: .callout))
                 .foregroundStyle(Theme.textMuted)
                 .multilineTextAlignment(.center)

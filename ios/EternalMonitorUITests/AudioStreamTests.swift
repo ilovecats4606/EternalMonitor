@@ -25,9 +25,8 @@ final class AudioStreamTests: XCTestCase {
         openSettings(app)
         XCTAssertTrue(toggle.waitForExistence(timeout: 5))
         setSwitch(toggle, to: "1")
-        app.swipeUp()
         let audio = app.descendants(matching: .any)["settings.hostAudio"].firstMatch
-        XCTAssertTrue(audio.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.swipeUp(toReveal: audio), app.debugDescription)
         let activeAudio = NSPredicate(format: "value CONTAINS %@", "Opus 128 kbps, buffer")
         expectation(for: activeAudio, evaluatedWith: audio)
         waitForExpectations(timeout: 5)
@@ -35,7 +34,7 @@ final class AudioStreamTests: XCTestCase {
         app.buttons["settings.done"].tap()
         waitForHUD(app, containing: "PC audio playing")
         capture("audio-playing-hud", app: app)
-        tapControl("display.disconnect", in: app, until: app.textFields["connect.host"])
+        app.tapHUDControl("display.disconnect", until: app.textFields["connect.host"])
         app.terminate()
     }
 
@@ -55,22 +54,8 @@ final class AudioStreamTests: XCTestCase {
         return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed
     }
 
-    private func tapControl(_ identifier: String, in app: XCUIApplication, until result: XCUIElement) {
-        let control = app.buttons[identifier]
-        for _ in 0..<3 where !result.exists {
-            revealControls(app, showing: control)
-            // A snapshot throws, instead of failing the test, if the control
-            // fades between the check and the read.
-            guard appears(control, within: 5), let frame = try? control.snapshot().frame else { continue }
-            app.coordinate(withNormalizedOffset: .zero)
-                .withOffset(CGVector(dx: frame.midX, dy: frame.midY)).tap()
-            _ = appears(result, within: 5)
-        }
-        XCTAssertTrue(result.exists, "\(identifier) did not open \(result)")
-    }
-
     private func openSettings(_ app: XCUIApplication) {
-        tapControl("display.settings", in: app, until: app.navigationBars["Settings"])
+        app.tapHUDControl("display.settings", until: app.navigationBars["Settings"])
     }
 
     private func waitForHUD(_ app: XCUIApplication, containing text: String) {

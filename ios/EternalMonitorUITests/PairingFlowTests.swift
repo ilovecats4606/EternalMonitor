@@ -37,10 +37,9 @@ final class PairingFlowTests: XCTestCase {
         XCTAssertTrue(app.buttons["display.disconnect"].waitForExistence(timeout: 10))
         XCTAssertFalse(input.exists)
         capture("pairing-token-reconnect", app: app)
-        tapControl("display.settings", in: app, until: app.navigationBars["Settings"])
+        app.tapHUDControl("display.settings", until: app.navigationBars["Settings"])
         let forget = app.buttons["settings.forgetPairings"]
-        for _ in 0..<3 where !forget.isHittable { app.swipeUp() }
-        XCTAssertTrue(forget.isHittable)
+        XCTAssertTrue(app.swipeUp(toReveal: forget))
         forget.tap()
         app.buttons["settings.done"].tap()
         disconnect(app)
@@ -52,29 +51,7 @@ final class PairingFlowTests: XCTestCase {
     }
 
     private func disconnect(_ app: XCUIApplication) {
-        tapControl("display.disconnect", in: app, until: app.textFields["connect.host"])
-    }
-
-    private func appears(_ element: XCUIElement, within timeout: TimeInterval) -> Bool {
-        let predicate = NSPredicate(format: "exists == true")
-        return XCTWaiter().wait(for: [XCTNSPredicateExpectation(predicate: predicate, object: element)],
-            timeout: timeout) == .completed
-    }
-
-    private func tapControl(_ identifier: String, in app: XCUIApplication, until result: XCUIElement) {
-        // The HUD can fade between its accessibility snapshot and the touch.
-        // Use its last position and verify the action, as AudioStreamTests does.
-        let control = app.buttons[identifier]
-        for _ in 0..<3 where !result.exists {
-            if !control.exists {
-                app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
-            }
-            guard appears(control, within: 5), let frame = try? control.snapshot().frame else { continue }
-            app.coordinate(withNormalizedOffset: .zero)
-                .withOffset(CGVector(dx: frame.midX, dy: frame.midY)).tap()
-            if appears(result, within: 5) { return }
-        }
-        XCTAssertTrue(result.exists, "\(identifier) did not open \(result)")
+        app.tapHUDControl("display.disconnect", until: app.textFields["connect.host"])
     }
 
     private func capture(_ name: String, app: XCUIApplication) {

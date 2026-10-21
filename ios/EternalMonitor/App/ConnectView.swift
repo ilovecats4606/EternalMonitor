@@ -63,7 +63,9 @@ struct ConnectView: View {
                                     .entrance(appeared, delay: 0.08)
                             }
 
-                            if let error = connectionManager.connectionError {
+                            if let problem = connectionManager.problem {
+                                problemBanner(problem)
+                            } else if let error = connectionManager.connectionError {
                                 errorBanner(error)
                             }
 
@@ -76,23 +78,25 @@ struct ConnectView: View {
                                     .transition(.opacity.combined(with: .scale(scale: 0.97)))
                             }
 
-                            usbCard
-                                .entrance(appeared, delay: 0.2)
-
-                            if scanner.hosts.isEmpty && !scanner.isScanning && !scanner.statusMessage.isEmpty {
+                            if !scanner.hosts.isEmpty {
+                                discoveredSection
+                            } else if !scanner.isScanning && !scanner.statusMessage.isEmpty {
                                 scanEmptyState
                             }
 
-                            if !scanner.hosts.isEmpty {
-                                discoveredSection
-                            }
+                            usbCard
+                                .entrance(appeared, delay: 0.2)
 
-                            if !recentStore.connections.isEmpty && scanner.hosts.isEmpty {
+                            // Saved PCs stay visible while discovery runs: Bonjour can
+                            // miss them (a VPN address, another subnet) and can find
+                            // someone else's PC on a shared network.
+                            if !unlistedRecents.isEmpty {
                                 recentSection
                                     .entrance(appeared, delay: 0.26)
                             }
 
-                            if isConnecting || connectionManager.connectionError != nil || !connectionManager.diagnostics.isEmpty {
+                            if isConnecting || connectionManager.connectionError != nil || connectionManager.problem != nil
+                                || !connectionManager.diagnostics.isEmpty {
                                 diagnosticsSection
                             }
                         }
@@ -147,9 +151,15 @@ struct ConnectView: View {
                     }
                     didPrefillFromLastHost = true
                 }
+                // Look for PCs straight away, so the usual first step is
+                // tapping your PC rather than typing an address.
+                if connectionManager.state == .disconnected && !scanner.isScanning && scanner.hosts.isEmpty {
+                    scanner.startScan()
+                }
             }
             .animation(.easeInOut(duration: 0.2), value: isConnecting)
             .animation(.easeInOut(duration: 0.2), value: connectionManager.connectionError)
+            .animation(.easeInOut(duration: 0.2), value: connectionManager.problem)
         }
         .tint(Theme.accent)
     }
@@ -190,9 +200,10 @@ struct ConnectView: View {
                 }
                 .accessibilityLabel("Dismiss tips")
             }
-            onboardingStep(1, "Open EternalMonitor on your Windows PC.")
-            onboardingStep(2, "Choose the PC below, scan its QR code, or plug in a USB cable.")
-            onboardingStep(3, "The first time on Wi-Fi, enter the six-digit code the PC shows.")
+            onboardingStep(1, "Install and open EternalMonitor on your Windows PC.")
+            onboardingStep(2, "Tap your PC when it appears below, scan the QR code on the PC, or plug in a USB cable.")
+            onboardingStep(3, "The first time on Wi-Fi, type the six-digit pairing code the PC shows.")
+            onboardingStep(4, "Your PC's screen is mirrored at first. To use this iPad as a second screen, choose Second screen in EternalMonitor on the PC.")
         }
         .card()
         .transition(.opacity.combined(with: .move(edge: .top)))
@@ -245,15 +256,75 @@ struct ConnectView: View {
         .transition(.opacity.combined(with: .move(edge: .top)))
     }
 
+    private func problemBanner(_ problem: ConnectionProblem) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 16))
+                .foregroundStyle(Theme.warning)
+                .padding(.top, 2)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(problem.title)
+                    .font(.app(16, .semibold, relativeTo: .headline))
+                    .foregroundStyle(Theme.text)
+                    .accessibilityIdentifier("connect.problemTitle")
+                Text(problem.detail)
+                    .font(.app(14, relativeTo: .callout))
+                    .foregroundStyle(Theme.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("connect.problemDetail")
+                if !problem.actions.isEmpty {
+                    HStack(spacing: 10) {
+                        ForEach(problem.actions, id: \.self) { action in
+                            switch action {
+                            case .retry:
+                                Button("Try again") { connectionManager.retry() }
+                                    .buttonStyle(PillButtonStyle(foreground: Theme.onAccent, fill: Theme.accent))
+                                    .accessibilityIdentifier("connect.retry")
+                            case .openSettings:
+                                Button("Open Settings") { openAppSettings() }
+                                    .buttonStyle(PillButtonStyle(foreground: Theme.onAccent, fill: Theme.accent))
+                                    .accessibilityIdentifier("connect.openSettings")
+                            }
+                        }
+                    }
+                    .padding(.top, 4)
+                }
+            }
+
+            Spacer(minLength: 0)
+
+            Button {
+                withAnimation { connectionManager.problem = nil }
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Theme.textMuted)
+                    .frame(width: 44, height: 44)
+            }
+            .accessibilityLabel("Dismiss")
+        }
+        .accessibilityElement(children: .contain)
+        .card(padding: 16, tint: Theme.warning)
+        .transition(.opacity.combined(with: .move(edge: .top)))
+    }
+
+    private func openAppSettings() {
+        if let url = URL(string: UIApplication.openSettingsURLString) {
+            UIApplication.shared.open(url)
+        }
+    }
+
     // MARK: - Connect
 
     private var connectCard: some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Connect to a PC")
+                Text("Connect to your PC")
                     .font(.app(20, .semibold, relativeTo: .title3))
                     .foregroundStyle(Theme.text)
-                Text("Enter the address shown in EternalMonitor on your PC.")
+                Text("Your PC appears below when EternalMonitor is open on it. You can also scan its QR code, or type the Address it shows.")
                     .font(.app(14, relativeTo: .callout))
                     .foregroundStyle(Theme.textMuted)
             }
@@ -417,9 +488,10 @@ struct ConnectView: View {
                 Text("USB cable")
                     .font(.app(15, .medium, relativeTo: .subheadline))
                     .foregroundStyle(Theme.text)
-                Text(connectionManager.usbStatus)
+                Text(USBStatusText.describe(connectionManager.usbStatus))
                     .font(.app(13.5, relativeTo: .footnote))
                     .foregroundStyle(Theme.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("connect.usbStatus")
             }
             Spacer(minLength: 8)
@@ -457,10 +529,22 @@ struct ConnectView: View {
             Image(systemName: "wifi.exclamationmark")
                 .foregroundStyle(Theme.textMuted)
                 .font(.system(size: 16))
-            Text("No PCs found. Check that both devices are on the same Wi-Fi (not a guest network), or type the address shown on the PC.")
-                .font(.app(14, relativeTo: .callout))
-                .foregroundStyle(Theme.textMuted)
-                .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 10) {
+                Text(scanner.searchBlocked
+                    ? "EternalMonitor can't look for PCs. Turn on Local Network for EternalMonitor in Settings."
+                    : "No PCs found. Check that EternalMonitor is open on the PC and both are on the same Wi-Fi, not a guest network. Or type the Address shown on the PC.")
+                    .font(.app(14, relativeTo: .callout))
+                    .foregroundStyle(Theme.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("connect.scanEmpty")
+                if scanner.searchBlocked {
+                    Button("Open Settings") { openAppSettings() }
+                        .buttonStyle(PillButtonStyle(foreground: Theme.onAccent, fill: Theme.accent))
+                } else {
+                    Button("Search again") { scanner.startScan() }
+                        .buttonStyle(PillButtonStyle())
+                }
+            }
             Spacer(minLength: 0)
         }
         .card(padding: 16)
@@ -476,18 +560,23 @@ struct ConnectView: View {
                 ForEach(Array(scanner.hosts.enumerated()), id: \.element.id) { index, host in
                     if index > 0 { rowDivider }
                     Button {
-                        hostIP = host.address
+                        // Only an IPv4 address reaches the PC; see DiscoveredHost.
+                        guard let address = host.address else { return }
+                        hostIP = address
                         port = "\(host.port)"
+                        connectionManager.connect(host: address, port: host.port)
                     } label: {
                         hostRow(
                             icon: "desktopcomputer",
-                            title: host.name != host.address ? host.name : host.address,
-                            subtitle: host.name != host.address ? "\(host.address) · port \(host.port)" : "Port \(host.port)",
+                            title: host.name,
+                            subtitle: Self.discoveredSubtitle(host),
                             badge: nil,
                             paired: false
                         )
                     }
                     .buttonStyle(RowButtonStyle())
+                    .disabled(isConnecting || host.address == nil)
+                    .accessibilityHint(host.address == nil ? "" : "Connects to this PC")
                 }
             }
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -496,13 +585,24 @@ struct ConnectView: View {
         .transition(.opacity.combined(with: .move(edge: .bottom)))
     }
 
+    static func discoveredSubtitle(_ host: DiscoveredHost) -> String {
+        if let address = host.address { return "Tap to connect · \(address)" }
+        return host.finding
+            ? "Finding…"
+            : "Couldn't get its address. Type the Address shown on the PC."
+    }
+
+    private var unlistedRecents: [RecentConnection] {
+        RecentConnection.unlisted(recentStore.connections, discovered: scanner.hosts)
+    }
+
     private var recentSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             SectionHeader(title: "Recent")
                 .padding(.horizontal, 4)
 
             VStack(spacing: 0) {
-                ForEach(Array(recentStore.connections.enumerated()), id: \.element.id) { index, conn in
+                ForEach(Array(unlistedRecents.enumerated()), id: \.element.id) { index, conn in
                     if index > 0 { rowDivider }
                     Button {
                         if conn.isUSB {
@@ -510,12 +610,13 @@ struct ConnectView: View {
                         } else {
                             hostIP = conn.host
                             port = "\(conn.port)"
+                            connectionManager.connect(host: conn.host, port: conn.port)
                         }
                     } label: {
                         hostRow(
                             icon: conn.isUSB ? "cable.connector" : "desktopcomputer",
                             title: conn.host,
-                            subtitle: conn.isUSB ? "Connect with a USB cable" : "Port \(conn.port)",
+                            subtitle: conn.isUSB ? "Plug in the cable to connect" : "Tap to connect",
                             badge: conn.isUSB ? "USB" : "Wi-Fi",
                             paired: conn.isUSB || pairings.isPaired(host: conn.host, port: conn.port)
                         )

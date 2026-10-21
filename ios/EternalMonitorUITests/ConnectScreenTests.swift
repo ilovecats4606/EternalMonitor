@@ -44,15 +44,38 @@ final class ConnectScreenTests: XCTestCase {
         XCTAssertEqual(allowUSB.value as? String, "0")
         app.buttons["settings.done"].tap()
         XCTAssertTrue(app.textFields["connect.host"].waitForExistence(timeout: 5))
-        XCTAssertEqual(app.staticTexts["connect.usbStatus"].label, "USB: off")
+        XCTAssertEqual(app.staticTexts["connect.usbStatus"].label, "Off. Turn on to connect with a cable.")
         settings.tap()
         XCTAssertTrue(allowUSB.waitForExistence(timeout: 5))
         allowUSB.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
         XCTAssertEqual(allowUSB.value as? String, "1")
         app.buttons["settings.done"].tap()
-        let listening = NSPredicate(format: "label == %@", "USB: waiting for a cable")
+        let listening = NSPredicate(format: "label == %@", "Plug this iPad into your PC. Keep Apple Devices open on the PC.")
         expectation(for: listening, evaluatedWith: app.staticTexts["connect.usbStatus"])
         waitForExpectations(timeout: 5)
+    }
+
+    /// An address where nothing answers ends in plain words and a retry,
+    /// not a transport trace.
+    func testUnreachablePCSaysWhatToDo() {
+        let app = XCUIApplication()
+        // 192.0.2.1 is a documentation address: nothing ever answers.
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-lastHost", "192.0.2.1", "-lastPort", "9876"]
+        app.launch()
+        XCTAssertTrue(app.buttons["connect.button"].waitForExistence(timeout: 10))
+        app.buttons["connect.button"].tap()
+        let title = app.staticTexts["connect.problemTitle"]
+        XCTAssertTrue(title.waitForExistence(timeout: 20), app.debugDescription)
+        XCTAssertEqual(title.label, "Your PC didn't answer")
+        let detail = app.staticTexts["connect.problemDetail"].label
+        XCTAssertTrue(detail.contains("Ready for your iPad") && detail.contains("Firewall"), detail)
+        XCTAssertFalse(detail.contains("HELLO") || detail.contains("datagram"), detail)
+        XCTAssertTrue(app.buttons["connect.retry"].exists)
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "pc-did-not-answer"; shot.lifetime = .keepAlways; add(shot)
+        app.buttons["connect.retry"].tap()
+        XCTAssertTrue(app.buttons["Cancel"].waitForExistence(timeout: 5))
+        app.buttons["Cancel"].tap()
     }
 
     func testDiagnosticsCanBeCopiedAndSharedWithoutAConnection() {
@@ -62,8 +85,7 @@ final class ConnectScreenTests: XCTestCase {
         XCTAssertTrue(app.buttons["settings.button"].waitForExistence(timeout: 10))
         app.buttons["settings.button"].tap()
         let diagnostics = app.buttons["settings.diagnostics"]
-        for _ in 0..<5 where !diagnostics.isHittable { app.swipeUp() }
-        XCTAssertTrue(diagnostics.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.swipeUp(toReveal: diagnostics))
         diagnostics.tap()
         let copy = app.buttons["diagnostics.copy"]
         XCTAssertTrue(copy.waitForExistence(timeout: 5))

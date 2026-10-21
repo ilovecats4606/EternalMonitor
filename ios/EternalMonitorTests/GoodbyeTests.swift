@@ -1,0 +1,121 @@
+import Darwin
+import XCTest
+@testable import EternalMonitor
+
+/// Leaving a session must hand every BYE copy to the network before the link
+/// is torn down, and that intentional teardown must not raise a problem.
+@MainActor
+final class GoodbyeTests: XCTestCase {
+    private func connectedManager(_ host: FakeUDPHost, timing: ConnectionManager.Timing = .init()) async throws
+        -> ConnectionManager {
+        let manager = ConnectionManager(timing: timing)
+        manager.connect(host: "127.0.0.1", port: host.port)
+        let accepted = await Task.detached { host.acceptSession() }.value
+        XCTAssertTrue(accepted, "the iPad never sent HELLO2")
+        for _ in 0..<200 where manager.hostInfo == nil {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(manager.hostInfo?.sessionId, 41)
+        return manager
+    }
+
+    func testBackgroundingSendsEveryGoodbyeBeforeTheLinkCloses() async throws {
+        let host = FakeUDPHost()
+        let manager = try await connectedManager(host)
+        defer { manager.cancel() }
+        manager.handleAppBackgrounded()
+        XCTAssertEqual(manager.state, .disconnected)
+        let reasons = await Task.detached { host.goodbyes() }.value
+        XCTAssertEqual(reasons.filter { $0 == .appBackground }.count, ControlChannel.byeCopies,
+            "every BYE copy must leave before teardown, not on a timer the teardown cancels")
+        // The intentional teardown raises no problem banner.
+        XCTAssertNil(manager.problem)
+        XCTAssertNil(manager.connectionError)
+    }
+
+    /// The CI lifecycle scenario's three Home/foreground cycles, without the UI:
+    /// every cycle says goodbye in full and resumes.
+    func testEveryBackgroundCycleSaysGoodbyeAndResumes() async throws {
+        let previous = UserDefaults.standard.object(forKey: "autoResumeOnForeground")
+        UserDefaults.standard.set(true, forKey: "autoResumeOnForeground")
+        defer { UserDefaults.standard.set(previous, forKey: "autoResumeOnForeground") }
+        let host = FakeUDPHost()
+        let manager = try await connectedManager(host)
+        defer { manager.cancel() }
+        for cycle in 1...3 {
+            manager.handleAppBackgrounded()
+            let reasons = await Task.detached { host.goodbyes() }.value
+            XCTAssertEqual(reasons.filter { $0 == .appBackground }.count, ControlChannel.byeCopies, "cycle \(cycle)")
+            XCTAssertNil(manager.problem, "cycle \(cycle)")
+            manager.handleAppForegrounded()
+            XCTAssertEqual(manager.state, .connecting, "cycle \(cycle) must resume")
+            let accepted = await Task.detached { host.acceptSession() }.value
+            XCTAssertTrue(accepted, "cycle \(cycle) never sent HELLO2")
+            for _ in 0..<200 where manager.hostInfo == nil {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            XCTAssertEqual(manager.hostInfo?.sessionId, 41, "cycle \(cycle)")
+        }
+    }
+
+    func testDisconnectSendsEveryGoodbyeWithoutAProblem() async throws {
+        let host = FakeUDPHost()
+        let manager = try await connectedManager(host)
+        manager.cancel()
+        let reasons = await Task.detached { host.goodbyes() }.value
+        XCTAssertEqual(reasons.filter { $0 == .userDisconnect }.count, ControlChannel.byeCopies)
+        XCTAssertNil(manager.problem)
+        XCTAssertNil(manager.connectionError)
+    }
+
+    // MARK: Goodbyes from the PC
+
+    private func until(_ description: String, seconds: Double = 10, _ condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(seconds)
+        while !condition(), Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertTrue(condition(), description)
+    }
+
+    /// A streaming session on `host`, with automatic reconnecting on.
+    private func streaming(_ host: FakeUDPHost) async throws -> ConnectionManager {
+        let previous = UserDefaults.standard.object(forKey: "autoReconnect")
+        UserDefaults.standard.set(true, forKey: "autoReconnect")
+        addTeardownBlock { UserDefaults.standard.set(previous, forKey: "autoReconnect") }
+        let manager = try await connectedManager(host, timing: ConnectionManager.Timing(
+            connectTimeoutSeconds: 1, reconnectGraceSeconds: 0.1, reconnectBackoffSeconds: { _ in 0.05 }))
+        host.sendKeyframe(try FakeUDPHost.keyframe())
+        try await until("streaming") { manager.state == .connected }
+        return manager
+    }
+
+    /// The PC ends the stream to restart it, for a mode switch, new
+    /// settings or an update, and comes back: the iPad reconnects by itself.
+    func testAPCRestartingItsStreamIsReconnected() async throws {
+        let host = FakeUDPHost()
+        let manager = try await streaming(host)
+        defer { manager.cancel() }
+        host.sendBye(.hostShuttingDown)
+        try await until("reconnecting") { manager.reconnectAttempt == 1 }
+        let accepted = await Task.detached { host.acceptSession() }.value
+        XCTAssertTrue(accepted, "the iPad never tried the PC again")
+        try await until("handshake") { manager.hostInfo != nil }
+        host.sendKeyframe(try FakeUDPHost.keyframe())
+        try await until("streaming again") { manager.state == .connected }
+        XCTAssertNil(manager.problem)
+        XCTAssertEqual(manager.reconnectAttempt, 0)
+    }
+
+    /// Disconnected from the PC's side: the iPad stays away.
+    func testAPCDisconnectingTheIPadStaysDisconnected() async throws {
+        let host = FakeUDPHost()
+        let manager = try await streaming(host)
+        defer { manager.cancel() }
+        host.sendBye(.userDisconnect)
+        try await until("disconnected") { manager.state == .disconnected }
+        XCTAssertEqual(manager.problem, .pcEndedSession)
+        XCTAssertEqual(manager.problem?.actions, [.retry])
+        let attempts = await Task.detached { host.helloAttempts(within: 1.5) }.value
+        XCTAssertEqual(attempts, 0, "no automatic reconnecting after a disconnect from the PC")
+        XCTAssertEqual(manager.reconnectAttempt, 0)
+    }
+}

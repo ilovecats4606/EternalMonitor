@@ -33,7 +33,7 @@ emails hello@sideband.studio.
 2. Connect and pair over WiFi
 ----------------------------
 Keep the PC and iPad on the same local network, outside a guest network.
-In the iPad app, tap Find PCs or enter the address shown by the host
+In the iPad app, tap your PC under Found on this network, or enter the address shown by the host
 (default port 9876). Enter the six-digit pairing code shown on the PC.
 Scanning the host QR instead carries its pairing token and skips code entry.
 The app remembers the host. On the PC, Settings > Forget all iPads resets pairing.
@@ -52,11 +52,12 @@ offers Open Apple Devices. If Apple Devices is not installed, it links to the
 Microsoft Store. If the iPad still does not appear after Apple Devices
 opens, unplug the cable and plug it in again.
 
-4. Choose mirror or extended display
------------------------------------
-Connect first. On the PC's Stream page, set Display to Extended display
-(iPad), then click Restart now. Drag windows into the new Windows display.
-To mirror again, choose Main display (mirror) and restart.
+4. Choose mirror or second screen
+---------------------------------
+At the top of the PC's Stream page, next to "Use the iPad as", click
+Second screen. A running stream restarts and the iPad reconnects by itself.
+Drag windows into the new Windows display. To mirror again, click
+Mirror my screen.
 The virtual display should disappear on disconnect and host exit. If it
 cannot start, collect the host log and rerun the matching installer.
 

@@ -1,10 +1,27 @@
 ## EternalMonitor (unreleased)
 
-Windows reliability and startup fixes from 0.3.1 support diagnostics. iPads on
-0.3.1 work with these changes.
+Plain-language setup and problem messages in both apps, and Windows reliability
+and startup fixes from 0.3.1 support diagnostics. iPads on 0.3.1 work with the
+Windows changes.
 
 ### What changed
 
+- The Windows Stream page asks **Use the iPad as** with **Mirror my screen**
+  and **Second screen** at the top, above the fold. A change applies straight
+  away: a running stream restarts and the iPad reconnects by itself. The iPad
+  app uses the same names and explains that the choice is made on the PC.
+- The iPad looks for PCs as soon as it opens, and tapping a found or recent PC
+  connects. Connection problems say what happened and what to do, with
+  **Try again** or **Open Settings**: the PC didn't answer (including the
+  firewall case), the PC answered but sent no picture, the connection was lost,
+  the cable was unplugged, and Local Network access is off. Technical detail
+  stays in Connection details and the support log.
+- Windows notices for the CPU encoder fallback and a second screen that
+  couldn't start use plain words and offer **Use recommended settings**,
+  **Try again** or **Download installer**. Encoder, packet size, HEVC and the
+  quality limit moved under **Advanced** in Settings.
+- Drawing mode is explained in one sentence, and **Reconnect now to apply**
+  appears when it changes mid-session.
 - The Windows window no longer closes without a word on PCs whose graphics
   driver crashes while it starts, such as Intel UHD 620 with a 2018 driver.
   The host prefers a fully supported graphics backend on the same GPU, usually
@@ -17,8 +34,8 @@ Windows reliability and startup fixes from 0.3.1 support diagnostics. iPads on
   display off if the app itself cannot.
 - A USB cable connection now stays up when the PC restarts its stream, for
   example after a settings change or when the extended display turns on. In
-  0.3.1 each restart dropped the cable connection, and with **Extended display
-  (iPad)** selected the iPad could keep reconnecting without ever showing a
+  0.3.1 each restart dropped the cable connection, and with the extended
+  display selected the iPad could keep reconnecting without ever showing a
   picture.
 - When Windows blocks screen capture (lock screen, UAC prompt, display mode
   change, or a laptop GPU it will not capture from), the host keeps retrying

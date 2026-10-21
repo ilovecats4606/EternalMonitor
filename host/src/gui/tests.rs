@@ -155,3 +155,117 @@ fn chart_steps_are_round_numbers() {
         assert!((got - step).abs() < 1e-4, "{value} -> {got}, want {step}");
     }
 }
+
+#[test]
+fn screen_choice_says_what_the_ipad_shows_and_that_it_reconnects() {
+    use super::page_stream::screen_mode_text;
+    use crate::control::VddStatus;
+
+    let mirror = screen_mode_text("", None, VddStatus::Inactive, false);
+    assert_eq!(
+        mirror,
+        "The iPad shows the same picture as your main screen."
+    );
+    let running = screen_mode_text("", None, VddStatus::Inactive, true);
+    assert!(running.contains("reconnects by itself"), "{running}");
+
+    let monitor = screen_mode_text(
+        r"\\.\DISPLAY2",
+        Some("DISPLAY2"),
+        VddStatus::Inactive,
+        false,
+    );
+    assert!(
+        monitor.contains("DISPLAY2") && monitor.contains("Settings"),
+        "{monitor}"
+    );
+
+    let waiting = screen_mode_text(
+        CAPTURE_VIRTUAL_SENTINEL,
+        None,
+        VddStatus::WaitingForClient,
+        true,
+    );
+    assert!(waiting.contains("as soon as it connects"), "{waiting}");
+    let active = screen_mode_text(CAPTURE_VIRTUAL_SENTINEL, None, VddStatus::Active, true);
+    assert!(active.contains("Drag windows"), "{active}");
+    for failed in [VddStatus::Failed, VddStatus::TaskFailed] {
+        let text = screen_mode_text(CAPTURE_VIRTUAL_SENTINEL, None, failed, true);
+        assert!(text.contains("mirrored"), "{text}");
+    }
+    // No driver or protocol words on the main screen.
+    for text in [mirror, running, monitor, waiting, active] {
+        for jargon in ["VDD", "virtual display", "capture", "DXGI", "encoder"] {
+            assert!(!text.contains(jargon), "{text}");
+        }
+    }
+}
+
+#[test]
+fn connection_quality_is_one_plain_word() {
+    assert_eq!(connection_quality(0, 0, 0, 30), "Measuring");
+    assert_eq!(connection_quality(1000, 0, 0, 30), "Excellent");
+    assert_eq!(connection_quality(1000, 0, 10, 300), "Good");
+    assert_eq!(connection_quality(1000, 0, 40, 300), "Fair");
+    assert_eq!(connection_quality(1000, 0, 200, 300), "Poor");
+    assert_eq!(connection_quality(1000, 0, 0, 2000), "Poor");
+}
+
+#[test]
+fn connection_rating_follows_the_latest_interval_not_the_session_total() {
+    let report = |stream_epoch: u32, frags_received: u32, frags_lost: u32| ReceiverReport {
+        stream_epoch,
+        frags_received,
+        frags_lost,
+        rtt_ms_x10: 30,
+        ..Default::default()
+    };
+    let mut meter = QualityMeter::default();
+    assert_eq!(meter.update(None, None), "Measuring");
+    assert_eq!(
+        meter.update(Some(7), Some(&report(1, 1_000_000, 0))),
+        "Excellent"
+    );
+    // 8,000 received and 2,000 lost since the last report is a 20% loss,
+    // although the session total is still 0.2%.
+    let bad = report(1, 1_008_000, 2_000);
+    assert_eq!(meter.update(Some(7), Some(&bad)), "Poor");
+    // The same report read again on the next frame keeps the rating.
+    assert_eq!(meter.update(Some(7), Some(&bad)), "Poor");
+    assert_eq!(
+        meter.update(Some(7), Some(&report(1, 1_018_000, 2_000))),
+        "Excellent"
+    );
+    // A host restart (new epoch) and a new session start from their own counters.
+    assert_eq!(meter.update(Some(7), Some(&report(2, 900, 100))), "Poor");
+    assert_eq!(
+        meter.update(Some(7), Some(&report(2, 10_900, 100))),
+        "Excellent"
+    );
+    assert_eq!(
+        meter.update(Some(8), Some(&report(2, 9_000, 1_000))),
+        "Poor"
+    );
+    // A quiet interval keeps the last word instead of "Measuring".
+    assert_eq!(
+        meter.update(Some(8), Some(&report(2, 9_000, 1_000))),
+        "Poor"
+    );
+    let mut quiet = report(2, 9_000, 1_000);
+    quiet.highest_seq = 1;
+    assert_eq!(meter.update(Some(8), Some(&quiet)), "Poor");
+    // Disconnecting forgets it.
+    assert_eq!(meter.update(None, None), "Measuring");
+}
+
+#[test]
+fn display_choices_use_the_names_shared_with_the_ipad() {
+    assert_eq!(CAPTURE_AUTO_LABEL, "Mirror my screen");
+    assert_eq!(CAPTURE_VIRTUAL_LABEL, "Second screen");
+    for (_, body) in [
+        usb_cable_notice(false, 1, true).unwrap(),
+        usb_cable_notice(false, 1, false).unwrap(),
+    ] {
+        assert!(body.contains("Wi-Fi") && !body.contains("WiFi"), "{body}");
+    }
+}

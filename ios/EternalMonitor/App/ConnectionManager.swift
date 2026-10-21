@@ -72,6 +72,12 @@ final class ConnectionManager: ObservableObject {
     @Published var fps: Double = 0
     @Published var transportMode: String = "WiFi"
     @Published var connectionError: String?
+    /// A connection problem in plain words, with its next action. Shown in
+    /// place of `connectionError` when set.
+    @Published var problem: ConnectionProblem?
+    /// The link failure classified for the current attempt. A link's close
+    /// callback that follows its own failure reports this, not a removed cable.
+    private var linkFailure: ConnectionProblem?
     @Published var pairingPrompt: PairingSheetModel?
     private var awaitingPairing = false
     private var explicitPairingToken: Data?
@@ -131,6 +137,12 @@ final class ConnectionManager: ObservableObject {
     private var livenessTimeoutUs: UInt64 = 3_000_000
     private var degradedSinceUs: UInt64?
     private var reconnectTask: Task<Void, Never>?
+    /// The automatic reconnect cycle allowed to write state. A cycle checks
+    /// this after every wait and stops once a newer cycle, or a connection
+    /// the user or a cable started, has replaced it.
+    private var reconnectCycleID: UUID?
+    /// The classified failure the current cycle shows if every attempt fails.
+    private var reconnectFailure: ConnectionProblem?
     private var prevCounters = FrameAssembler.Counters()
     /// True when backgrounding ended a live session — foregrounding may resume it.
     private var resumeOnForeground = false
@@ -138,13 +150,26 @@ final class ConnectionManager: ObservableObject {
 
     static let connectionTimeoutSeconds: UInt64 = 10
 
+    /// Connect and reconnect timing. The app uses the defaults; tests pass
+    /// shorter ones when they create the manager.
+    struct Timing {
+        var connectTimeoutSeconds = Double(ConnectionManager.connectionTimeoutSeconds)
+        var reconnectGraceSeconds = 2.0
+        var reconnectBackoffSeconds: (Int) -> Double = { attempt in Double(min(1 << (attempt - 1), 15)) }
+    }
+    private let timing: Timing
+
+    init(timing: Timing = Timing()) {
+        self.timing = timing
+    }
+
     func refreshUSBAvailability() {
         let allowed = UserDefaults.standard.flag(forKey: "allowUSB")
         guard allowed, isForeground, !usbPaused else {
             usbListener?.stop()
             usbListener = nil
             usbStatus = allowed ? "USB: disconnected" : "USB: off"
-            if !allowed, mediaLink?.isUSB == true { beginReconnect(reason: "USB connections turned off") }
+            if !allowed, mediaLink?.isUSB == true { beginReconnect(.usbTurnedOff) }
             return
         }
         guard usbListener == nil else { return }
@@ -163,18 +188,23 @@ final class ConnectionManager: ObservableObject {
         }
         listener.onAccepted = { [weak self, weak listener] link in
             Task { @MainActor in
-                guard let self, let listener, self.usbListener === listener,
-                      self.isForeground, !self.usbPaused, self.mediaLink?.isUSB != true else { link.stop(); return }
-                self.reconnectTask?.cancel()
-                self.reconnectAttempt = 0
-                if self.state != .disconnected {
-                    E2E.linkSwitch(from: "udp", to: "usb")
-                    self.disconnect(reason: .superseded)
-                }
-                self.connect(target: .usb(link))
+                guard let self, let listener, self.usbListener === listener else { link.stop(); return }
+                self.acceptUSBLink(link)
             }
         }
         listener.start()
+    }
+
+    /// A cable the listener accepted. It takes over from Wi-Fi, including an
+    /// automatic reconnect cycle and any attempt that cycle has running.
+    func acceptUSBLink(_ link: FramedLink) {
+        guard isForeground, !usbPaused, mediaLink?.isUSB != true else { link.stop(); return }
+        endReconnectCycle()
+        if state != .disconnected {
+            E2E.linkSwitch(from: "udp", to: "usb")
+            disconnect(reason: .superseded)
+        }
+        connect(target: .usb(link))
     }
 
     func resumeUSBConnections() {
@@ -232,7 +262,19 @@ final class ConnectionManager: ObservableObject {
         catch { connectionError = "Could not remove saved pairings from this iPad." }
     }
 
+    /// A connection the user or a cable starts. It replaces any automatic
+    /// reconnect cycle, so that cycle's count and kept failure end with it.
     func connect(target: ConnectionTarget) {
+        guard state == .disconnected else { return }
+        if case .udp(let host, let port) = target,
+           host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || port == 0 { return }
+        endReconnectCycle()
+        startAttempt(target)
+    }
+
+    /// Starts one attempt. The reconnect cycle calls this directly, so its
+    /// own attempts don't end it.
+    private func startAttempt(_ target: ConnectionTarget) {
         guard state == .disconnected else { return }
         let normalizedHost: String
         let port: UInt16
@@ -265,6 +307,8 @@ final class ConnectionManager: ObservableObject {
 
         state = .connecting
         connectionError = nil
+        problem = nil
+        linkFailure = nil
         signalLost = false
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
@@ -320,6 +364,8 @@ final class ConnectionManager: ObservableObject {
                     self.record(.info, "decode", "First frame decoded successfully")
                     self.timeoutTask?.cancel()
                     self.state = .connected
+                    // A reconnect attempt that streams ends its cycle.
+                    self.endReconnectCycle()
                     self.transportMode = isUSB ? "USB" : "WiFi"
                     // Streaming is a passive activity — keep the iPad from
                     // dimming mid-session unless the user opted out.
@@ -428,12 +474,11 @@ final class ConnectionManager: ObservableObject {
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 self.livenessTimeoutUs = UInt64(info.livenessTimeoutMs) * 1000
-                self.reconnectAttempt = 0
                 self.hostInfo = info
                 if self.awaitingPairing {
                     self.awaitingPairing = false
                     self.pairingPrompt = nil
-                    self.armConnectTimeout(seconds: Self.connectionTimeoutSeconds)
+                    self.armConnectTimeout(seconds: self.timing.connectTimeoutSeconds)
                 }
                 if PairingStore.valid(info.authToken) {
                     do { try self.pairingStore.save(token: info.authToken, hostName: info.hostName, address: pairingAddress) }
@@ -450,10 +495,13 @@ final class ConnectionManager: ObservableObject {
         channel.onRejected = { [weak self] status in
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                // Busy passes: the PC is streaming elsewhere, often to this
+                // iPad's own cable session that hasn't closed yet. An
+                // automatic cycle keeps retrying and shows it if it runs out.
+                // Pairing and a version mismatch need the user, so they end it.
+                if status != .busy { self.endReconnectCycle() }
                 if status == .unauthorized || status == .rateLimited {
                     self.timeoutTask?.cancel()
-                    self.reconnectTask?.cancel()
-                    self.reconnectAttempt = 0
                     self.didExtendTimeout = true
                     if status == .unauthorized {
                         do { try self.pairingStore.remove(address: pairingAddress) }
@@ -468,13 +516,13 @@ final class ConnectionManager: ObservableObject {
                 }
                 switch status {
                 case .busy:
-                    self.connectionError = "Your PC is already streaming to another device."
+                    self.problem = .pcBusy
                 case .versionUnsupported:
                     self.connectionError = "This app and EternalMonitor on your PC are different versions. Update both, then try again."
                 default:
                     self.connectionError = "Your PC turned down the connection."
                 }
-                self.record(.error, "ctrl", self.connectionError ?? "rejected")
+                self.record(.error, "ctrl", self.connectionError ?? self.problem?.title ?? "rejected")
                 self.disconnect()
             }
         }
@@ -486,6 +534,7 @@ final class ConnectionManager: ObservableObject {
                     return
                 }
                 if let receiver, receiver.legacyLookingDatagrams > 0 {
+                    self.endReconnectCycle()
                     self.connectionError =
                         "The host is running v0.1.x — update EternalMonitor on the PC."
                     self.record(.error, "ctrl", "Legacy v1 host detected")
@@ -498,9 +547,24 @@ final class ConnectionManager: ObservableObject {
         channel.onBye = { [weak self] reason in
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
-                self.connectionError = "Your PC ended the session."
                 self.record(.info, "ctrl", "Host BYE (\(reason))")
-                self.disconnect()
+                switch reason {
+                case .userDisconnect, .superseded:
+                    // Disconnected from the PC, or another device took over:
+                    // stay away until the user connects again.
+                    self.endReconnectCycle()
+                    self.disconnect()
+                    self.problem = .pcEndedSession
+                default:
+                    // A PC that stops or restarts its stream may come back.
+                    // A running cycle keeps going; otherwise start one.
+                    if self.reconnectCycleID != nil {
+                        self.disconnect()
+                        self.problem = .pcEndedSession
+                    } else {
+                        self.beginReconnect(.pcStoppedResponding, failure: .pcEndedSession)
+                    }
+                }
             }
         }
         channel.onHeartbeat = { [weak self, weak assembler] heartbeat in
@@ -565,13 +629,29 @@ final class ConnectionManager: ObservableObject {
                 self.record(.info, isUSB ? "usb" : "udp", "Accepted stream from selected host")
             }
         }
-        receiver.onError = { [weak self] message in
+        receiver.onError = { [weak self] error in
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
-                self.record(.error, isUSB ? "usb" : "udp", "state=\(self.state) \(message)")
-                guard self.state == .connecting else { return }
-                self.connectionError = message
-                if !isUSB { self.disconnect() }
+                self.record(.error, isUSB ? "usb" : "udp", "state=\(self.state) \(error.message)")
+                let failure = ConnectionProblem.linkFailure(error, isUSB: isUSB, host: normalizedHost)
+                // A live stream rides out transient errors; a USB link that
+                // failed for good closes next, and that close reports this.
+                guard self.state == .connecting else {
+                    if isUSB { self.linkFailure = failure }
+                    return
+                }
+                guard isUSB else {
+                    self.disconnect()
+                    self.problem = failure
+                    return
+                }
+                // Decide once, here, as a close would: fall back to Wi-Fi when
+                // automatic reconnecting is on, otherwise show the cable
+                // advice. beginReconnect disconnects, which retires
+                // connectionID, so the close FramedLink sends next is ignored
+                // instead of relabelling this as an unplugged cable.
+                self.usbStatus = "USB: waiting for a cable"
+                self.beginReconnect(.cableUnplugged, failure: failure)
             }
         }
 
@@ -579,7 +659,9 @@ final class ConnectionManager: ObservableObject {
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 if isUSB { self.usbStatus = "USB: waiting for a cable" }
-                self.beginReconnect(reason: "USB disconnected")
+                // An ordinary close is the cable coming out; a close after a
+                // classified failure keeps that failure's advice.
+                self.beginReconnect(.cableUnplugged, failure: self.linkFailure)
             }
         }
 
@@ -599,7 +681,7 @@ final class ConnectionManager: ObservableObject {
         startStatsFlushLoop()
 
         // Timeout after N seconds (re-armed once when datagrams start arriving).
-        armConnectTimeout(seconds: Self.connectionTimeoutSeconds)
+        armConnectTimeout(seconds: timing.connectTimeoutSeconds)
     }
 
     /// Drains the hot-path counters onto the MainActor at 4 Hz — cheap enough
@@ -635,7 +717,7 @@ final class ConnectionManager: ObservableObject {
                         // off mid-handshake.
                         if self.state == .connecting && !self.didExtendTimeout {
                             self.didExtendTimeout = true
-                            self.armConnectTimeout(seconds: Self.connectionTimeoutSeconds)
+                            self.armConnectTimeout(seconds: self.timing.connectTimeoutSeconds)
                         }
                     }
                     if firstAssembled {
@@ -704,7 +786,7 @@ final class ConnectionManager: ObservableObject {
                       ControlChannel.clientNowUs() &- since > 5_000_000 {
                 // 5s of degraded: give up on this session and (optionally)
                 // start the reconnect cycle.
-                beginReconnect(reason: "host stopped responding")
+                beginReconnect(.pcStoppedResponding)
             }
         } else if signalLost {
             signalLost = false
@@ -713,54 +795,85 @@ final class ConnectionManager: ObservableObject {
         }
     }
 
-    private func beginReconnect(reason: String) {
+    private func beginReconnect(_ reason: ConnectionProblem.LostReason, failure: ConnectionProblem? = nil) {
         let target = lastTarget
         let auto = UserDefaults.standard.flag(forKey: "autoReconnect")
-        record(.warning, "ctrl", "Connection lost (\(reason))")
+        // Support logs keep the original wording so reports stay comparable.
+        let logged: String
+        switch reason {
+        case .pcStoppedResponding: logged = "host stopped responding"
+        case .cableUnplugged: logged = failure == nil ? "USB disconnected" : "USB link failed"
+        case .usbTurnedOff: logged = "USB connections turned off"
+        }
+        record(.warning, "ctrl", "Connection lost (\(logged))")
         disconnect()
         guard auto, let target else {
-            connectionError = "Connection lost — \(reason)."
+            problem = failure ?? .lost(reason)
             return
         }
-        startReconnectCycle(to: target)
+        startReconnectCycle(to: target, failure: failure)
     }
 
-    private func startReconnectCycle(to target: (host: String, port: UInt16)) {
-        reconnectTask?.cancel()
+    /// Retries the last Wi-Fi PC. `failure` is the classified problem that
+    /// ended the session (a failed cable); a more specific failure in a later
+    /// attempt replaces it, and whichever is left is shown if every attempt
+    /// fails, rather than the generic message. The cycle writes state only
+    /// while `reconnectCycleID` is its own.
+    private func startReconnectCycle(to target: (host: String, port: UInt16), failure: ConnectionProblem? = nil) {
+        endReconnectCycle()
+        let cycleID = UUID()
+        reconnectCycleID = cycleID
+        reconnectFailure = failure
         reconnectTask = Task { @MainActor [weak self] in
             for attempt in 1...6 {
-                guard let self, !Task.isCancelled else { return }
+                guard let self, self.reconnectCycleID == cycleID else { return }
                 self.reconnectAttempt = attempt
-                self.connectionError = "Connection lost — reconnecting (attempt \(attempt)/6)…"
-                let backoff = min(1 << (attempt - 1), 15)
-                try? await Task.sleep(for: .seconds(Double(backoff)))
-                guard !Task.isCancelled, self.state == .disconnected else { return }
-                self.connect(host: target.host, port: target.port)
-                // Give the attempt its connect-timeout window to succeed.
-                try? await Task.sleep(for: .seconds(Double(Self.connectionTimeoutSeconds) + 2))
-                guard !Task.isCancelled else { return }
-                if self.state == .connected {
-                    self.reconnectAttempt = 0
-                    self.connectionError = nil
-                    return
+                self.problem = .reconnecting(attempt: attempt, of: 6)
+                try? await Task.sleep(for: .seconds(self.timing.reconnectBackoffSeconds(attempt)))
+                guard self.reconnectCycleID == cycleID else { return }
+                self.startAttempt(.udp(host: target.host, port: target.port))
+                // Give the attempt its connect-timeout window, and wait out a
+                // window that arriving data extended. Streaming ends the cycle.
+                try? await Task.sleep(for: .seconds(self.timing.connectTimeoutSeconds + self.timing.reconnectGraceSeconds))
+                while self.reconnectCycleID == cycleID, self.state == .connecting {
+                    try? await Task.sleep(for: .milliseconds(250))
+                }
+                guard self.reconnectCycleID == cycleID else { return }
+                if ConnectionProblem.afterReconnecting(lastAttempt: self.problem) != .reconnectFailed {
+                    self.reconnectFailure = self.problem
                 }
             }
-            guard let self, !Task.isCancelled else { return }
-            self.reconnectAttempt = 0
-            self.connectionError = "Couldn't reach your PC after 6 tries. Check that EternalMonitor is running on it."
+            guard let self, self.reconnectCycleID == cycleID else { return }
+            let kept = self.reconnectFailure
+            self.endReconnectCycle()
+            self.problem = kept ?? .reconnectFailed
         }
+    }
+
+    /// Retires the automatic reconnect cycle, if one is running: its task
+    /// stops at its next check and can no longer write state.
+    private func endReconnectCycle() {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        reconnectCycleID = nil
+        reconnectFailure = nil
+        reconnectAttempt = 0
     }
 
     /// (Re)arm the connect-timeout watchdog. Cancels any existing timer and starts a fresh one;
     /// if we're still `.connecting` when it fires, surface a diagnostic and disconnect.
-    private func armConnectTimeout(seconds: UInt64) {
+    private func armConnectTimeout(seconds: Double) {
         timeoutTask?.cancel()
         timeoutTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: seconds * 1_000_000_000)
+            try? await Task.sleep(for: .seconds(seconds))
             if !Task.isCancelled && self.state == .connecting {
                 let summary = self.debugState.timeoutSummary
                 self.record(.error, "timeout", summary)
-                self.connectionError = "No picture arrived from your PC. \(summary)"
+                let debug = self.debugState
+                self.problem = .timeout(
+                    listenerReady: debug.listenerReadyPort != nil, helloAttempts: debug.helloAttempts,
+                    handshakeDone: self.hostInfo != nil, datagramsReceived: debug.datagramsReceived,
+                    isUSB: self.transportMode == "USB")
                 self.disconnect()
             }
         }
@@ -774,9 +887,32 @@ final class ConnectionManager: ObservableObject {
             usbStatus = "USB: disconnected"
         }
         timeoutTask?.cancel()
-        reconnectTask?.cancel()
-        reconnectAttempt = 0
+        endReconnectCycle()
         disconnect()
+    }
+
+    /// Try the last connection again: the cable when that is what failed,
+    /// otherwise the last PC address.
+    func retry() {
+        guard state == .disconnected else { return }
+        endReconnectCycle()
+        problem = nil
+        connectionError = nil
+        if transportMode == "USB" {
+            resumeUSBConnections()
+        } else if let target = lastTarget {
+            connect(host: target.host, port: target.port)
+        }
+    }
+
+    /// Settings negotiated at connect (Drawing mode, Control PC) apply after
+    /// a new handshake. USB's listener accepts the retry on its own.
+    func reconnectToApply() {
+        guard state == .connected else { return }
+        let isUSB = mediaLink?.isUSB == true
+        let target = lastTarget
+        disconnect()
+        if !isUSB, let target { connect(host: target.host, port: target.port) }
     }
 
     func refreshAudioPreference(_ enabled: Bool) {
@@ -822,7 +958,14 @@ final class ConnectionManager: ObservableObject {
         isForeground = false
         usbListener?.stop()
         usbListener = nil
+        // A suspended app can't reconnect. Backgrounding ends an automatic
+        // cycle where running out would, and foregrounding resumes it as an
+        // interrupted session.
+        let cycleOutcome = reconnectCycleID == nil ? nil : reconnectFailure ?? .reconnectFailed
+        endReconnectCycle()
+        if cycleOutcome != nil { resumeOnForeground = true }
         guard state != .disconnected else {
+            if let cycleOutcome { problem = cycleOutcome }
             endBackgroundGoodbye()
             return
         }
@@ -830,6 +973,7 @@ final class ConnectionManager: ObservableObject {
         record(.info, "ctrl", "App backgrounded — sending BYE and disconnecting")
         let goodbye = backgroundGoodbyeTask
         disconnect(reason: .appBackground)
+        if let cycleOutcome { problem = cycleOutcome }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             guard let self, self.backgroundGoodbyeTask == goodbye else { return }
             self.endBackgroundGoodbye()
@@ -1121,6 +1265,16 @@ struct RecentConnection: Codable, Identifiable {
     let port: UInt16
     let lastUsed: Date
     let isUSB: Bool
+}
+
+extension RecentConnection {
+    /// Recent PCs that discovery has not already listed at the same address
+    /// and port. Cable entries always stay; they connect another way.
+    static func unlisted(_ recents: [RecentConnection], discovered: [DiscoveredHost]) -> [RecentConnection] {
+        recents.filter { recent in
+            recent.isUSB || !discovered.contains { $0.address == recent.host && $0.port == recent.port }
+        }
+    }
 }
 
 final class RecentConnectionStore: ObservableObject {

@@ -96,14 +96,22 @@ struct SettingsView: View {
                         if enabled { settings.allowUSB = true }
                     }
                     if connectionManager.state == .connected {
-                        infoRow("Pencil", connectionManager.sessionHasPen ? "Windows Ink ready" : "Unavailable on this host", "pencil")
-                        infoRow("Drawing mode", connectionManager.sessionDrawingMode ? "Active" : "Off", "hand.draw")
+                        infoRow("Pencil", connectionManager.sessionHasPen ? "Ready to draw" : "Not available from this PC", "pencil")
+                        infoRow("Drawing mode", connectionManager.sessionDrawingMode ? "On" : "Off", "hand.draw")
+                        if settings.drawingMode != connectionManager.sessionDrawingMode {
+                            Button {
+                                connectionManager.reconnectToApply()
+                            } label: {
+                                rowLabel("Reconnect now to apply", "arrow.triangle.2.circlepath")
+                            }
+                            .accessibilityIdentifier("settings.reconnectToApply")
+                        }
                     }
                 } header: {
                     sectionHeader("Apple Pencil")
                 } footer: {
-                    footnote("Drawing mode ignores fingers on the canvas and mutes PC audio. Over USB it requests the iPad's highest frame rate, up to the PC's limit. Applies from the next connection. "
-                        + "In Clip Studio Paint, choose Preferences > Tablet > Tablet PC. Pressure requires a pressure-sensitive Pencil; Apple Pencil USB-C does not support pressure.")
+                    footnote("Draw with Apple Pencil in Windows apps, with pressure and tilt; fingers on the picture are ignored and PC sound is muted while it's on. "
+                        + "In Clip Studio Paint, choose Preferences > Tablet > Tablet PC.")
                 }
                 .listRowBackground(Theme.surfaceRaised)
 
@@ -118,12 +126,12 @@ struct SettingsView: View {
                             "rectangle.on.rectangle"
                         )
                         infoRow(
-                            "Codec",
+                            "Video format",
                             config.codec == StreamConfig.codecHEVC ? "HEVC (H.265)" : "H.264",
                             "cpu"
                         )
                         infoRow(
-                            "Bitrate",
+                            "Data rate",
                             String(format: "%.1f Mbps", Double(config.bitrateBps) / 1_000_000.0),
                             "chart.bar"
                         )
@@ -138,7 +146,27 @@ struct SettingsView: View {
                 } header: {
                     sectionHeader("Connected PC")
                 } footer: {
-                    footnote("Resolution, codec and bitrate are set in EternalMonitor on your PC.")
+                    footnote("These are set in EternalMonitor on your PC.")
+                }
+                .listRowBackground(Theme.surfaceRaised)
+
+                // After Connected PC: the audio status there stays close to the
+                // Play PC audio switch, and this explains what the PC decides.
+                Section {
+                    Label {
+                        Text("Your PC chooses whether this iPad mirrors its screen or works as a second screen. "
+                            + "In EternalMonitor on the PC, pick Mirror my screen or Second screen at the top of the Stream page. "
+                            + "This iPad reconnects by itself.")
+                            .font(.app(15, relativeTo: .callout))
+                            .foregroundStyle(Theme.text)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } icon: {
+                        Image(systemName: "rectangle.on.rectangle")
+                            .foregroundStyle(Theme.textMuted)
+                    }
+                    .accessibilityIdentifier("settings.screenMode")
+                } header: {
+                    sectionHeader("Second screen or mirror")
                 }
                 .listRowBackground(Theme.surfaceRaised)
 

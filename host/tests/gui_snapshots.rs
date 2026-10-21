@@ -140,6 +140,28 @@ fn connect_named(shared: &SharedControl, device_name: &str, frags_lost: u32, fra
     );
 }
 
+/// Another receiver report from the connected iPad, with cumulative counters.
+fn report(shared: &SharedControl, frags_received: u32, frags_lost: u32) {
+    let mut session = shared.session.lock();
+    let session_id = session.session_id().unwrap();
+    session.handle_control(
+        PeerId::usb(7),
+        session_id,
+        ControlMessage::ReceiverReport(ReceiverReport {
+            stream_epoch: 1,
+            frags_received,
+            frags_lost,
+            decode_fps_x10: 599,
+            e2e_latency_ms_x10: 184,
+            rtt_ms_x10: 32,
+            audio_buffer_ms: 60,
+            ..Default::default()
+        }),
+        &Fixture,
+        Instant::now(),
+    );
+}
+
 fn pipeline_stats() -> PipelineStats {
     let mut stats = PipelineStats::new();
     stats.listen_addr = "192.0.2.10:9876".into();
@@ -219,6 +241,13 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
         harness.get_by_label(label);
     }
     assert!(harness.query_by_label("Waiting for an iPad").is_none());
+    // Mirror or second screen is chosen at the top of Stream, by the same
+    // names the iPad uses.
+    harness.get_by_label("Use the iPad as");
+    harness.get_by_label("Mirror my screen");
+    harness.get_by_label("Connection");
+    // 1% of fragments lost in the fixture.
+    harness.get_by_label("Good");
     harness.get_by_label_contains("Streaming PC headphones");
     snapshot(&mut harness, &shared, "stream-connected");
 
@@ -249,9 +278,13 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
 
     nav(&mut harness, "Settings");
     harness.get_by_label("Encoder input");
+    harness.get_by_label("ADVANCED");
     harness.get_by_label("120").click();
     harness.run_steps(4);
     assert_eq!(shared.target_fps.load(Ordering::SeqCst), 120);
+    // Encoder input sits under Advanced, below the fold.
+    harness.get_by_label("BGRA").scroll_to_me();
+    harness.run_steps(4);
     harness.get_by_label("BGRA").click();
     harness.run_steps(4);
     assert_eq!(
@@ -259,7 +292,10 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
         eternal_host::encoder::input::EncoderInput::Bgra
     );
     // Encoder input applies on restart, so the page asks for one.
-    harness.get_by_label("Restart the stream to apply your changes");
+    harness
+        .get_by_label("Restart the stream to apply your changes")
+        .scroll_to_me();
+    harness.run_steps(4);
     snapshot(&mut harness, &shared, "settings");
 
     // General sits below the fold of the Settings page.
@@ -292,9 +328,44 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     PIPELINE_STATS.lock().using_software_fallback = true;
     *shared.vdd_status.lock() = VddStatus::TaskFailed;
     harness.run_steps(4);
-    harness.get_by_label("Hardware encoder unavailable. Encoding on the CPU (libx264).");
-    harness.get_by_label("Extended display unavailable. Mirroring the main screen instead.");
+    harness.get_by_label("Video is using the processor instead of the graphics card");
+    harness.get_by_label("The second screen couldn't start, so your main screen is mirrored");
+    harness.get_by_label("Download installer");
+    // Encoder input is still BGRA from above, so the notice offers to undo it.
+    harness.get_by_label("Use recommended settings");
     snapshot(&mut harness, &shared, "software-and-display-task-failure");
+    harness.get_by_label("Use recommended settings").click();
+    harness.run_steps(4);
+    assert_eq!(
+        *shared.encoder_input.lock(),
+        eternal_host::encoder::input::EncoderInput::Yuv420
+    );
+
+    // Choosing Second screen applies at once: no separate restart prompt.
+    *shared.vdd_status.lock() = VddStatus::WaitingForClient;
+    PIPELINE_STATS.lock().using_software_fallback = false;
+    // Let the notices disappear first, so the click lands where the choice is.
+    harness.run_steps(4);
+    harness.get_by_label("Second screen").click();
+    harness.run_steps(4);
+    assert_eq!(
+        *shared.capture_target.lock(),
+        eternal_host::control::CaptureTarget::VirtualExtended
+    );
+    assert!(harness
+        .query_by_label("Restart the stream to apply your changes")
+        .is_none());
+    harness.get_by_label_contains("as soon as it connects");
+
+    // The Connection rating follows the latest interval. After a million
+    // clean fragments, 8,000 received and 2,000 lost is a bad interval even
+    // though the session total is 0.2% loss.
+    report(&shared, 1_000_000, 10);
+    harness.run_steps(4);
+    harness.get_by_label("Excellent");
+    report(&shared, 1_008_000, 2_010);
+    harness.run_steps(4);
+    harness.get_by_label("Poor");
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -335,6 +406,52 @@ fn review_screens() {
     let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
     save(&mut h, "stopped");
     PIPELINE_STATS.lock().pipeline_running = true;
+
+    // An iPad on the cable while Apple Devices is missing, then closed.
+    for (name, installed) in [
+        ("usb-apple-devices-missing", false),
+        ("usb-apple-devices-closed", true),
+    ] {
+        {
+            let mut stats = PIPELINE_STATS.lock();
+            stats.usb_service_reachable = false;
+            stats.usb_cabled_devices = 1;
+            stats.apple_devices_installed = installed;
+        }
+        let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
+        save(&mut h, name);
+    }
+    {
+        let mut stats = PIPELINE_STATS.lock();
+        stats.usb_service_reachable = true;
+        stats.usb_cabled_devices = 0;
+    }
+
+    // Second screen chosen, before any iPad connects.
+    SettingsFile {
+        check_for_updates: false,
+        capture_display: Some(eternal_host::control::CAPTURE_VIRTUAL_SENTINEL.into()),
+        ..Default::default()
+    }
+    .save();
+    *shared.vdd_status.lock() = VddStatus::WaitingForClient;
+    let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
+    save(&mut h, "extend-waiting");
+    // The display task failed, and the encoder fell back to the CPU.
+    *shared.vdd_status.lock() = VddStatus::TaskFailed;
+    PIPELINE_STATS.lock().using_software_fallback = true;
+    let mut h = harness(&shared, egui::vec2(1040.0, 900.0), 2.0);
+    save(&mut h, "problems-display-task-and-encoder");
+    *shared.vdd_status.lock() = VddStatus::Failed;
+    PIPELINE_STATS.lock().using_software_fallback = false;
+    let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
+    save(&mut h, "problem-display-timeout");
+    *shared.vdd_status.lock() = VddStatus::Inactive;
+    SettingsFile {
+        check_for_updates: false,
+        ..Default::default()
+    }
+    .save();
 
     connect_ipad(&shared);
     let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
