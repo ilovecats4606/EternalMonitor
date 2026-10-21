@@ -296,10 +296,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     info!("EternalMonitor shutting down");
-    // process::exit skips destructors. Flush the upload outbox and the log
-    // writers first, so a normal quit is told apart from a crash.
-    drop(_uploads);
-    drop(_session_guard);
-    drop(_stdout_guard);
+    // process::exit skips destructors. Flush the log writers and the upload
+    // outbox first, so a normal quit is told apart from a crash.
+    logging::flush_before_exit(_session_guard, _uploads, _stdout_guard);
     std::process::exit(0);
 }

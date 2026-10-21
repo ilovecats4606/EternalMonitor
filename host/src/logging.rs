@@ -308,6 +308,17 @@ pub fn session_log_path() -> PathBuf {
     SESSION_LOG_PATH.clone()
 }
 
+/// Release the log and upload guards in the order a normal quit needs. A
+/// session-log guard may emit final lines, such as repeat summaries, while it
+/// drops; those reach support only while the upload guard still queues lines.
+/// The upload guard then writes what is queued to the outbox, within its
+/// bound, and console output goes last.
+pub fn flush_before_exit<S, U, C>(session_log: S, uploads: U, console: C) {
+    drop(session_log);
+    drop(uploads);
+    drop(console);
+}
+
 /// Write one line straight to the session log. A fatal failure can end the
 /// process before the output worker writes what is queued.
 pub fn append_now(line: &str) -> io::Result<()> {
@@ -776,6 +787,23 @@ mod tests {
             "2"
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn quit_drops_session_log_guards_while_uploads_still_queue() {
+        struct Guard(&'static str, Arc<Mutex<Vec<&'static str>>>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.1.lock().push(self.0);
+            }
+        }
+        let order = Arc::new(Mutex::new(Vec::new()));
+        flush_before_exit(
+            Guard("session log", order.clone()),
+            Guard("uploads", order.clone()),
+            Guard("console", order.clone()),
+        );
+        assert_eq!(*order.lock(), ["session log", "uploads", "console"]);
     }
 
     #[test]

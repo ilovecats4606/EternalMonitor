@@ -11,7 +11,8 @@
   with the error and the path of the log file. The error is written to the log
   and queued for automatic support diagnostics before the process ends.
 - The host log and support diagnostics keep their final lines when the app
-  quits normally, so a normal quit can be told apart from a crash.
+  quits normally, so a normal quit can be told apart from a crash. Quitting
+  waits at most two seconds for uploads; the rest are sent on the next launch.
 
 ### What to test
 
