@@ -36,7 +36,11 @@ Knowing these limits helps you judge whether a finding is new.
   in depth rather than a guarantee. Its helper loads DLLs only from System32 and
   imports only Windows system libraries. It refuses an update folder reached
   through a link and keeps the installer open so it can't be changed. Setup
-  starts suspended and runs only if it is the verified file. Microsoft does not
+  starts suspended and runs only if it is the verified file. If the old host
+  takes more than 60 seconds to close, Setup does not run, but the helper keeps
+  waiting for that process and starts the app once it exits, however late: a
+  start while the old host still runs would only show its window and quit,
+  leaving nothing running when it finally closed. Microsoft does not
   treat UAC as a security boundary, and such software could ask for elevation
   itself, so same-user races beyond these are out of scope.
 

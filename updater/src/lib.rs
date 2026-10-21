@@ -190,6 +190,14 @@ fn run_with(args: HelperArgs, out: &mut dyn Write, host_exit_wait: Duration) -> 
     // old host has exited. A start while it still runs would find it, show
     // its window and quit, and then nothing would be running when it closes.
     // While it runs the user has that app, so there is no deadline here.
+    //
+    // The single-instance mutex is a named object that lasts until its last
+    // handle closes, not until its creator exits. The host's handle comes from
+    // CreateMutexW with no security attributes, so it is not inheritable, and
+    // it is never owned or duplicated: its children cannot keep the name
+    // alive, and Windows closes it before the process counts as exited. The
+    // only other handles are a second start's own check, which closes it at
+    // once, so the start below finds the name free.
     if host.wait(None) == HostExit::StillRunning {
         log.note("cannot wait for EternalMonitor to close; not starting it again");
         return 6;
