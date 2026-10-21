@@ -13,6 +13,11 @@ enum ConnectionProblem: Equatable {
     /// This iPad could not open its side of the connection.
     case receiverNotReady
     case badAddress(String)
+    /// The typed address is a six-digit number: the pairing code.
+    case pairingCodeAsAddress
+    /// Nothing answered at a home network address ending in .1, which is
+    /// usually the router.
+    case routerAddress
     case noNetwork
     case localNetworkBlocked
     case couldNotConnect
@@ -44,6 +49,8 @@ enum ConnectionProblem: Equatable {
         case .noPicture: return "Your PC answered, but no picture arrived"
         case .receiverNotReady: return "This iPad couldn't start the connection"
         case .badAddress: return "That address doesn't look right"
+        case .pairingCodeAsAddress: return "That looks like the pairing code, not the PC's address"
+        case .routerAddress: return "That looks like your router's address, not your PC's"
         case .noNetwork: return "This iPad isn't connected to a network"
         case .localNetworkBlocked: return "EternalMonitor isn't allowed on your local network"
         case .couldNotConnect: return "Couldn't connect to your PC"
@@ -73,6 +80,12 @@ enum ConnectionProblem: Equatable {
             return "Close EternalMonitor on this iPad and open it again."
         case .badAddress(let host):
             return "This iPad couldn't find \"\(host)\". Type the Address exactly as the PC window shows it, for example 192.168.1.20."
+        case .pairingCodeAsAddress:
+            return "Type the Address shown in the EternalMonitor window on the PC, for example 192.168.1.20. "
+                + "This iPad asks for the pairing code after it connects."
+        case .routerAddress:
+            return "Addresses ending in .1 usually belong to the Wi-Fi router. Type the Address shown in the "
+                + "EternalMonitor window on the PC, for example 192.168.1.20."
         case .noNetwork:
             return "Turn on Wi-Fi and join the same network as your PC, or connect with a USB cable."
         case .localNetworkBlocked:
@@ -101,7 +114,7 @@ enum ConnectionProblem: Equatable {
     var actions: [Action] {
         switch self {
         case .localNetworkBlocked: return [.openSettings]
-        case .reconnecting, .lost(.cableUnplugged), .lost(.usbTurnedOff), .receiverNotReady: return []
+        case .reconnecting, .lost(.cableUnplugged), .lost(.usbTurnedOff), .receiverNotReady, .pairingCodeAsAddress: return []
         default: return [.retry]
         }
     }
@@ -110,10 +123,27 @@ enum ConnectionProblem: Equatable {
     /// A PC that accepted the handshake did answer: no picture after that is
     /// a problem on the PC (screen capture or video encoding), not the network.
     static func timeout(listenerReady: Bool, helloAttempts: Int, handshakeDone: Bool,
-                        datagramsReceived: Int, isUSB: Bool) -> ConnectionProblem {
+                        datagramsReceived: Int, isUSB: Bool, host: String = "") -> ConnectionProblem {
         if handshakeDone { return .noPicture }
         if !listenerReady || helloAttempts == 0 { return .receiverNotReady }
-        return datagramsReceived == 0 ? .noReply(usb: isUSB) : .noPicture
+        if datagramsReceived > 0 { return .noPicture }
+        if !isUSB && isRouterAddress(host) { return .routerAddress }
+        return .noReply(usb: isUSB)
+    }
+
+    /// A problem with the typed address found before connecting. The pairing
+    /// code would otherwise be read as a numeric IPv4 address that never answers.
+    static func typedAddress(_ host: String) -> ConnectionProblem? {
+        let text = host.filter { !$0.isWhitespace }
+        return text.count == 6 && text.allSatisfy({ ("0"..."9").contains($0) }) ? .pairingCodeAsAddress : nil
+    }
+
+    /// A private IPv4 address ending in .1, where home routers sit. A PC can
+    /// have one, so this only changes the advice once nothing answered.
+    static func isRouterAddress(_ host: String) -> Bool {
+        guard host.split(separator: ".").count == 4, let bytes = IPv4Address(host)?.rawValue, bytes.count == 4,
+              bytes[3] == 1 else { return false }
+        return bytes[0] == 10 || (bytes[0] == 172 && (16...31).contains(bytes[1])) || (bytes[0] == 192 && bytes[1] == 168)
     }
 
     /// The banner once automatic reconnecting gives up. A last attempt that

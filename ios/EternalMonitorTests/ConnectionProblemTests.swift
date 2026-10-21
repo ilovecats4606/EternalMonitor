@@ -14,6 +14,45 @@ final class ConnectionProblemTests: XCTestCase {
         XCTAssertEqual(ConnectionProblem.timeout(listenerReady: true, helloAttempts: 1, handshakeDone: true, datagramsReceived: 0, isUSB: true), .noPicture)
     }
 
+    func testAPairingCodeTypedAsTheAddressIsCaughtBeforeConnecting() {
+        for typed in ["390756", "390 756", " 390756 "] {
+            XCTAssertEqual(ConnectionProblem.typedAddress(typed), .pairingCodeAsAddress, typed)
+        }
+        for address in ["192.168.1.20", "studio-pc", "39075", "3907561", "10.0.0.1", "fe80::1", "12345a"] {
+            XCTAssertNil(ConnectionProblem.typedAddress(address), address)
+        }
+        XCTAssertEqual(ConnectionProblem.pairingCodeAsAddress.actions, [])
+        XCTAssertTrue(ConnectionProblem.pairingCodeAsAddress.detail.contains("192.168.1.20"))
+    }
+
+    func testNoReplyFromAHomeRoutersAddressSaysItIsTheRouter() {
+        let noReply = { (host: String, usb: Bool) in
+            ConnectionProblem.timeout(listenerReady: true, helloAttempts: 6, handshakeDone: false,
+                                      datagramsReceived: 0, isUSB: usb, host: host)
+        }
+        for router in ["192.168.1.1", "192.168.0.1", "10.0.0.1", "172.16.4.1", "172.31.255.1"] {
+            XCTAssertEqual(noReply(router, false), .routerAddress, router)
+        }
+        // Other private addresses, public and documentation addresses, and
+        // names keep the general advice. So does the cable.
+        for other in ["192.168.1.20", "192.168.1.10", "172.32.0.1", "8.8.8.1", "192.0.2.1", "100.64.0.1", "studio-pc", "390756"] {
+            XCTAssertEqual(noReply(other, false), .noReply(usb: false), other)
+        }
+        XCTAssertEqual(noReply("USB", true), .noReply(usb: true))
+        // A router address that answered is a PC after all.
+        XCTAssertEqual(ConnectionProblem.timeout(listenerReady: true, helloAttempts: 2, handshakeDone: true,
+                                                 datagramsReceived: 0, isUSB: false, host: "192.168.1.1"), .noPicture)
+        XCTAssertEqual(ConnectionProblem.routerAddress.actions, [.retry])
+    }
+
+    func testTheSupportLogSaysAnAcceptedSessionSentNoPicture() {
+        let debug = ConnectionDebugState(host: "192.168.1.20", port: 9876, listenerReadyPort: 9877, helloAttempts: 1)
+        let accepted = debug.timeoutSummary(handshakeDone: true)
+        XCTAssertFalse(accepted.contains("no datagrams came back"), accepted)
+        XCTAssertTrue(accepted.contains("Session accepted") && accepted.contains("no video"), accepted)
+        XCTAssertTrue(debug.timeoutSummary(handshakeDone: false).contains("no datagrams came back"))
+    }
+
     func testLinkFailuresBecomePlainProblemsForTheirTransport() {
         let wifi = { (error: LinkError) in ConnectionProblem.linkFailure(error, isUSB: false, host: "studio-pc") }
         // DNS: a name that doesn't resolve, through either socket backend.
@@ -62,7 +101,7 @@ final class ConnectionProblemTests: XCTestCase {
             .noReply(usb: false), .noReply(usb: true), .noPicture, .receiverNotReady, .badAddress("pc"),
             .noNetwork, .localNetworkBlocked, .couldNotConnect, .usbFailed, .lost(.pcStoppedResponding), .lost(.cableUnplugged),
             .lost(.usbTurnedOff), .reconnecting(attempt: 2, of: 6), .reconnectFailed, .pcEndedSession,
-            .pcBusy,
+            .pcBusy, .pairingCodeAsAddress, .routerAddress,
         ]
         for problem in all {
             XCTAssertFalse(problem.title.isEmpty)

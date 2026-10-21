@@ -30,7 +30,7 @@ struct DiagnosticEntry: Identifiable {
     let message: String
 }
 
-private struct ConnectionDebugState {
+struct ConnectionDebugState {
     var host = ""
     var port: UInt16 = 0
     var listenerReadyPort: UInt16?
@@ -43,7 +43,8 @@ private struct ConnectionDebugState {
     var decodedFrames = 0
     var lastDecodedTimestampUs: UInt64 = 0
 
-    var timeoutSummary: String {
+    /// For the support log. `handshakeDone` says the PC accepted the session.
+    func timeoutSummary(handshakeDone: Bool) -> String {
         if listenerReadyPort == nil {
             return "Receiver never became ready."
         }
@@ -51,6 +52,9 @@ private struct ConnectionDebugState {
             return "Listener came up, but HELLO registration never sent."
         }
         if datagramsReceived == 0 {
+            if handshakeDone {
+                return "Session accepted by \(host):\(port), but no video datagrams arrived."
+            }
             return "HELLO sent \(helloAttempts)x to \(host):\(port), but no datagrams came back."
         }
         if assembledFrames == 0 {
@@ -269,6 +273,12 @@ final class ConnectionManager: ObservableObject {
         if case .udp(let host, let port) = target,
            host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || port == 0 { return }
         endReconnectCycle()
+        if case .udp(let host, _) = target, let typed = ConnectionProblem.typedAddress(host) {
+            connectionError = nil
+            problem = typed
+            record(.warning, "connection", "Not connecting: the typed address looks like the pairing code")
+            return
+        }
         startAttempt(target)
     }
 
@@ -867,13 +877,13 @@ final class ConnectionManager: ObservableObject {
         timeoutTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(seconds))
             if !Task.isCancelled && self.state == .connecting {
-                let summary = self.debugState.timeoutSummary
-                self.record(.error, "timeout", summary)
                 let debug = self.debugState
+                let handshakeDone = self.hostInfo != nil
+                self.record(.error, "timeout", debug.timeoutSummary(handshakeDone: handshakeDone))
                 self.problem = .timeout(
                     listenerReady: debug.listenerReadyPort != nil, helloAttempts: debug.helloAttempts,
-                    handshakeDone: self.hostInfo != nil, datagramsReceived: debug.datagramsReceived,
-                    isUSB: self.transportMode == "USB")
+                    handshakeDone: handshakeDone, datagramsReceived: debug.datagramsReceived,
+                    isUSB: self.transportMode == "USB", host: debug.host)
                 self.disconnect()
             }
         }

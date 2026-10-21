@@ -55,6 +55,22 @@ final class ConnectScreenTests: XCTestCase {
         waitForExpectations(timeout: 5)
     }
 
+    /// The pairing code typed into Address is caught at once, instead of
+    /// being read as a numeric address that never answers.
+    func testPairingCodeAsAddressIsExplainedAtOnce() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-lastHost", "390756", "-lastPort", "9876"]
+        app.launch()
+        XCTAssertTrue(app.buttons["connect.button"].waitForExistence(timeout: 10))
+        app.buttons["connect.button"].tap()
+        let title = app.staticTexts["connect.problemTitle"]
+        XCTAssertTrue(title.waitForExistence(timeout: 3), app.debugDescription)
+        XCTAssertEqual(title.label, "That looks like the pairing code, not the PC's address")
+        XCTAssertFalse(app.buttons["Cancel"].exists)
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "pairing-code-as-address"; shot.lifetime = .keepAlways; add(shot)
+    }
+
     /// An address where nothing answers ends in plain words and a retry,
     /// not a transport trace.
     func testUnreachablePCSaysWhatToDo() {
