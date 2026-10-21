@@ -245,7 +245,7 @@ public sealed class EMPlacementProbe : Form {
 
 [EMLayout]::BecomeAware()
 # Keep the display and system awake for the run.
-[EMLayout]::SetThreadExecutionState(0x80000003) | Out-Null
+[EMLayout]::SetThreadExecutionState([uint32]2147483651) | Out-Null
 function Get-Layout {
     @([EMLayout]::Read() | ForEach-Object {
         [pscustomobject]@{ name = $_.Name; adapter = $_.Adapter; x = $_.X; y = $_.Y;
@@ -371,7 +371,7 @@ try {
     $report.final_layout = $final
     $report.layout_restored = (& $key $original) -eq (& $key $final)
     $report.restore_errors = $restoreErrors
-    [EMLayout]::SetThreadExecutionState(0x80000000) | Out-Null
+    [EMLayout]::SetThreadExecutionState([uint32]2147483648) | Out-Null
     $report | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $EvidenceDirectory 'result.json')
 }
 $failed = @($cases | Where-Object { !$_.passed })
