@@ -96,6 +96,21 @@ impl TransportLinks {
         }
     }
 
+    /// Waits, for at most `timeout`, until what was sent to `peer` has been
+    /// written out. UDP sends are written when they return.
+    pub async fn flush(&self, peer: PeerId, timeout: Duration) -> io::Result<()> {
+        match peer.link {
+            LinkId::Udp => Ok(()),
+            id => match self.usb.get(&id) {
+                Some(active) => active.link.flush(timeout).await,
+                None => Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "USB tunnel unavailable",
+                )),
+            },
+        }
+    }
+
     pub fn update_stats(&mut self) {
         for active in self.usb.values_mut() {
             active.report_drops();

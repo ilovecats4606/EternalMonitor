@@ -874,19 +874,18 @@ fn stop_and_update_ends_the_stream_and_hands_over() {
     assert!(!session.is_active(), "the stream ended");
     let sent = session.tick(&StreamSource, false, Instant::now());
     assert!(sent.client_lost);
-    let [(to, datagram)] = sent.replies.as_slice() else {
-        panic!("one goodbye, got {:?}", sent.replies);
-    };
-    assert_eq!(*to, peer);
+    assert!(sent.replies.is_empty());
+    let (to, datagram) = sent.goodbye.expect("a goodbye");
+    assert_eq!(to, peer);
     assert!(matches!(
-        parse_control(datagram),
+        parse_control(&datagram),
         Ok((header, ControlMessage::Bye(ByeReason::HostShuttingDown))) if header.session_id != 0
     ));
     assert!(
         session
             .tick(&StreamSource, false, Instant::now())
-            .replies
-            .is_empty(),
+            .goodbye
+            .is_none(),
         "said once"
     );
 }

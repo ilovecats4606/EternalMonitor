@@ -242,12 +242,6 @@ pub async fn start_sender(
             _ = liveness_tick.tick() => {
                 links.update_stats();
                 if !shared.running.load(Ordering::SeqCst) {
-                    // An update may have just stopped the stream and be
-                    // closing the host: tell the iPad before leaving.
-                    let goodbye = shared.session.lock().take_goodbye();
-                    if let Some((peer, datagram)) = goodbye {
-                        let _ = links.send_to(&datagram, peer).await;
-                    }
                     info!("Transport loop stopping on running=false");
                     break;
                 }
@@ -485,8 +479,31 @@ pub async fn start_sender(
         }
     }
 
+    // Every way out of the loop comes here, before the links close: an update
+    // that just stopped the stream must still tell the iPad.
+    let goodbye = shared.session.lock().take_goodbye();
+    if let Some(goodbye) = goodbye {
+        say_goodbye(&links, goodbye).await;
+    }
     info!("NAL channel closed, transport sender shutting down");
     Ok(())
+}
+
+/// How long a goodbye over USB may hold up the exit while it is written.
+const GOODBYE_FLUSH: Duration = Duration::from_millis(250);
+
+/// Tells the iPad that an update stopped its stream, and returns once the
+/// message has left. Over USB it is queued for the link's writer, which
+/// dropping the link would abort, so wait for it to be written.
+async fn say_goodbye(links: &TransportLinks, (peer, datagram): (PeerId, Vec<u8>)) {
+    let sent = match links.send_to(&datagram, peer).await {
+        Ok(()) => links.flush(peer, GOODBYE_FLUSH).await,
+        Err(error) => Err(error),
+    };
+    match sent {
+        Ok(()) => info!(%peer, "Told the iPad the stream stopped for an update"),
+        Err(error) => warn!(%peer, %error, "Could not tell the iPad the stream stopped"),
+    }
 }
 
 type DeferredControl = VecDeque<LinkEvent>;
@@ -607,6 +624,10 @@ async fn execute_actions(
                 warn!(error = %error, "Failed to request pipeline restart for the virtual display");
             }
         }
+    }
+
+    if let Some(goodbye) = actions.goodbye {
+        say_goodbye(links, goodbye).await;
     }
 
     if actions.force_idr {

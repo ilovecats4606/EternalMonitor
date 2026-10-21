@@ -48,6 +48,9 @@ pub struct Actions {
     /// Negotiated and session-gated request; the transport checks frag_count
     /// against its stored datagrams before sending anything.
     pub retransmit: Option<(u32, u32, Vec<u16>)>,
+    /// An update stopped this client's stream: tell it, making sure the
+    /// message leaves (see [`Session::begin_update`]).
+    pub goodbye: Option<(PeerId, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -577,7 +580,7 @@ impl Session {
     ) -> Actions {
         let mut actions = Actions::default();
         if let Some(goodbye) = self.take_goodbye() {
-            actions.replies.push(goodbye);
+            actions.goodbye = Some(goodbye);
             actions.client_lost = self.active.is_none();
         }
         let Some(session) = self.active.as_ref() else {
@@ -1117,9 +1120,10 @@ mod tests {
         // The next tick tells the iPad, once.
         let ticked = session.tick(&TestConfig, false, now);
         assert!(ticked.client_lost);
-        assert_eq!(ticked.replies.len(), 1);
-        assert_eq!(ticked.replies[0].0, peer);
-        let (header, bye) = eternal_wire::v2::control::parse_control(&ticked.replies[0].1).unwrap();
+        assert!(ticked.replies.is_empty());
+        let (to, goodbye) = ticked.goodbye.unwrap();
+        assert_eq!(to, peer);
+        let (header, bye) = eternal_wire::v2::control::parse_control(&goodbye).unwrap();
         assert_eq!(header.session_id, id);
         assert_eq!(bye, ControlMessage::Bye(ByeReason::HostShuttingDown));
         assert!(session.take_goodbye().is_none());
