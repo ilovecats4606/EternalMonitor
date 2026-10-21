@@ -178,8 +178,11 @@ pub struct UploadGuard {
     _uploader: Option<Uploader>,
 }
 
-/// The upload thread. Dropping it waits at most [`SHUTDOWN_WAIT`]; if a request
-/// is still in flight, the queued lines are written to the outbox from here.
+/// The upload thread. Dropping it waits up to [`SHUTDOWN_WAIT`] for the thread
+/// to finish, which bounds the wait for a request in flight. If the thread has
+/// not finished by then, the queued lines are written to the outbox from here,
+/// after any final write the thread has begun; those disk writes are not
+/// bounded.
 struct Uploader {
     stop: std::sync::Arc<AtomicBool>,
     /// Wakes a thread waiting for lines, so an idle quit does not wait out
