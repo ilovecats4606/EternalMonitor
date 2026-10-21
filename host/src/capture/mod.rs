@@ -269,17 +269,28 @@ pub(crate) fn reconcile_virtual_display(
     shared: &SharedControl,
     generation: u64,
 ) -> Option<CaptureTarget> {
-    // A previous capture thread may still be leaving its attach poll when the
-    // supervisor starts the next generation. Only one may trigger driver tasks.
-    let _lifecycle = shared.vdd_lifecycle.lock();
-    if !capture_is_current(shared, generation) {
-        return None;
-    }
     let progress = || {
         if capture_is_current(shared, generation) {
             startup_heartbeat(shared, crate::clock::host_now_us() / 1000);
         }
     };
+    // A previous capture thread may still be leaving its attach poll or a
+    // driver task (up to 30 s) when the supervisor starts the next generation.
+    // Only one may trigger driver tasks. Waiting here without heartbeats read
+    // as a wedged capture loop after 3 s, and each forced restart queued
+    // another generation behind the same lock.
+    let _lifecycle = loop {
+        if let Some(guard) = shared.vdd_lifecycle.try_lock_for(Duration::from_millis(50)) {
+            break guard;
+        }
+        if !capture_is_current(shared, generation) {
+            return None;
+        }
+        progress();
+    };
+    if !capture_is_current(shared, generation) {
+        return None;
+    }
     match target {
         CaptureTarget::VirtualExtended => {
             // Defer enabling the VDD until an iPad actually connects. The transport restarts the
@@ -352,6 +363,9 @@ pub(crate) fn reconcile_virtual_display(
             }
             startup_heartbeat(shared, crate::clock::host_now_us() / 1000);
             if !crate::vdd::set_enabled(true, progress) {
+                if !capture_is_current(shared, generation) {
+                    return None;
+                }
                 warn!(
                     "Virtual display could not be enabled (installer task missing?) — \
                      capturing the primary display instead"
