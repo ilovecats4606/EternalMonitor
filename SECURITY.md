@@ -29,6 +29,16 @@ Knowing these limits helps you judge whether a finding is new.
 - The Windows host runs as the signed-in user. It turns the virtual display on and
   off through two scheduled tasks that the installer registers to run as SYSTEM.
 - The installer is not code-signed yet. Check its SHA-256 against the release page.
+- In-app updates (Windows) trust the network for nothing: the host fetches over
+  HTTPS from an allowlist of GitHub hosts, and the installer must match the
+  SHA-256 in both eternalmonitor.dev/latest.json and the GitHub release. Against
+  other software already running as your Windows user, the updater adds defense
+  in depth rather than a guarantee. Its helper loads DLLs only from System32 and
+  imports only Windows system libraries. It refuses an update folder reached
+  through a link and keeps the installer open so it can't be changed. Setup
+  starts suspended and runs only if it is the verified file. Microsoft does not
+  treat UAC as a security boundary, and such software could ask for elevation
+  itself, so same-user races beyond these are out of scope.
 
 Reports are welcome for anything that lets someone:
 
