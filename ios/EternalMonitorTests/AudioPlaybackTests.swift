@@ -211,6 +211,18 @@ final class AudioTimelineTests: XCTestCase {
         XCTAssertEqual(timeline.decoded, 2)
     }
 
+    func testSequenceRangeIsCoveredByDecodedAndLostPackets() throws {
+        // The simulator test matches iPad losses to host drops by this range.
+        let timeline = try AudioTimeline(pcm: AudioPCMBuffer())
+        try timeline.receive(packet(5)); try timeline.drain(nowUs: 0)
+        try timeline.receive(packet(7, arrival: 20_000)); try timeline.drain(nowUs: 40_000)
+        try timeline.receive(packet(30, timestamp: 600_000, arrival: 60_000)); try timeline.drain(nowUs: 90_000)
+        XCTAssertEqual(timeline.firstSeq, 5)
+        XCTAssertEqual(timeline.nextSeq, 31)
+        XCTAssertEqual(timeline.decoded, 3)
+        XCTAssertEqual(timeline.decoded + timeline.lost, 31 - 5)
+    }
+
     func testDtxGapAndCodecDiscontinuityKeepTheClockWithoutLoss() throws {
         let timeline = try AudioTimeline(pcm: AudioPCMBuffer())
         try timeline.receive(packet(1)); try timeline.drain(nowUs: 0)

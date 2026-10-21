@@ -65,7 +65,58 @@ pub struct AudioStats {
     pub stale_dropped: u64,
     pub oversized_dropped: u64,
     pub send_failed: u64,
+    /// Sequence numbers dropped after missing the send deadline (stale or
+    /// capture queue full), and those the host failed to send.
+    pub late_seqs: SeqRanges,
+    pub failed_seqs: SeqRanges,
     samples: VecDeque<(Instant, usize)>,
+}
+
+/// Inclusive sequence ranges for the stats log, such as `3-5,9`. At most
+/// 32 ranges are kept; a trailing `+` marks drops that did not fit.
+#[derive(Clone, Default)]
+pub struct SeqRanges {
+    ranges: Vec<(u32, u32)>,
+    truncated: bool,
+}
+
+impl SeqRanges {
+    pub fn record(&mut self, seq: u32) {
+        if let Some((_, end)) = self.ranges.last_mut() {
+            if end.wrapping_add(1) == seq {
+                *end = seq;
+                return;
+            }
+        }
+        if self.ranges.len() < 32 {
+            self.ranges.push((seq, seq));
+        } else {
+            self.truncated = true;
+        }
+    }
+}
+
+impl std::fmt::Display for SeqRanges {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.ranges.is_empty() && !self.truncated {
+            return f.write_str("none");
+        }
+        let mut parts: Vec<String> = self
+            .ranges
+            .iter()
+            .map(|&(start, end)| {
+                if start == end {
+                    start.to_string()
+                } else {
+                    format!("{start}-{end}")
+                }
+            })
+            .collect();
+        if self.truncated {
+            parts.push("+".into());
+        }
+        f.write_str(&parts.join(","))
+    }
 }
 
 impl Default for AudioStats {
@@ -83,6 +134,8 @@ impl Default for AudioStats {
             stale_dropped: 0,
             oversized_dropped: 0,
             send_failed: 0,
+            late_seqs: SeqRanges::default(),
+            failed_seqs: SeqRanges::default(),
             samples: VecDeque::with_capacity(64),
         }
     }
@@ -120,5 +173,30 @@ impl AudioStats {
         self.packets_per_sec = self.samples.len() as f64;
         self.kbps =
             self.samples.iter().map(|(_, bytes)| *bytes).sum::<usize>() as f64 * 8.0 / 1000.0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SeqRanges;
+
+    #[test]
+    fn dropped_sequences_log_as_compact_ranges() {
+        let mut ranges = SeqRanges::default();
+        assert_eq!(ranges.to_string(), "none");
+        for seq in [3, 4, 5, 9, 11, 12] {
+            ranges.record(seq);
+        }
+        assert_eq!(ranges.to_string(), "3-5,9,11-12");
+        for seq in (20..200).step_by(2) {
+            ranges.record(seq);
+        }
+        let text = ranges.to_string();
+        assert_eq!(
+            text.split(',').count(),
+            33,
+            "32 ranges and a truncation mark"
+        );
+        assert!(text.ends_with(",+"));
     }
 }

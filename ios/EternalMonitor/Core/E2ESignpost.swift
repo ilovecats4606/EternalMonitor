@@ -64,8 +64,10 @@ enum E2E {
         )
     }
 
-    static func audio(_ stats: AudioStats) {
+    static func audio(_ stats: AudioStats, firstSeq: UInt32?, nextSeq: UInt32?) {
         guard enabled else { return }
-        emit("E2E_AUDIO packets=\(stats.packets) decoded=\(stats.decoded) lost=\(stats.lost) buffer_ms=\(stats.bufferMs) rms=\(stats.rms) tone1k_db=\(stats.tone1kDB)")
+        // The sequence range lets the test match each loss to a host drop.
+        let range = firstSeq.flatMap { first in nextSeq.map { " first_seq=\(first) next_seq=\($0)" } } ?? ""
+        emit("E2E_AUDIO packets=\(stats.packets) decoded=\(stats.decoded) lost=\(stats.lost) buffer_ms=\(stats.bufferMs) rms=\(stats.rms) tone1k_db=\(stats.tone1kDB)\(range)")
     }
 }

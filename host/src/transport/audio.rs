@@ -39,6 +39,7 @@ impl AudioSender {
             let mut stats = PIPELINE_STATS.lock();
             stats.audio.dropped += 1;
             stats.audio.stale_dropped += 1;
+            stats.audio.late_seqs.record(queued.packet.seq);
             return None;
         }
         let stream = (queued.session_id, epoch);
@@ -57,6 +58,7 @@ impl AudioSender {
             let mut stats = PIPELINE_STATS.lock();
             stats.audio.dropped += 1;
             stats.audio.oversized_dropped += 1;
+            stats.audio.failed_seqs.record(queued.packet.seq);
             return None;
         }
         Some((peer, datagram))
@@ -70,6 +72,7 @@ impl AudioSender {
         epoch: u32,
     ) {
         let session_id = queued.session_id;
+        let seq = queued.packet.seq;
         let payload_size = queued.packet.opus.len();
         if let Some((peer, datagram)) =
             self.prepare(queued, shared, epoch, crate::clock::host_now_us())
@@ -83,6 +86,7 @@ impl AudioSender {
                 let mut stats = PIPELINE_STATS.lock();
                 stats.audio.dropped += 1;
                 stats.audio.send_failed += 1;
+                stats.audio.failed_seqs.record(seq);
             }
         }
     }

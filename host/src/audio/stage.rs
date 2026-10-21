@@ -190,11 +190,12 @@ impl CaptureSession {
                 packet,
             }) {
                 Ok(()) => self.mark_discontinuity = false,
-                Err(TrySendError::Full(_)) => {
+                Err(TrySendError::Full(rejected)) => {
                     self.mark_discontinuity = true;
                     let mut stats = PIPELINE_STATS.lock();
                     stats.audio.dropped += 1;
                     stats.audio.capture_queue_dropped += 1;
+                    stats.audio.late_seqs.record(rejected.packet.seq);
                 }
                 Err(TrySendError::Closed(_)) => return Ok(false),
             }
@@ -290,7 +291,8 @@ pub fn run_audio_stage(
                 packets_per_sec = stats.packets_per_sec, quiet_packets = stats.quiet_packets,
                 dropped = stats.dropped, capture_queue_dropped = stats.capture_queue_dropped,
                 stale_dropped = stats.stale_dropped, oversized_dropped = stats.oversized_dropped,
-                send_failed = stats.send_failed, "Audio stream stats");
+                send_failed = stats.send_failed, late_seqs = %stats.late_seqs,
+                failed_seqs = %stats.failed_seqs, "Audio stream stats");
         }
     }
     drop(active);

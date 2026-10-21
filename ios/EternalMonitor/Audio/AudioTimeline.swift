@@ -13,7 +13,10 @@ final class AudioTimeline {
     let pcm: AudioPCMBuffer
     private var pending: [UInt32: ReceivedAudio] = [:]
     private var epoch: UInt32?
-    private var nextSeq: UInt32?
+    /// The current timeline's first sequence number and the next one it
+    /// expects. Every number in between was decoded or counted as lost.
+    private(set) var firstSeq: UInt32?
+    private(set) var nextSeq: UInt32?
     private var lastCaptureUs: UInt64?
     private var gapSinceUs: UInt64?
     private(set) var packets: UInt64 = 0
@@ -55,6 +58,7 @@ final class AudioTimeline {
     private func restart(at header: AudioHeader) throws {
         pending.removeAll(keepingCapacity: true)
         epoch = header.streamEpoch
+        firstSeq = header.audioSeq
         nextSeq = header.audioSeq
         lastCaptureUs = nil
         gapSinceUs = nil
