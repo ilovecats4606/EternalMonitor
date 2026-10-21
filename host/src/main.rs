@@ -39,6 +39,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Session log file initialized"
     );
 
+    // One host per installation; a second launch shows the first one. Checked
+    // before the virtual display reset below, which would cut its stream.
+    let Some(_instance) = eternal_host::single_instance::acquire() else {
+        info!("EternalMonitor is already running; showing its window");
+        eternal_host::single_instance::show_existing();
+        return Ok(());
+    };
+
     // Never leave a virtual display attached across runs. If a previous run crashed or was
     // force-killed while streaming the virtual extended display, the VDD device is still enabled
     // and shows up as a phantom monitor. Disabling it unconditionally at startup guarantees the
