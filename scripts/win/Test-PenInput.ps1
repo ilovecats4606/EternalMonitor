@@ -42,6 +42,9 @@ public sealed class EMPenProbe : Form {
     [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint flags);
     readonly List<PenInfo> samples = new List<PenInfo>();
     readonly List<long> sampleTimes = new List<long>();
+    // When Windows stamped each pointer message, so a receiver that handles
+    // messages late cannot shorten the measured hold.
+    readonly List<long> pointerTimes = new List<long>();
     readonly Timer timer = new Timer();
     readonly Stopwatch clock = Stopwatch.StartNew();
     readonly string executable, directory;
@@ -108,7 +111,7 @@ public sealed class EMPenProbe : Form {
                 bool low = false, high = false, left = false, right = false, cancelFlagReported = false;
                 bool positions = true;
                 int downs = 0, ups = 0;
-                long heldFrom = 0, heldUntil = 0;
+                long heldFrom = 0, heldUntil = 0, handledFrom = 0, handledUntil = 0;
                 for (int i = 0; i < samples.Count; i++) {
                     var sample = samples[i];
                     low |= sample.pressure > 0 && sample.pressure <= 103;
@@ -117,11 +120,11 @@ public sealed class EMPenProbe : Form {
                     right |= sample.tiltX == 40 && sample.tiltY == 30;
                     if ((sample.pointer.flags & 0x10000) != 0) {
                         downs++;
-                        if (downs == 2) heldFrom = sampleTimes[i];
+                        if (downs == 2) { heldFrom = pointerTimes[i]; handledFrom = sampleTimes[i]; }
                     }
                     if ((sample.pointer.flags & 0x40000) != 0) {
                         ups++;
-                        if (downs == 2) heldUntil = sampleTimes[i];
+                        if (downs == 2) { heldUntil = pointerTimes[i]; handledUntil = sampleTimes[i]; }
                     }
                     cancelFlagReported |= (sample.pointer.flags & 0x48000) == 0x48000;
                     positions &= bounds.Contains(sample.pointer.pixel);
@@ -138,11 +141,13 @@ public sealed class EMPenProbe : Form {
                 bool releasedOnReset = downs == 2 && ups == 2 && samples.Count > 0
                     && (samples[samples.Count - 1].pointer.flags & 0x40004) == 0x40000
                     && samples[samples.Count - 1].pressure == 0;
-                bool held = heldFrom > 0 && heldUntil - heldFrom >= 1450;
+                long heldMs = downs >= 2 && heldUntil > 0 ? heldUntil - heldFrom : 0;
+                bool held = heldMs >= 1450;
                 Passed = child.ExitCode == 0 && samples.Count >= 10 && low && high && left && right && releasedOnReset && held && positions
                     && !output.Contains("rejected") && !output.Contains("unavailable");
                 File.WriteAllText(Path.Combine(directory, "result.json"), json.Serialize(new {
                     passed = Passed, count = samples.Count, low, high, left, right, downs, ups, releasedOnReset, held, cancelFlagReported, positions,
+                    heldMs, heldHandledMs = handledUntil - handledFrom,
                     x = bounds.X, y = bounds.Y, width = bounds.Width, height = bounds.Height
                 }));
                 Close();
@@ -155,10 +160,17 @@ public sealed class EMPenProbe : Form {
         if (message.Msg >= 0x245 && message.Msg <= 0x247) {
             PenInfo info;
             if (GetPointerPenInfo((uint)(message.WParam.ToInt64() & 0xffff), out info)) {
+                // PerformanceCount is in QueryPerformanceCounter ticks, the
+                // Stopwatch's clock; dwTime is in milliseconds.
+                long pointerMs = info.pointer.performance != 0
+                    ? (long)(info.pointer.performance * 1000.0 / Stopwatch.Frequency)
+                    : info.pointer.time;
                 samples.Add(info);
                 sampleTimes.Add(clock.ElapsedMilliseconds);
+                pointerTimes.Add(pointerMs);
                 log.WriteLine(json.Serialize(new { message = message.Msg, type = info.pointer.type,
-                    elapsedMs = clock.ElapsedMilliseconds,
+                    elapsedMs = clock.ElapsedMilliseconds, pointerMs, dwTime = info.pointer.time,
+                    performance = info.pointer.performance,
                     flags = info.pointer.flags, pressure = info.pressure, tiltX = info.tiltX, tiltY = info.tiltY,
                     x = info.pointer.pixel.X, y = info.pointer.pixel.Y }));
                 message.Result = IntPtr.Zero;
