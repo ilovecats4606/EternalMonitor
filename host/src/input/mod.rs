@@ -372,20 +372,35 @@ pub fn resolve(
 #[cfg(not(windows))]
 pub mod recorder {
     use super::Injection;
-    use std::sync::Mutex;
 
-    static RECORDED: Mutex<Vec<Injection>> = Mutex::new(Vec::new());
+    /// The end-to-end tests record on the transport's thread and read on
+    /// their own. Unit tests run in parallel, so each keeps its own record.
+    fn recorded<R>(f: impl FnOnce(&mut Vec<Injection>) -> R) -> R {
+        #[cfg(not(test))]
+        {
+            static RECORDED: std::sync::Mutex<Vec<Injection>> = std::sync::Mutex::new(Vec::new());
+            f(&mut RECORDED.lock().unwrap())
+        }
+        #[cfg(test)]
+        {
+            thread_local! {
+                static RECORDED: std::cell::RefCell<Vec<Injection>> =
+                    const { std::cell::RefCell::new(Vec::new()) };
+            }
+            RECORDED.with_borrow_mut(f)
+        }
+    }
 
     pub fn record(injections: &[Injection]) {
-        RECORDED.lock().unwrap().extend_from_slice(injections);
+        recorded(|recorded| recorded.extend_from_slice(injections));
     }
 
     pub fn take() -> Vec<Injection> {
-        std::mem::take(&mut *RECORDED.lock().unwrap())
+        recorded(std::mem::take)
     }
 
     pub fn peek() -> Vec<Injection> {
-        RECORDED.lock().unwrap().clone()
+        recorded(|recorded| recorded.clone())
     }
 }
 
