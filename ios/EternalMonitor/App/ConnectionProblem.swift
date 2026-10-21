@@ -111,6 +111,18 @@ enum ConnectionProblem: Equatable {
         return datagramsReceived == 0 ? .noReply(usb: isUSB) : .noPicture
     }
 
+    /// The banner once automatic reconnecting gives up. A last attempt that
+    /// failed for a specific reason keeps that advice; otherwise the PC just
+    /// never answered.
+    static func afterReconnecting(lastAttempt: ConnectionProblem?) -> ConnectionProblem {
+        switch lastAttempt {
+        case .localNetworkBlocked, .noNetwork, .badAddress, .usbFailed, .noPicture:
+            return lastAttempt ?? .reconnectFailed
+        default:
+            return .reconnectFailed
+        }
+    }
+
     /// What a link failure means for the user. The raw error stays in the
     /// support log; nothing here shows it.
     static func linkFailure(_ error: LinkError, isUSB: Bool, host: String) -> ConnectionProblem {

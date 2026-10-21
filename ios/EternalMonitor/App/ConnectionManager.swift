@@ -75,6 +75,9 @@ final class ConnectionManager: ObservableObject {
     /// A connection problem in plain words, with its next action. Shown in
     /// place of `connectionError` when set.
     @Published var problem: ConnectionProblem?
+    /// The link failure classified for the current attempt. A link's close
+    /// callback that follows its own failure reports this, not a removed cable.
+    private var linkFailure: ConnectionProblem?
     @Published var pairingPrompt: PairingSheetModel?
     private var awaitingPairing = false
     private var explicitPairingToken: Data?
@@ -269,6 +272,7 @@ final class ConnectionManager: ObservableObject {
         state = .connecting
         connectionError = nil
         problem = nil
+        linkFailure = nil
         signalLost = false
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
@@ -573,9 +577,19 @@ final class ConnectionManager: ObservableObject {
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 self.record(.error, isUSB ? "usb" : "udp", "state=\(self.state) \(error.message)")
-                guard self.state == .connecting else { return }
-                self.problem = .linkFailure(error, isUSB: isUSB, host: normalizedHost)
-                if !isUSB { self.disconnect() }
+                let failure = ConnectionProblem.linkFailure(error, isUSB: isUSB, host: normalizedHost)
+                // A live stream rides out transient errors; a USB link that
+                // failed for good closes next, and that close reports this.
+                guard self.state == .connecting else {
+                    if isUSB { self.linkFailure = failure }
+                    return
+                }
+                // End the attempt once. That retires connectionID, so the
+                // close callback FramedLink sends after a failure is ignored
+                // instead of relabelling it as an unplugged cable.
+                if isUSB { self.usbStatus = "USB: waiting for a cable" }
+                self.disconnect()
+                self.problem = failure
             }
         }
 
@@ -583,7 +597,9 @@ final class ConnectionManager: ObservableObject {
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 if isUSB { self.usbStatus = "USB: waiting for a cable" }
-                self.beginReconnect(.cableUnplugged)
+                // An ordinary close is the cable coming out; a close after a
+                // classified failure keeps that failure's advice.
+                self.beginReconnect(.cableUnplugged, failure: self.linkFailure)
             }
         }
 
@@ -717,7 +733,7 @@ final class ConnectionManager: ObservableObject {
         }
     }
 
-    private func beginReconnect(_ reason: ConnectionProblem.LostReason) {
+    private func beginReconnect(_ reason: ConnectionProblem.LostReason, failure: ConnectionProblem? = nil) {
         let target = lastTarget
         let auto = UserDefaults.standard.flag(forKey: "autoReconnect")
         // Support logs keep the original wording so reports stay comparable.
@@ -730,7 +746,7 @@ final class ConnectionManager: ObservableObject {
         record(.warning, "ctrl", "Connection lost (\(logged))")
         disconnect()
         guard auto, let target else {
-            problem = .lost(reason)
+            problem = failure ?? .lost(reason)
             return
         }
         startReconnectCycle(to: target)
@@ -758,7 +774,7 @@ final class ConnectionManager: ObservableObject {
             }
             guard let self, !Task.isCancelled else { return }
             self.reconnectAttempt = 0
-            self.problem = .reconnectFailed
+            self.problem = ConnectionProblem.afterReconnecting(lastAttempt: self.problem)
         }
     }
 

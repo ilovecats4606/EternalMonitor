@@ -45,6 +45,17 @@ final class ConnectionProblemTests: XCTestCase {
         XCTAssertEqual(usb.actions, [.retry])
     }
 
+    func testGivingUpOnReconnectingKeepsASpecificLastFailure() {
+        // A classified failure in the last attempt is more useful than
+        // "Couldn't reconnect"; a PC that just never answered is not.
+        for specific: ConnectionProblem in [.localNetworkBlocked, .noNetwork, .badAddress("pc"), .usbFailed, .noPicture] {
+            XCTAssertEqual(ConnectionProblem.afterReconnecting(lastAttempt: specific), specific)
+        }
+        for generic: ConnectionProblem? in [nil, .noReply(usb: false), .reconnecting(attempt: 6, of: 6), .couldNotConnect] {
+            XCTAssertEqual(ConnectionProblem.afterReconnecting(lastAttempt: generic), .reconnectFailed)
+        }
+    }
+
     func testEveryProblemSaysWhatToDoWithoutTransportJargon() {
         let all: [ConnectionProblem] = [
             .noReply(usb: false), .noReply(usb: true), .noPicture, .receiverNotReady, .badAddress("pc"),
