@@ -3,7 +3,7 @@
 //! crashes releases it.
 
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,13 @@ pub(crate) fn lock(path: &Path, wait: Duration, mut waiting: impl FnMut()) -> io
 }
 
 impl Locked {
+    pub(crate) fn read(&mut self) -> io::Result<String> {
+        let mut text = String::new();
+        self.0.seek(SeekFrom::Start(0))?;
+        self.0.read_to_string(&mut text)?;
+        Ok(text)
+    }
+
     pub(crate) fn write(&mut self, text: &str) -> io::Result<()> {
         self.0.set_len(0)?;
         self.0.seek(SeekFrom::Start(0))?;
@@ -75,8 +82,9 @@ mod tests {
         assert_eq!(second.err().unwrap().kind(), io::ErrorKind::TimedOut);
         assert!(waited > 0);
         drop(first);
-        drop(lock(&path, Duration::ZERO, || {}).unwrap());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "owner");
+        let mut second = lock(&path, Duration::ZERO, || {}).unwrap();
+        assert_eq!(second.read().unwrap(), "owner");
+        drop(second);
         std::fs::remove_file(path).unwrap();
     }
 }

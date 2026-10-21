@@ -290,16 +290,17 @@ fn queue_into(directory: &Path, message: &str) -> std::io::Result<()> {
 }
 /// Queue an error event for another launch of this installation, from the
 /// failure reporter process. `index` keeps several such events distinct.
-pub fn queue_for_launch(launch_id: &str, index: u64, message: &str) {
+/// Ok when the event is saved or uploads are off.
+pub fn queue_for_launch(launch_id: &str, index: u64, message: &str) -> std::io::Result<()> {
     let Some(base) = crate::settings::app_data_dir() else {
-        return;
+        return Ok(());
     };
     if base.join("diagnostics-upload-disabled").exists()
         || !Config::load().is_some_and(|c| c.enabled)
     {
-        return;
+        return Ok(());
     }
-    let _ = queue_foreign(&base.join("diagnostics-outbox"), launch_id, index, message);
+    queue_foreign(&base.join("diagnostics-outbox"), launch_id, index, message)
 }
 fn queue_foreign(
     directory: &Path,

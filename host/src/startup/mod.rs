@@ -5,6 +5,7 @@
 //! reporter process shows the message, so a dialog never holds up cleanup or
 //! exit. A native crash only writes a fixed record (see `record`), which the
 //! reporter or the next launch turns into the same log line, event and message.
+//! A host that ends past the exception filter is reported by its exit code.
 
 pub(crate) mod display;
 pub(crate) mod lock;
@@ -27,11 +28,12 @@ static SHOWN_AT: OnceLock<Instant> = OnceLock::new();
 
 /// Test hook for the failure paths. Set `ETERNAL_SIMULATE_STARTUP_FAILURE` to
 /// `error`, `panic`, `hang` (30 s) or, on Windows, `crash`, `crash-thread`
-/// (on another thread) or `crash-heap` (while another thread holds the heap
-/// lock) to fail while the window renderer starts, `panic-later` to panic
-/// 15 s after the window appears, or `surface-error` to report a surface
-/// error on every frame of the first two seconds. A `-quiet` suffix skips the
-/// message box.
+/// (on another thread), `crash-heap` (while another thread holds the heap
+/// lock) or `fail-fast` (past the exception filter) to fail while the window
+/// renderer starts; `early-error` to fail right after the failure reporter
+/// starts; `panic-later` or, on Windows, `fail-fast-later` to fail 15 s after
+/// the window works; or `surface-error` to report a surface error on every
+/// frame of the first two seconds. A `-quiet` suffix skips the message box.
 pub const SIMULATE_ENV: &str = "ETERNAL_SIMULATE_STARTUP_FAILURE";
 
 /// Called once the window works, so later failures read as a stop, not a
@@ -39,6 +41,7 @@ pub const SIMULATE_ENV: &str = "ETERNAL_SIMULATE_STARTUP_FAILURE";
 pub fn mark_window_shown() {
     WINDOW_SHOWN.store(true, Ordering::Relaxed);
     let _ = SHOWN_AT.set(Instant::now());
+    reporter::mark(reporter::SHOWN);
 }
 
 pub(crate) fn window_shown() -> bool {
@@ -65,6 +68,10 @@ pub fn install_failure_hooks() {
     }));
     #[cfg(windows)]
     prepare_crash_reporting();
+    if simulated() == "early-error" {
+        report(&format!("Simulated early failure from {SIMULATE_ENV}"));
+        std::process::exit(1);
+    }
 }
 
 /// Open this launch's crash record, install the exception filter and start
@@ -86,7 +93,7 @@ fn prepare_crash_reporting() {
         .create(true)
         .truncate(true)
         .share_mode(0x7)
-        .open(reporter::crash_file(&directory, owner));
+        .open(reporter::owner_file(&directory, owner, reporter::RECORD));
     match file {
         Ok(file) => record::filter::install(file),
         Err(error) => tracing::warn!(%error, "Could not prepare the crash record"),
@@ -109,20 +116,23 @@ fn after_main_panic(
     }
 }
 
-/// A normal quit leaves no crash record behind.
+/// A normal quit leaves no crash record behind, and tells the reporter.
 pub fn finish() {
+    reporter::mark(reporter::DONE);
     if let Some(directory) = crash_dir() {
         let owner = ProcessId::current();
-        let _ = fs::remove_file(reporter::crash_file(&directory, owner));
+        let _ = fs::remove_file(reporter::owner_file(&directory, owner, reporter::RECORD));
     }
 }
 
-/// Report crashes of earlier launches that no reporter handled.
+/// Report crashes of earlier launches that no reporter saved, and show
+/// messages that no reporter showed.
 pub fn take_previous_crashes() {
     let Some(directory) = crash_dir() else {
         return;
     };
-    for record in collect_previous(&directory, ProcessId::current()) {
+    let previous = collect_previous(&directory, ProcessId::current());
+    for record in previous.records {
         let summary = summary(record.window_shown);
         let detail = native_detail(record, None);
         tracing::error!("{summary} last time: {detail}");
@@ -132,34 +142,53 @@ pub fn take_previous_crashes() {
             &message_body(&detail, &log_path.display().to_string(), true),
         );
     }
+    for (title, body) in previous.messages {
+        tracing::warn!("Showing a message from the last launch: {title}");
+        show(&format!("{title} last time"), &body);
+    }
 }
 
-/// Unacknowledged records of exited processes. Their files are removed; files
-/// of running instances, including this one, are left alone.
-fn collect_previous(directory: &Path, current: ProcessId) -> Vec<record::Record> {
-    let mut records = Vec::new();
+#[derive(Debug, Default, PartialEq)]
+struct Previous {
+    records: Vec<record::Record>,
+    messages: Vec<(String, String)>,
+}
+
+/// Crash records and message requests that earlier launches left. A record
+/// is only removed once its report is saved, so any record here still needs
+/// one. Files of exited launches are removed unless their reporter is still
+/// handling them; files of running instances, including this one, are left
+/// alone.
+fn collect_previous(directory: &Path, current: ProcessId) -> Previous {
+    let mut previous = Previous::default();
     let Ok(entries) = fs::read_dir(directory) else {
-        return records;
+        return previous;
     };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    paths.sort();
+    for path in paths {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let Some(owner) = ProcessId::from_name(&name) else {
             continue;
         };
-        if owner == current || owner.is_running() {
+        if owner == current || owner.is_running() || reporter::still_reporting(directory, owner) {
             continue;
         }
-        if name.ends_with(".rec") {
-            if let Some((record, false)) = fs::read(entry.path())
-                .ok()
-                .and_then(|bytes| record::parse(&bytes))
-            {
-                records.push(record);
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some(reporter::RECORD) => {
+                if let Some((record, _)) = fs::read(&path).ok().and_then(|b| record::parse(&b)) {
+                    previous.records.push(record);
+                }
             }
+            Some(reporter::REQUEST) => previous.messages.extend(reporter::take_request(&path)),
+            _ => {}
         }
-        let _ = fs::remove_file(entry.path());
+        let _ = fs::remove_file(&path);
     }
-    records
+    previous
 }
 
 /// Report an error that is about to end startup, and pass it on unchanged.
@@ -189,6 +218,7 @@ fn save(detail: &str) -> Option<(&'static str, String)> {
     }
     crate::telemetry::queue_now(&format!("{summary}: {detail}"));
     eprintln!("{summary}: {detail}");
+    reporter::mark(reporter::DONE);
     Some((
         summary,
         message_body(detail, &log_path.display().to_string(), false),
@@ -218,15 +248,22 @@ fn summary(window_shown: bool) -> &'static str {
 }
 
 fn log_line(summary: &str, detail: &str) -> String {
+    timestamped("ERROR", &format!("{summary}: {detail}"))
+}
+
+/// A line the reporter adds to the session log about its own work.
+#[cfg(windows)]
+fn info_line(text: &str) -> String {
+    timestamped(" INFO", text)
+}
+
+fn timestamped(level: &str, text: &str) -> String {
     use tracing_subscriber::fmt::time::FormatTime;
     let mut time = String::new();
     let _ = tracing_subscriber::fmt::time::SystemTime
         .format_time(&mut tracing_subscriber::fmt::format::Writer::new(&mut time));
     // The same shape as the tracing lines, so upload levels and searches match.
-    format!(
-        "{time} ERROR {summary}: {}",
-        detail.replace(['\r', '\n'], " ")
-    )
+    format!("{time} {level} {}", text.replace(['\r', '\n'], " "))
 }
 
 fn message_body(detail: &str, log_path: &str, previous_launch: bool) -> String {
@@ -260,6 +297,12 @@ fn panic_detail(info: &std::panic::PanicHookInfo<'_>) -> String {
 }
 
 fn native_detail(record: record::Record, module: Option<(&str, u64)>) -> String {
+    // No thread: the reporter saw the process end without a crash record.
+    match (record.thread, record.code) {
+        (0, 0) => return "The process ended without a crash record".to_string(),
+        (0, code) => return format!("Exit code 0x{code:08X} without a crash record"),
+        _ => {}
+    }
     let place = match module {
         Some((name, offset)) => format!("in {name}+0x{offset:X}"),
         None => format!("at 0x{:016X}", record.address),
@@ -295,6 +338,8 @@ pub(crate) fn simulate_renderer_failure() -> Result<(), String> {
             Ok(())
         }
         #[cfg(windows)]
+        "fail-fast" => std::process::abort(),
+        #[cfg(windows)]
         "crash-heap" => {
             // As after a fault inside the allocator: any allocation now blocks.
             static LOCKED: AtomicBool = AtomicBool::new(false);
@@ -322,12 +367,16 @@ pub(crate) fn simulate_renderer_failure() -> Result<(), String> {
 
 /// Fail on purpose while the window is up, when [`SIMULATE_ENV`] asks.
 pub(crate) fn simulate_window_failure() {
-    if simulated() == "panic-later"
-        && SHOWN_AT
-            .get()
-            .is_some_and(|shown| shown.elapsed() > Duration::from_secs(15))
-    {
-        panic!("Simulated panic after the window appeared, from {SIMULATE_ENV}");
+    let later = SHOWN_AT
+        .get()
+        .is_some_and(|shown| shown.elapsed() > Duration::from_secs(15));
+    match simulated().as_str() {
+        "panic-later" if later => {
+            panic!("Simulated panic after the window appeared, from {SIMULATE_ENV}")
+        }
+        #[cfg(windows)]
+        "fail-fast-later" if later => std::process::abort(),
+        _ => {}
     }
 }
 
@@ -420,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn the_next_launch_takes_only_unhandled_records_of_exited_processes() {
+    fn the_next_launch_takes_what_no_reporter_handled() {
         let directory = std::env::temp_dir().join(format!(
             "eternal-crash-{}-{}",
             std::process::id(),
@@ -455,24 +504,51 @@ mod tests {
         let write =
             |name: String, content: &[u8]| fs::write(directory.join(name), content).unwrap();
         write(format!("{exited}.rec"), &bytes);
-        write(format!("{exited}.box"), b"title\nbody");
-        let handled = ProcessId { start: 8, ..exited };
+        // A message the host asked for just before it ended, never shown.
         write(
-            format!("{handled}.rec"),
+            format!("{exited}.box"),
+            b"EternalMonitor could not start\nbody",
+        );
+        // Acknowledged, so the process was released, but the reporter could
+        // not save the report.
+        let unsaved = ProcessId { start: 8, ..exited };
+        write(
+            format!("{unsaved}.rec"),
             &[&bytes[..], record::ACK].concat(),
         );
         let killed = ProcessId { start: 9, ..exited };
         write(format!("{killed}.rec"), b"");
+        write(format!("{killed}.done"), b"");
+        // A reporter, this test process standing in, still handles these.
+        let reporting = ProcessId {
+            start: 10,
+            ..exited
+        };
+        write(format!("{reporting}.rec"), &bytes);
+        write(format!("{reporting}.ready"), me.to_string().as_bytes());
         write(format!("{me}.rec"), &bytes);
 
-        assert_eq!(collect_previous(&directory, me), [crashed]);
-        let left: Vec<String> = fs::read_dir(&directory)
+        assert_eq!(
+            collect_previous(&directory, me),
+            Previous {
+                records: vec![crashed, crashed],
+                messages: vec![("EternalMonitor could not start".into(), "body".into())],
+            }
+        );
+        let mut left: Vec<String> = fs::read_dir(&directory)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(left, [format!("{me}.rec")]);
+        left.sort();
+        let mut expected = [
+            format!("{reporting}.ready"),
+            format!("{reporting}.rec"),
+            format!("{me}.rec"),
+        ];
+        expected.sort();
+        assert_eq!(left, expected);
         // Taken once.
-        assert!(collect_previous(&directory, me).is_empty());
+        assert_eq!(collect_previous(&directory, me), Previous::default());
         fs::remove_dir_all(directory).unwrap();
     }
 

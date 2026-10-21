@@ -2,26 +2,44 @@
 //! `--failure-reporter`, that outlives the main process. A native crash leaves
 //! only a fixed record behind; the reporter resolves the faulting module while
 //! the crashed process waits, writes the log line and the upload event, turns
-//! the virtual display off and shows the message. Panics and startup errors
-//! hand it just the message, so a dialog never holds up cleanup or exit.
+//! the virtual display off and shows the message. A host that ends past the
+//! exception filter, as fail-fast exceptions and some heap corruption do, is
+//! reported by its exit code. Panics and startup errors hand it just the
+//! message, so a dialog never holds up cleanup or exit.
+//!
+//! Each launch's files in the crash folder are named by the host's process:
+//! `.rec` the crash record, `.box` a message to show, `.ready` the reporter's
+//! own id once it watches the host, `.shown` once the window works and
+//! `.done` once the host quit normally or reported its failure itself.
 
 use super::process::ProcessId;
+#[cfg(windows)]
+use super::record;
+#[cfg(any(windows, test))]
+use super::record::Record;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 pub const REPORTER_ARG: &str = "--failure-reporter";
+pub(super) const RECORD: &str = "rec";
+pub(super) const REQUEST: &str = "box";
+const READY: &str = "ready";
+pub(super) const SHOWN: &str = "shown";
+pub(super) const DONE: &str = "done";
+/// How long a host that fails at once waits for its reporter to start.
+const READY_WAIT: Duration = Duration::from_secs(3);
+/// How long the message waits for the virtual display to turn off.
+#[cfg(windows)]
+const CLEANUP_WAIT: Duration = Duration::from_secs(5);
 
 static REPORTER: OnceLock<ProcessId> = OnceLock::new();
-static REQUESTS: OnceLock<PathBuf> = OnceLock::new();
+/// The crash folder and this host, once a reporter was started for it.
+static FILES: OnceLock<(PathBuf, ProcessId)> = OnceLock::new();
 
-pub(super) fn crash_file(directory: &Path, owner: ProcessId) -> PathBuf {
-    directory.join(format!("{owner}.rec"))
-}
-
-#[cfg(any(windows, test))]
-fn request_file(directory: &Path, owner: ProcessId) -> PathBuf {
-    directory.join(format!("{owner}.box"))
+pub(super) fn owner_file(directory: &Path, owner: ProcessId, kind: &str) -> PathBuf {
+    directory.join(format!("{owner}.{kind}"))
 }
 
 /// Start the reporter for this process. Messages fall back to an in-process
@@ -29,7 +47,6 @@ fn request_file(directory: &Path, owner: ProcessId) -> PathBuf {
 #[cfg(windows)]
 pub(super) fn start(directory: &Path, owner: ProcessId, launch_id: &str) {
     use std::os::windows::process::CommandExt;
-    let _ = REQUESTS.set(request_file(directory, owner));
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
@@ -52,20 +69,54 @@ pub(super) fn start(directory: &Path, owner: ProcessId, launch_id: &str) {
                 start: super::process::start_time(child.id()).unwrap_or(0),
             };
             let _ = REPORTER.set(id);
+            let _ = FILES.set((directory.to_path_buf(), owner));
             tracing::info!(pid = id.pid, "Failure reporter started");
         }
         Err(error) => tracing::warn!(%error, "Could not start the failure reporter"),
     }
 }
 
-/// Ask the reporter to show a message. False when there is no reporter to ask.
-pub(super) fn request_message(title: &str, body: &str) -> bool {
-    match (REPORTER.get(), REQUESTS.get()) {
-        (Some(reporter), Some(path)) if reporter.is_running() => {
-            write_request(path, title, body).is_ok()
-        }
-        _ => false,
+/// Tell the reporter how this launch is going (see the module notes).
+pub(super) fn mark(kind: &str) {
+    if let Some((directory, owner)) = FILES.get() {
+        let _ = fs::write(owner_file(directory, *owner, kind), b"");
     }
+}
+
+/// Ask the reporter to show a message. False when no reporter is watching
+/// this process, so the caller shows it itself.
+pub(super) fn request_message(title: &str, body: &str) -> bool {
+    let (Some(reporter), Some((directory, owner))) = (REPORTER.get(), FILES.get()) else {
+        return false;
+    };
+    wait_until_ready(&owner_file(directory, *owner, READY), *reporter, READY_WAIT)
+        && write_request(&owner_file(directory, *owner, REQUEST), title, body).is_ok()
+}
+
+/// A startup error can end the host before its reporter watches it; a
+/// request written then would never be read.
+fn wait_until_ready(ready: &Path, reporter: ProcessId, wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        if !reporter.is_running() {
+            return false;
+        }
+        if ready.exists() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Whether a reporter is still handling the files of `owner`.
+pub(super) fn still_reporting(directory: &Path, owner: ProcessId) -> bool {
+    fs::read_to_string(owner_file(directory, owner, READY))
+        .ok()
+        .and_then(|text| ProcessId::from_name(text.trim()))
+        .is_some_and(ProcessId::is_running)
 }
 
 fn write_request(path: &Path, title: &str, body: &str) -> std::io::Result<()> {
@@ -74,12 +125,68 @@ fn write_request(path: &Path, title: &str, body: &str) -> std::io::Result<()> {
     fs::rename(temp, path)
 }
 
-#[cfg(any(windows, test))]
-fn take_request(path: &Path) -> Option<(String, String)> {
+pub(super) fn take_request(path: &Path) -> Option<(String, String)> {
     let text = fs::read_to_string(path).ok()?;
     let _ = fs::remove_file(path);
     let (title, body) = text.split_once('\n')?;
     Some((title.to_string(), body.to_string()))
+}
+
+/// What to report once the host has ended, when the reporter has not already
+/// reported its crash: a crash record it left, or else its exit code. Nothing
+/// after a normal quit, a failure the host reported itself, or while Windows
+/// ends the session and stops every program.
+#[cfg(any(windows, test))]
+fn after_exit(
+    record: Option<Record>,
+    done: bool,
+    exit_code: Option<u32>,
+    window_shown: bool,
+    session_ending: bool,
+) -> Option<Record> {
+    if record.is_some() {
+        return record;
+    }
+    if done || exit_code == Some(0) || session_ending {
+        return None;
+    }
+    // Thread 0 marks an exit code; code 0 one that could not be read.
+    Some(Record {
+        code: exit_code.unwrap_or(0),
+        address: 0,
+        thread: 0,
+        window_shown,
+    })
+}
+
+/// Write the log line and the upload event. Both must succeed before the
+/// crash record is removed; otherwise the next launch reports it again.
+#[cfg(windows)]
+fn save(summary: &str, detail: &str, launch_id: &str) -> std::io::Result<()> {
+    let logged = crate::logging::append_now(&super::log_line(summary, detail));
+    let queued = if launch_id == "-" {
+        Ok(())
+    } else {
+        crate::telemetry::queue_for_launch(launch_id, 1, &format!("{summary}: {detail}"))
+    };
+    logged.and(queued)
+}
+
+/// The launch is handled. Its crash record stays when the report could not be
+/// saved, so the next launch saves and shows it.
+#[cfg(any(windows, test))]
+fn remove_files(directory: &Path, owner: ProcessId, saved: bool) {
+    for kind in [REQUEST, "tmp", DONE, SHOWN, READY] {
+        let _ = fs::remove_file(owner_file(directory, owner, kind));
+    }
+    if saved {
+        let _ = fs::remove_file(owner_file(directory, owner, RECORD));
+    }
+}
+
+#[cfg(windows)]
+fn read_record(path: &Path) -> Option<(Record, bool)> {
+    record::parse(&fs::read(path).ok()?)
 }
 
 /// Run as the reporter when the command line asks for it; never returns then.
@@ -97,11 +204,13 @@ fn run(_args: &[String]) -> i32 {
 
 #[cfg(windows)]
 fn run(args: &[String]) -> i32 {
+    use std::io::Write;
     use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
     use windows::Win32::System::Threading::{
-        OpenProcess, WaitForSingleObject, PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE,
-        PROCESS_VM_READ,
+        GetExitCodeProcess, OpenProcess, WaitForSingleObject, PROCESS_QUERY_INFORMATION,
+        PROCESS_SYNCHRONIZE, PROCESS_VM_READ,
     };
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SHUTTINGDOWN};
     let [pid, start, directory, launch_id] = args else {
         return 2;
     };
@@ -110,6 +219,7 @@ fn run(args: &[String]) -> i32 {
     };
     let owner = ProcessId { pid, start };
     let directory = PathBuf::from(directory);
+    let file = |kind| owner_file(&directory, owner, kind);
     let process = unsafe {
         OpenProcess(
             PROCESS_SYNCHRONIZE | PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
@@ -117,66 +227,122 @@ fn run(args: &[String]) -> i32 {
             owner.pid,
         )
     };
-    let Ok(process) = process else {
-        return 1;
+    // Opened after the host ended, the id could belong to another process.
+    let process = match process {
+        Ok(handle) if owner.is_running() => Some(handle),
+        Ok(handle) => {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            None
+        }
+        Err(_) => None,
     };
-    if !owner.is_running() {
-        return 1;
-    }
-    let crash = crash_file(&directory, owner);
-    let requests = request_file(&directory, owner);
-    loop {
-        let exited = unsafe { WaitForSingleObject(process, 100) } == WAIT_OBJECT_0;
-        if let Some((title, body)) = take_request(&requests) {
-            show(&title, &body);
-        }
-        if let Some((record, false)) = fs::read(&crash).ok().and_then(|b| super::record::parse(&b))
-        {
-            report_crash(process, record, &crash, launch_id);
-            break;
-        }
-        if exited {
-            break;
-        }
-    }
-    unsafe {
-        let _ = CloseHandle(process);
-    }
-    0
-}
+    let _ = fs::write(file(READY), ProcessId::current().to_string());
 
-#[cfg(windows)]
-fn report_crash(
-    process: windows::Win32::Foundation::HANDLE,
-    record: super::record::Record,
-    crash: &Path,
-    launch_id: &str,
-) {
-    use std::io::Write;
-    let module = module_at(process, record.address);
-    let detail = super::native_detail(record, module.as_ref().map(|(n, o)| (n.as_str(), *o)));
-    let summary = super::summary(record.window_shown);
-    let _ = crate::logging::append_now(&super::log_line(summary, &detail));
-    if launch_id != "-" {
-        crate::telemetry::queue_for_launch(launch_id, 1, &format!("{summary}: {detail}"));
+    let mut report = None;
+    if let Some(process) = process {
+        loop {
+            let exited = unsafe { WaitForSingleObject(process, 100) } == WAIT_OBJECT_0;
+            if let Some((title, body)) = take_request(&file(REQUEST)) {
+                show(&title, &body);
+            }
+            if let Some((record, false)) = read_record(&file(RECORD)) {
+                let module = module_at(process, record.address);
+                let detail =
+                    super::native_detail(record, module.as_ref().map(|(n, o)| (n.as_str(), *o)));
+                let summary = super::summary(record.window_shown);
+                let saved = save(summary, &detail, launch_id);
+                // Release the crashed process whether or not the saves
+                // worked; the record stays until they do.
+                if let Ok(mut crash) = fs::OpenOptions::new().append(true).open(file(RECORD)) {
+                    let _ = crash.write_all(record::ACK);
+                }
+                // It ends once its filter sees the acknowledgement; a process
+                // hung by its own fault does not hold the cleanup for long.
+                unsafe {
+                    WaitForSingleObject(process, 10_000);
+                }
+                report = Some((summary, detail, saved));
+                break;
+            }
+            if exited {
+                break;
+            }
+        }
     }
-    if let Ok(mut file) = fs::OpenOptions::new().append(true).open(crash) {
-        let _ = file.write_all(super::record::ACK);
+    // Also when the host ended before this process could watch it.
+    if let Some((title, body)) = take_request(&file(REQUEST)) {
+        show(&title, &body);
     }
-    // The crashed process ends once its filter sees the acknowledgement; a
-    // process hung by its own fault does not hold the cleanup for long.
-    unsafe {
-        windows::Win32::System::Threading::WaitForSingleObject(process, 10_000);
+    if report.is_none() {
+        let exit_code = process.and_then(|process| {
+            let mut code = 0u32;
+            unsafe { GetExitCodeProcess(process, &mut code) }
+                .is_ok()
+                .then_some(code)
+        });
+        let left = read_record(&file(RECORD)).map(|(record, _)| record);
+        let session_ending = unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) } != 0;
+        if let Some(record) = after_exit(
+            left,
+            file(DONE).exists(),
+            exit_code,
+            file(SHOWN).exists(),
+            session_ending,
+        ) {
+            let mut bytes = [0u8; record::RECORD_LEN];
+            record::format(record, &mut bytes);
+            // Kept until the saves succeed, for the next launch.
+            let kept = if left.is_some() {
+                Ok(())
+            } else {
+                fs::write(file(RECORD), bytes)
+            };
+            let detail = super::native_detail(record, None);
+            let summary = super::summary(record.window_shown);
+            let saved = save(summary, &detail, launch_id).and(kept);
+            report = Some((summary, detail, saved));
+        }
     }
-    crate::vdd::disable();
-    let _ = fs::remove_file(crash);
-    if super::dialogs_wanted() {
-        let log_path = crate::logging::session_log_path();
-        show(
-            summary,
-            &super::message_body(&detail, &log_path.display().to_string(), false),
-        );
+    if let Some(process) = process {
+        unsafe {
+            let _ = CloseHandle(process);
+        }
     }
+
+    // The message waits a little for the cleanup, never for long.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let cleanup = std::thread::spawn(move || {
+        let result = crate::vdd::disable_for_ended(owner);
+        let _ = done_tx.send(());
+        result
+    });
+    let _ = done_rx.recv_timeout(CLEANUP_WAIT);
+    if let Some((summary, detail, _)) = &report {
+        if super::dialogs_wanted() {
+            let log_path = crate::logging::session_log_path();
+            show(
+                summary,
+                &super::message_body(detail, &log_path.display().to_string(), false),
+            );
+        }
+    }
+    let note = match cleanup.join().unwrap_or(Err("the cleanup failed")) {
+        Ok(true) => Some("turned the virtual display off".to_string()),
+        Ok(false) => Some("could not turn the virtual display off".to_string()),
+        // Nothing to do after a normal quit.
+        Err("no host turned it on") => None,
+        Err(reason) => Some(format!("left the virtual display on: {reason}")),
+    };
+    if let Some(note) = note {
+        let _ = crate::logging::append_now(&super::info_line(&format!(
+            "Failure reporter for {owner} {note}"
+        )));
+    }
+    let saved = report.as_ref().is_none_or(|(_, _, saved)| saved.is_ok());
+    remove_files(&directory, owner, saved);
+    0
 }
 
 /// The module of another process that contains `address`, and the offset.
@@ -244,10 +410,9 @@ fn show(title: &str, body: &str) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_message_request_is_read_once() {
+    fn temp_dir(name: &str) -> PathBuf {
         let directory = std::env::temp_dir().join(format!(
-            "eternal-request-{}-{}",
+            "eternal-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -255,13 +420,120 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&directory).unwrap();
-        let path = request_file(&directory, ProcessId { pid: 1, start: 2 });
+        directory
+    }
+
+    fn exited_process() -> ProcessId {
+        let mut child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "true" })
+            .args(if cfg!(windows) {
+                &["/c", "exit"][..]
+            } else {
+                &[][..]
+            })
+            .spawn()
+            .unwrap();
+        let id = ProcessId {
+            pid: child.id(),
+            start: 1,
+        };
+        child.wait().unwrap();
+        id
+    }
+
+    #[test]
+    fn a_message_request_is_read_once() {
+        let directory = temp_dir("request");
+        let path = owner_file(&directory, ProcessId { pid: 1, start: 2 }, REQUEST);
         write_request(&path, "EternalMonitor\nstopped", "line one\nline two").unwrap();
         assert_eq!(
             take_request(&path),
             Some(("EternalMonitor stopped".into(), "line one\nline two".into()))
         );
         assert_eq!(take_request(&path), None);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_request_waits_for_a_starting_reporter_but_not_for_a_dead_one() {
+        let directory = temp_dir("ready");
+        let ready = directory.join("host.ready");
+        // Still starting: this test process stands in for it.
+        let reporter = ProcessId::current();
+        assert!(!wait_until_ready(
+            &ready,
+            reporter,
+            Duration::from_millis(50)
+        ));
+        let writer = {
+            let ready = ready.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                fs::write(ready, reporter.to_string()).unwrap();
+            })
+        };
+        assert!(wait_until_ready(&ready, reporter, Duration::from_secs(5)));
+        writer.join().unwrap();
+        // A reporter that exited reads nothing, ready or not.
+        let started = Instant::now();
+        assert!(!wait_until_ready(
+            &ready,
+            exited_process(),
+            Duration::from_secs(5)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_host_that_ends_past_the_exception_filter_is_reported_by_its_exit_code() {
+        // __fastfail: STATUS_STACK_BUFFER_OVERRUN, with no crash record.
+        let fail_fast = after_exit(None, false, Some(0xC000_0409), true, false).unwrap();
+        assert_eq!((fail_fast.code, fail_fast.thread), (0xC000_0409, 0));
+        assert!(fail_fast.window_shown);
+        assert_eq!(
+            super::super::native_detail(fail_fast, None),
+            "Exit code 0xC0000409 without a crash record"
+        );
+        // Ended before the reporter could read its exit code.
+        let unknown = after_exit(None, false, None, false, false).unwrap();
+        assert_eq!(
+            super::super::native_detail(unknown, None),
+            "The process ended without a crash record"
+        );
+        // A crash record left behind comes first.
+        let crash = Record {
+            code: 0xC000_0005,
+            address: 0x1000,
+            thread: 9,
+            window_shown: false,
+        };
+        assert_eq!(
+            after_exit(Some(crash), true, Some(1), false, false),
+            Some(crash)
+        );
+    }
+
+    #[test]
+    fn a_normal_quit_or_a_reported_failure_is_not_reported_again() {
+        assert_eq!(after_exit(None, false, Some(0), false, false), None);
+        assert_eq!(after_exit(None, true, Some(101), true, false), None);
+        // Windows ending the session stops every program.
+        assert_eq!(after_exit(None, false, Some(1), true, true), None);
+    }
+
+    #[test]
+    fn a_crash_record_stays_until_its_report_is_saved() {
+        let directory = temp_dir("handled");
+        let host = exited_process();
+        for kind in [RECORD, READY, DONE, SHOWN] {
+            fs::write(owner_file(&directory, host, kind), b"x").unwrap();
+        }
+        remove_files(&directory, host, false);
+        let left: Vec<_> = fs::read_dir(&directory).unwrap().flatten().collect();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].path(), owner_file(&directory, host, RECORD));
+        remove_files(&directory, host, true);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
         fs::remove_dir_all(directory).unwrap();
     }
 }
