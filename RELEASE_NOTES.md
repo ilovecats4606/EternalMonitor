@@ -18,7 +18,9 @@ with these changes.
 - Turning on the extended display no longer triggers repeated stream restarts
   while Windows runs the display task. When that task hangs or is missing, the
   host mirrors the main screen immediately instead of waiting for it each time.
-- With no iPad connected, the PC no longer captures and encodes its screen.
+- With no iPad connected, the PC no longer encodes its screen. It reads the
+  screen at most once a second, so an iPad that connects still sees the
+  current desktop.
 - PC audio no longer turns off for the rest of a session after a single large
   sound packet.
 - The installer also allows display traffic on domain (work or school)

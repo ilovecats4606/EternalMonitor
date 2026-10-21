@@ -40,38 +40,58 @@ pub(crate) const IDLE_KEEPALIVE: Duration = Duration::from_millis(750);
 /// viewer's first frame is at most this old even on a static desktop.
 #[cfg(any(windows, test))]
 pub(crate) const IDLE_REFRESH: Duration = Duration::from_secs(1);
-/// Polling interval for a new frame while nobody is watching.
-#[cfg(windows)]
-pub(crate) const IDLE_POLL: Duration = Duration::from_millis(250);
 
-/// What the capture loop does with a new desktop frame.
+/// What the capture loop does with a frame it acquired.
 #[cfg(any(windows, test))]
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum IdleAction {
+pub(crate) enum FrameUse {
     /// Read it back and hand it to the encoder.
     Publish,
     /// Read it back into the cache without encoding it.
-    Refresh,
-    /// Release it untouched.
-    Skip,
+    Cache,
 }
 
 /// 0.3.1 captured and encoded at up to 60 fps whenever the desktop changed,
 /// connected or not: 29 of 35 PCs in the field encoded about 30 fps for
-/// nobody, on battery-powered laptops too. The first frame is still
-/// published so the encoder opens before an iPad arrives.
+/// nobody, on battery-powered laptops too. With nobody watching, the loop
+/// now waits before acquiring instead of acquiring and dropping frames:
+/// DXGI reports a change only once, so a dropped frame left the cache stale
+/// until the desktop changed again. Every acquired frame is read back. The
+/// first one is published so the encoder opens before an iPad arrives.
 #[cfg(any(windows, test))]
-pub(crate) fn idle_action(
-    watching: bool,
+pub(crate) struct IdleGate {
     published_once: bool,
-    since_refresh: Duration,
-) -> IdleAction {
-    if watching || !published_once {
-        IdleAction::Publish
-    } else if since_refresh >= IDLE_REFRESH {
-        IdleAction::Refresh
-    } else {
-        IdleAction::Skip
+    last_refresh: Option<Instant>,
+}
+
+#[cfg(any(windows, test))]
+impl IdleGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            published_once: false,
+            last_refresh: None,
+        }
+    }
+
+    /// How long to wait before the next acquire. Changes made meanwhile stay
+    /// pending in DXGI, so the next acquire returns the latest desktop.
+    pub(crate) fn wait_before_acquire(&self, watching: bool, now: Instant) -> Duration {
+        match self.last_refresh {
+            Some(at) if !watching && self.published_once => {
+                (at + IDLE_REFRESH).saturating_duration_since(now)
+            }
+            _ => Duration::ZERO,
+        }
+    }
+
+    pub(crate) fn on_frame(&mut self, watching: bool, now: Instant) -> FrameUse {
+        self.last_refresh = Some(now);
+        if watching || !self.published_once {
+            self.published_once = true;
+            FrameUse::Publish
+        } else {
+            FrameUse::Cache
+        }
     }
 }
 
@@ -557,13 +577,70 @@ fn pick_new_virtual_output<'a>(before: &[String], now: &'a [OutputInfo]) -> Opti
 mod tests {
 
     #[test]
-    fn an_unwatched_desktop_is_cached_once_a_second_but_never_encoded() {
+    fn an_unwatched_desktop_is_acquired_once_a_second_and_never_encoded() {
+        let start = Instant::now();
         let ms = Duration::from_millis;
+        let mut gate = IdleGate::new();
         // The first frame opens the encoder even with nobody connected.
-        assert_eq!(idle_action(false, false, ms(0)), IdleAction::Publish);
-        assert_eq!(idle_action(false, true, ms(400)), IdleAction::Skip);
-        assert_eq!(idle_action(false, true, IDLE_REFRESH), IdleAction::Refresh);
-        assert_eq!(idle_action(true, true, ms(0)), IdleAction::Publish);
+        assert_eq!(gate.wait_before_acquire(false, start), Duration::ZERO);
+        assert_eq!(gate.on_frame(false, start), FrameUse::Publish);
+        assert_eq!(gate.wait_before_acquire(false, start + ms(400)), ms(600));
+        assert_eq!(
+            gate.wait_before_acquire(false, start + IDLE_REFRESH),
+            Duration::ZERO
+        );
+        assert_eq!(gate.on_frame(false, start + IDLE_REFRESH), FrameUse::Cache);
+        // A viewer is served at once.
+        assert_eq!(
+            gate.wait_before_acquire(true, start + IDLE_REFRESH),
+            Duration::ZERO
+        );
+        assert_eq!(gate.on_frame(true, start + IDLE_REFRESH), FrameUse::Publish);
+    }
+
+    /// DXGI semantics: a desktop change is reported by exactly one
+    /// AcquireNextFrame; later acquires time out until the next change. The
+    /// loop below mirrors the capture loop's use of the gate, with the idle
+    /// keepalive resending the cache when an acquire times out.
+    #[test]
+    fn a_new_viewer_gets_the_current_desktop_after_an_idle_change() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let (mut image, mut pending) = (1u32, true);
+        let mut cache = 0u32;
+        let mut first_sent = None;
+        let mut gate = IdleGate::new();
+        let mut t = 0u64;
+        while t < 6_000 && first_sent.is_none() {
+            // A change lands right after the 2 s refresh, then the desktop
+            // stays still until a viewer connects at 5 s.
+            if t >= 2_000 && image == 1 {
+                image = 2;
+                pending = true;
+            }
+            if t >= 2_100 && image == 2 {
+                image = 3;
+                pending = true;
+            }
+            let watching = t >= 5_000;
+            let wait = gate.wait_before_acquire(watching, at(t));
+            if !wait.is_zero() {
+                // The loop wakes early when a viewer arrives.
+                t = (t + wait.as_millis() as u64).min(t.max(5_000));
+                continue;
+            }
+            if pending {
+                pending = false;
+                cache = image;
+                if gate.on_frame(watching, at(t)) == FrameUse::Publish && watching {
+                    first_sent = Some(image);
+                }
+            } else if watching {
+                first_sent = Some(cache);
+            }
+            t += 8;
+        }
+        assert_eq!(first_sent, Some(3));
     }
 
     use super::*;

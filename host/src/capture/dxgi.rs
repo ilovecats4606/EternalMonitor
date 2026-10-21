@@ -15,9 +15,9 @@ use super::recovery::{
     note_capture_resumed, CaptureBlock, CaptureUnavailable, LossRecovery, LossStep, LOSS_GIVE_UP,
 };
 use super::{
-    client_connected, frame_budget_for, heartbeat, idle_action, reconcile_virtual_display,
-    resolve_target, FrameSlot, IdleAction, OutputInfo, RawFrame, ACQUIRE_TIMEOUT_MS, FPS_WINDOW,
-    IDLE_KEEPALIVE, IDLE_POLL,
+    client_connected, frame_budget_for, heartbeat, reconcile_virtual_display, resolve_target,
+    FrameSlot, FrameUse, IdleGate, OutputInfo, RawFrame, ACQUIRE_TIMEOUT_MS, FPS_WINDOW,
+    IDLE_KEEPALIVE,
 };
 use crate::control::SharedControl;
 use crate::stats::PIPELINE_STATS;
@@ -286,8 +286,7 @@ pub fn run_capture_loop(
     let mut cursor_y: i32 = 0;
     let mut recovery = LossRecovery::default();
     let mut resumed = false;
-    let mut published_once = false;
-    let mut last_refresh = Instant::now();
+    let mut idle = IdleGate::new();
 
     loop {
         if !shared.running.load(Ordering::SeqCst)
@@ -297,6 +296,26 @@ pub fn run_capture_loop(
             break;
         }
         heartbeat(&shared.hb_capture_loop_ms);
+
+        let wait = idle.wait_before_acquire(client_connected(&shared), Instant::now());
+        if !wait.is_zero() {
+            // Nobody is watching. Waiting (instead of acquiring and dropping
+            // frames) keeps desktop changes pending for the next acquire.
+            let deadline = Instant::now() + wait;
+            while Instant::now() < deadline
+                && !client_connected(&shared)
+                && shared.running.load(Ordering::SeqCst)
+                && crate::supervisor::generation_is_current(generation)
+            {
+                heartbeat(&shared.hb_capture_loop_ms);
+                std::thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(50)),
+                );
+            }
+            continue;
+        }
 
         let frame_start = Instant::now();
         let frame_budget = frame_budget_for(shared.effective_fps());
@@ -383,19 +402,6 @@ pub fn run_capture_loop(
                     "Frame acquired"
                 );
 
-                let action = idle_action(
-                    client_connected(&shared),
-                    published_once,
-                    last_refresh.elapsed(),
-                );
-                if action == IdleAction::Skip {
-                    unsafe {
-                        dupl.ReleaseFrame()?;
-                    }
-                    std::thread::sleep(IDLE_POLL);
-                    continue;
-                }
-
                 // --- Copy desktop texture to staging and read pixels into a
                 // recycled buffer (the readback is the ONLY full-frame copy) ---
                 let frame_data: Option<Arc<Vec<u8>>> = if let Some(ref resource) = desktop_resource
@@ -479,8 +485,7 @@ pub fn run_capture_loop(
                 };
 
                 if let Some(data) = frame_data {
-                    last_refresh = now;
-                    if action == IdleAction::Publish {
+                    if idle.on_frame(client_connected(&shared), now) == FrameUse::Publish {
                         PIPELINE_STATS.lock().record_capture(tex_width, tex_height);
                         heartbeat(&shared.hb_capture_frame_ms);
 
@@ -491,7 +496,6 @@ pub fn run_capture_loop(
                             width: tex_width,
                             height: tex_height,
                         });
-                        published_once = true;
                         last_send = now;
                     }
                     // The displaced spare (if any) plus last_frame keep at most
