@@ -33,6 +33,9 @@ const READY_WAIT: Duration = Duration::from_secs(3);
 /// How long the message waits for the virtual display to turn off.
 #[cfg(windows)]
 const CLEANUP_WAIT: Duration = Duration::from_secs(5);
+/// The reporter exits by then even if the turn-off is still running.
+#[cfg(windows)]
+const CLEANUP_CAP: Duration = Duration::from_secs(30);
 
 static REPORTER: OnceLock<ProcessId> = OnceLock::new();
 /// The crash folder and this host, once a reporter was started for it.
@@ -119,6 +122,18 @@ pub(super) fn still_reporting(directory: &Path, owner: ProcessId) -> bool {
         .is_some_and(ProcessId::is_running)
 }
 
+/// The failure reporters watching hosts of this folder, by their ready files.
+#[cfg(windows)]
+fn reporters(directory: &Path) -> Vec<ProcessId> {
+    fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|e| e == READY))
+        .filter_map(|entry| ProcessId::from_name(fs::read_to_string(entry.path()).ok()?.trim()))
+        .collect()
+}
+
 fn write_request(path: &Path, title: &str, body: &str) -> std::io::Result<()> {
     let temp = path.with_extension("tmp");
     fs::write(&temp, format!("{}\n{body}", title.replace('\n', " ")))?;
@@ -160,14 +175,14 @@ fn after_exit(
 }
 
 /// Write the log line and the upload event. Both must succeed before the
-/// crash record is removed; otherwise the next launch reports it again.
+/// record is removed; otherwise the next launch reports it again.
 #[cfg(windows)]
-fn save(summary: &str, detail: &str, launch_id: &str) -> std::io::Result<()> {
-    let logged = crate::logging::append_now(&super::log_line(summary, detail));
+fn save(outcome: &super::Outcome, launch_id: &str) -> std::io::Result<()> {
+    let logged = crate::logging::append_now(&outcome.log_line());
     let queued = if launch_id == "-" {
         Ok(())
     } else {
-        crate::telemetry::queue_for_launch(launch_id, 1, &format!("{summary}: {detail}"))
+        crate::telemetry::queue_for_launch(launch_id, 1, &outcome.event(), outcome.level())
     };
     logged.and(queued)
 }
@@ -249,10 +264,12 @@ fn run(args: &[String]) -> i32 {
             }
             if let Some((record, false)) = read_record(&file(RECORD)) {
                 let module = module_at(process, record.address);
-                let detail =
-                    super::native_detail(record, module.as_ref().map(|(n, o)| (n.as_str(), *o)));
-                let summary = super::summary(record.window_shown);
-                let saved = save(summary, &detail, launch_id);
+                let outcome = super::Outcome::new(
+                    record,
+                    module.as_ref().map(|(n, o)| (n.as_str(), *o)),
+                    false,
+                );
+                let saved = save(&outcome, launch_id);
                 // Release the crashed process whether or not the saves
                 // worked; the record stays until they do.
                 if let Ok(mut crash) = fs::OpenOptions::new().append(true).open(file(RECORD)) {
@@ -263,7 +280,7 @@ fn run(args: &[String]) -> i32 {
                 unsafe {
                     WaitForSingleObject(process, 10_000);
                 }
-                report = Some((summary, detail, saved));
+                report = Some((outcome, saved));
                 break;
             }
             if exited {
@@ -275,13 +292,42 @@ fn run(args: &[String]) -> i32 {
     if let Some((title, body)) = take_request(&file(REQUEST)) {
         show(&title, &body);
     }
-    if report.is_none() {
-        let exit_code = process.and_then(|process| {
-            let mut code = 0u32;
-            unsafe { GetExitCodeProcess(process, &mut code) }
-                .is_ok()
-                .then_some(code)
+    let exit_code = process.and_then(|process| {
+        let mut code = 0u32;
+        unsafe { GetExitCodeProcess(process, &mut code) }
+            .is_ok()
+            .then_some(code)
+    });
+    if let Some(process) = process {
+        unsafe {
+            let _ = CloseHandle(process);
+        }
+    }
+
+    // After any abnormal end, whatever the report says, turn the virtual
+    // display off while the report is saved. The message waits for it at
+    // most CLEANUP_WAIT and this process at most CLEANUP_CAP.
+    let cleanup_started = Instant::now();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    if exit_code != Some(0) {
+        let reporters = reporters(&directory);
+        std::thread::spawn(move || {
+            let note = match crate::vdd::disable_for_ended(owner, &reporters) {
+                Ok(true) => Some("turned the virtual display off".to_string()),
+                Ok(false) => Some("could not turn the virtual display off".to_string()),
+                Err("no host turned it on") => None,
+                Err(reason) => Some(format!("left the virtual display on: {reason}")),
+            };
+            if let Some(note) = note {
+                let _ = crate::logging::append_now(&super::info_line(&format!(
+                    "Failure reporter for {owner} {note}"
+                )));
+            }
+            let _ = done_tx.send(());
         });
+    }
+
+    if report.is_none() {
         let left = read_record(&file(RECORD)).map(|(record, _)| record);
         let session_ending = unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) } != 0;
         if let Some(record) = after_exit(
@@ -299,48 +345,24 @@ fn run(args: &[String]) -> i32 {
             } else {
                 fs::write(file(RECORD), bytes)
             };
-            let detail = super::native_detail(record, None);
-            let summary = super::summary(record.window_shown);
-            let saved = save(summary, &detail, launch_id).and(kept);
-            report = Some((summary, detail, saved));
-        }
-    }
-    if let Some(process) = process {
-        unsafe {
-            let _ = CloseHandle(process);
+            let outcome = super::Outcome::new(record, None, false);
+            let saved = save(&outcome, launch_id).and(kept);
+            report = Some((outcome, saved));
         }
     }
 
-    // The message waits a little for the cleanup, never for long.
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let cleanup = std::thread::spawn(move || {
-        let result = crate::vdd::disable_for_ended(owner);
-        let _ = done_tx.send(());
-        result
-    });
-    let _ = done_rx.recv_timeout(CLEANUP_WAIT);
-    if let Some((summary, detail, _)) = &report {
-        if super::dialogs_wanted() {
+    let _ = done_rx.recv_timeout(CLEANUP_WAIT.saturating_sub(cleanup_started.elapsed()));
+    if let Some((outcome, _)) = &report {
+        if outcome.crash && super::dialogs_wanted() {
             let log_path = crate::logging::session_log_path();
             show(
-                summary,
-                &super::message_body(detail, &log_path.display().to_string(), false),
+                &outcome.summary,
+                &super::message_body(&outcome.detail, &log_path.display().to_string(), false),
             );
         }
     }
-    let note = match cleanup.join().unwrap_or(Err("the cleanup failed")) {
-        Ok(true) => Some("turned the virtual display off".to_string()),
-        Ok(false) => Some("could not turn the virtual display off".to_string()),
-        // Nothing to do after a normal quit.
-        Err("no host turned it on") => None,
-        Err(reason) => Some(format!("left the virtual display on: {reason}")),
-    };
-    if let Some(note) = note {
-        let _ = crate::logging::append_now(&super::info_line(&format!(
-            "Failure reporter for {owner} {note}"
-        )));
-    }
-    let saved = report.as_ref().is_none_or(|(_, _, saved)| saved.is_ok());
+    let _ = done_rx.recv_timeout(CLEANUP_CAP.saturating_sub(cleanup_started.elapsed()));
+    let saved = report.as_ref().is_none_or(|(_, saved)| saved.is_ok());
     remove_files(&directory, owner, saved);
     0
 }

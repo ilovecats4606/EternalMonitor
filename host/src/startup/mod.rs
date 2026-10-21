@@ -27,10 +27,10 @@ static WINDOW_SHOWN: AtomicBool = AtomicBool::new(false);
 static SHOWN_AT: OnceLock<Instant> = OnceLock::new();
 
 /// Test hook for the failure paths. Set `ETERNAL_SIMULATE_STARTUP_FAILURE` to
-/// `error`, `panic`, `hang` (30 s) or, on Windows, `crash`, `crash-thread`
-/// (on another thread), `crash-heap` (while another thread holds the heap
-/// lock) or `fail-fast` (past the exception filter) to fail while the window
-/// renderer starts; `early-error` to fail right after the failure reporter
+/// `error`, `panic`, `hang` (30 s) or, on Windows,
+/// `crash`, `crash-thread` (on another thread), `crash-heap` (while another
+/// thread holds the heap lock) or `fail-fast` (past the exception filter) to
+/// fail while the window renderer starts; `early-error` to fail right after the failure reporter
 /// starts; `panic-later` or, on Windows, `fail-fast-later` to fail 15 s after
 /// the window works; or `surface-error` to report a surface error on every
 /// frame of the first two seconds. A `-quiet` suffix skips the message box.
@@ -125,40 +125,136 @@ pub fn finish() {
     }
 }
 
-/// Report crashes of earlier launches that no reporter saved, and show
+/// Report what earlier launches left that no reporter saved, and show
 /// messages that no reporter showed.
 pub fn take_previous_crashes() {
     let Some(directory) = crash_dir() else {
         return;
     };
     let previous = collect_previous(&directory, ProcessId::current());
-    for record in previous.records {
-        let summary = summary(record.window_shown);
-        let detail = native_detail(record, None);
-        tracing::error!("{summary} last time: {detail}");
-        let log_path = crate::logging::session_log_path();
-        show(
-            &format!("{summary} last time"),
-            &message_body(&detail, &log_path.display().to_string(), true),
-        );
-    }
+    let log_path = crate::logging::session_log_path().display().to_string();
+    recover(
+        previous.records,
+        |outcome| {
+            crate::logging::append_now(&outcome.log_line()).and(crate::telemetry::queue_now(
+                &outcome.event(),
+                outcome.level(),
+            ))
+        },
+        |outcome| {
+            show(
+                &outcome.summary,
+                &message_body(&outcome.detail, &log_path, true),
+            )
+        },
+    );
     for (title, body) in previous.messages {
         tracing::warn!("Showing a message from the last launch: {title}");
         show(&format!("{title} last time"), &body);
     }
 }
 
+/// Save each record an earlier launch left, synchronously to the log and the
+/// outbox, and remove it only once both are saved; otherwise the next launch
+/// tries again. Crashes are shown either way.
+fn recover(
+    records: Vec<(PathBuf, record::Record)>,
+    mut save: impl FnMut(&Outcome) -> std::io::Result<()>,
+    mut show: impl FnMut(&Outcome),
+) {
+    for (path, record) in records {
+        let outcome = Outcome::new(record, None, true);
+        match save(&outcome) {
+            Ok(()) => {
+                let _ = fs::remove_file(&path);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Could not save a report from the last launch; keeping it")
+            }
+        }
+        if outcome.crash {
+            show(&outcome);
+        }
+    }
+}
+
+/// NTSTATUS exit codes that mean a crash although the exception filter left
+/// no record. These faults end the process without running the filter, or
+/// before it could write.
+const CRASH_STATUSES: [u32; 5] = [
+    // Access violation, the usual driver fault, when the filter could not
+    // write its record.
+    0xC000_0005,
+    // __fastfail: Rust's abort, /GS stack-cookie and CRT checks.
+    0xC000_0409,
+    // Heap corruption that the heap manager detected.
+    0xC000_0374,
+    // Stack overflow: the filter has no stack left to run on.
+    0xC000_00FD,
+    // RaiseFailFastException.
+    0xC000_0602,
+];
+
+const CLOSED: &str = "EternalMonitor closed without finishing";
+
+/// How an ended launch is reported. A crash, a record the exception filter
+/// wrote or a crash status as the exit code, is an error with a message.
+/// Any other end without a normal quit (Task Manager, taskkill, a forced
+/// close by Windows, unknown codes) is only noted, as information.
+#[derive(Debug, PartialEq)]
+struct Outcome {
+    crash: bool,
+    summary: String,
+    detail: String,
+}
+
+impl Outcome {
+    fn new(record: record::Record, module: Option<(&str, u64)>, previous_launch: bool) -> Self {
+        let crash = record.thread != 0 || CRASH_STATUSES.contains(&record.code);
+        let summary = if crash {
+            summary(record.window_shown)
+        } else {
+            CLOSED
+        };
+        Self {
+            crash,
+            summary: if previous_launch {
+                format!("{summary} last time")
+            } else {
+                summary.to_string()
+            },
+            detail: native_detail(record, module),
+        }
+    }
+
+    fn event(&self) -> String {
+        format!("{}: {}", self.summary, self.detail)
+    }
+
+    fn level(&self) -> &'static str {
+        if self.crash {
+            "error"
+        } else {
+            "info"
+        }
+    }
+
+    fn log_line(&self) -> String {
+        timestamped(if self.crash { "ERROR" } else { " INFO" }, &self.event())
+    }
+}
+
 #[derive(Debug, Default, PartialEq)]
 struct Previous {
-    records: Vec<record::Record>,
+    records: Vec<(PathBuf, record::Record)>,
     messages: Vec<(String, String)>,
 }
 
-/// Crash records and message requests that earlier launches left. A record
-/// is only removed once its report is saved, so any record here still needs
-/// one. Files of exited launches are removed unless their reporter is still
-/// handling them; files of running instances, including this one, are left
-/// alone.
+/// Records and message requests that earlier launches left. A record is only
+/// removed once its report is saved, so any record here still needs one, and
+/// it stays until [`recover`] saves it. Other files of exited launches are
+/// removed unless their reporter is still handling them; files of running
+/// instances, including this one, are left alone.
 fn collect_previous(directory: &Path, current: ProcessId) -> Previous {
     let mut previous = Previous::default();
     let Ok(entries) = fs::read_dir(directory) else {
@@ -180,7 +276,8 @@ fn collect_previous(directory: &Path, current: ProcessId) -> Previous {
         match path.extension().and_then(|extension| extension.to_str()) {
             Some(reporter::RECORD) => {
                 if let Some((record, _)) = fs::read(&path).ok().and_then(|b| record::parse(&b)) {
-                    previous.records.push(record);
+                    previous.records.push((path, record));
+                    continue;
                 }
             }
             Some(reporter::REQUEST) => previous.messages.extend(reporter::take_request(&path)),
@@ -216,7 +313,7 @@ fn save(detail: &str) -> Option<(&'static str, String)> {
     if let Err(error) = crate::logging::append_now(&log_line(summary, detail)) {
         eprintln!("Could not write the session log: {error}");
     }
-    crate::telemetry::queue_now(&format!("{summary}: {detail}"));
+    let _ = crate::telemetry::queue_now(&format!("{summary}: {detail}"), "error");
     eprintln!("{summary}: {detail}");
     reporter::mark(reporter::DONE);
     Some((
@@ -528,28 +625,109 @@ mod tests {
         write(format!("{reporting}.ready"), me.to_string().as_bytes());
         write(format!("{me}.rec"), &bytes);
 
+        let previous = collect_previous(&directory, me);
+        let records: Vec<_> = previous.records.iter().map(|(_, r)| *r).collect();
+        assert_eq!(records, [crashed, crashed]);
         assert_eq!(
-            collect_previous(&directory, me),
-            Previous {
-                records: vec![crashed, crashed],
-                messages: vec![("EternalMonitor could not start".into(), "body".into())],
-            }
+            previous.messages,
+            [("EternalMonitor could not start".into(), "body".into())]
         );
         let mut left: Vec<String> = fs::read_dir(&directory)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         left.sort();
+        // Records stay until their reports are saved.
         let mut expected = [
+            format!("{exited}.rec"),
+            format!("{unsaved}.rec"),
             format!("{reporting}.ready"),
             format!("{reporting}.rec"),
             format!("{me}.rec"),
         ];
         expected.sort();
         assert_eq!(left, expected);
-        // Taken once.
-        assert_eq!(collect_previous(&directory, me), Previous::default());
+        assert_eq!(collect_previous(&directory, me).records.len(), 2);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_record_from_the_last_launch_stays_until_it_is_saved() {
+        let directory = std::env::temp_dir().join(format!(
+            "eternal-recover-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let crash = record::Record {
+            code: 0xC000_0005,
+            address: 0x1000,
+            thread: 9,
+            window_shown: false,
+        };
+        let killed = record::Record {
+            code: 1,
+            address: 0,
+            thread: 0,
+            window_shown: true,
+        };
+        let records = vec![
+            (directory.join("1-1.rec"), crash),
+            (directory.join("2-1.rec"), killed),
+        ];
+        for (path, _) in &records {
+            fs::write(path, b"x").unwrap();
+        }
+        let mut saved = Vec::new();
+        let mut shown = Vec::new();
+        recover(
+            records,
+            |outcome| {
+                saved.push(outcome.log_line());
+                if outcome.crash {
+                    Err(std::io::ErrorKind::PermissionDenied.into())
+                } else {
+                    Ok(())
+                }
+            },
+            |outcome| shown.push(outcome.summary.clone()),
+        );
+        assert!(directory.join("1-1.rec").exists());
+        assert!(!directory.join("2-1.rec").exists());
+        assert!(saved[0].contains(" ERROR EternalMonitor could not start last time: "));
+        assert!(saved[1].contains(
+            "  INFO EternalMonitor closed without finishing last time: Exit code 0x00000001"
+        ));
+        assert_eq!(shown, ["EternalMonitor could not start last time"]);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn only_crash_records_and_crash_statuses_are_crashes() {
+        let ended = |code, thread| record::Record {
+            code,
+            address: 0,
+            thread,
+            window_shown: true,
+        };
+        // A record the exception filter wrote, whatever the code.
+        assert!(Outcome::new(ended(0xE06D_7363, 42), None, false).crash);
+        for code in CRASH_STATUSES {
+            let outcome = Outcome::new(ended(code, 0), None, false);
+            assert!(outcome.crash);
+            assert_eq!(outcome.summary, "EternalMonitor stopped unexpectedly");
+            assert_eq!(outcome.level(), "error");
+        }
+        // Task Manager's End task, Process.Kill, Restart Manager, unknown.
+        for code in [1, 0xFFFF_FFFF, 0x4001_0004, 0] {
+            let outcome = Outcome::new(ended(code, 0), None, false);
+            assert!(!outcome.crash);
+            assert_eq!(outcome.summary, CLOSED);
+            assert_eq!(outcome.level(), "info");
+        }
     }
 
     #[test]

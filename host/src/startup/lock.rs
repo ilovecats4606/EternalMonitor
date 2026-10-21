@@ -1,41 +1,13 @@
 //! An exclusive lock on a small state file, shared by every EternalMonitor
 //! process of the user. The lock belongs to the open handle, so a holder that
-//! crashes releases it.
+//! crashes releases it. Nobody waits for it: a caller that finds it taken
+//! tries again later.
 
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io;
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 pub(crate) struct Locked(File);
-
-/// Lock `path`, creating it, waiting at most `wait` for another holder and
-/// calling `waiting` meanwhile.
-pub(crate) fn lock(path: &Path, wait: Duration, mut waiting: impl FnMut()) -> io::Result<Locked> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-    let deadline = Instant::now() + wait;
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(Locked(file)),
-            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
-                waiting();
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(TryLockError::WouldBlock) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("{} is locked by another process", path.display()),
-                ))
-            }
-            Err(TryLockError::Error(error)) => return Err(error),
-        }
-    }
-}
 
 /// Lock `path`, creating it. `WouldBlock` when another holder has it.
 pub(crate) fn try_lock(path: &Path) -> io::Result<Locked> {
@@ -52,22 +24,6 @@ pub(crate) fn try_lock(path: &Path) -> io::Result<Locked> {
     }
 }
 
-impl Locked {
-    pub(crate) fn read(&mut self) -> io::Result<String> {
-        let mut text = String::new();
-        self.0.seek(SeekFrom::Start(0))?;
-        self.0.read_to_string(&mut text)?;
-        Ok(text)
-    }
-
-    pub(crate) fn write(&mut self, text: &str) -> io::Result<()> {
-        self.0.set_len(0)?;
-        self.0.seek(SeekFrom::Start(0))?;
-        self.0.write_all(text.as_bytes())?;
-        self.0.sync_data()
-    }
-}
-
 /// Unlock explicitly: on Unix a child being started at that moment can still
 /// share the handle, and with it the lock.
 impl Drop for Locked {
@@ -81,7 +37,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_second_holder_waits_and_then_gives_up() {
+    fn a_second_holder_is_turned_away_until_the_first_lets_go() {
         let path = std::env::temp_dir().join(format!(
             "eternal-lock-{}-{}",
             std::process::id(),
@@ -90,16 +46,18 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let mut first = lock(&path, Duration::ZERO, || {}).unwrap();
-        first.write("owner").unwrap();
-        let mut waited = 0;
-        let second = lock(&path, Duration::from_millis(100), || waited += 1);
-        assert_eq!(second.err().unwrap().kind(), io::ErrorKind::TimedOut);
-        assert!(waited > 0);
+        let first = try_lock(&path).unwrap();
+        assert_eq!(
+            try_lock(&path).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
         drop(first);
-        let mut second = lock(&path, Duration::ZERO, || {}).unwrap();
-        assert_eq!(second.read().unwrap(), "owner");
-        drop(second);
+        // A child started by another test may briefly share the handle.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while try_lock(&path).is_err() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(try_lock(&path).is_ok());
         std::fs::remove_file(path).unwrap();
     }
 }

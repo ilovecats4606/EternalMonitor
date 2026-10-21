@@ -273,25 +273,34 @@ pub fn record(line: &str) {
         }
     }
 }
-/// Queue one error event on disk now. The upload thread sends it, or the next
-/// launch does if this process ends first.
-pub fn queue_now(message: &str) {
+/// Queue one event (`level` is `error` or `info`) on disk now. The upload
+/// thread sends it, or the next launch does if this process ends first. Ok
+/// when the event is saved or uploads are off.
+pub fn queue_now(message: &str, level: &str) -> std::io::Result<()> {
     if !enabled() {
-        return;
+        return Ok(());
     }
-    if let Some(directory) = OUTBOX.get() {
-        if queue_into(directory, message).is_err() {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
-        }
+    let Some(directory) = OUTBOX.get() else {
+        return Ok(());
+    };
+    let queued = queue_into(directory, message, level);
+    if queued.is_err() {
+        DROPPED.fetch_add(1, Ordering::Relaxed);
     }
+    queued
 }
-fn queue_into(directory: &Path, message: &str) -> std::io::Result<()> {
-    persist(directory, &batch(vec![event(message, "error")])?)
+fn queue_into(directory: &Path, message: &str, level: &str) -> std::io::Result<()> {
+    persist(directory, &batch(vec![event(message, level)])?)
 }
-/// Queue an error event for another launch of this installation, from the
-/// failure reporter process. `index` keeps several such events distinct.
-/// Ok when the event is saved or uploads are off.
-pub fn queue_for_launch(launch_id: &str, index: u64, message: &str) -> std::io::Result<()> {
+/// Queue an event for another launch of this installation, from the failure
+/// reporter process. `index` keeps several such events distinct. Ok when the
+/// event is saved or uploads are off.
+pub fn queue_for_launch(
+    launch_id: &str,
+    index: u64,
+    message: &str,
+    level: &str,
+) -> std::io::Result<()> {
     let Some(base) = crate::settings::app_data_dir() else {
         return Ok(());
     };
@@ -300,16 +309,23 @@ pub fn queue_for_launch(launch_id: &str, index: u64, message: &str) -> std::io::
     {
         return Ok(());
     }
-    queue_foreign(&base.join("diagnostics-outbox"), launch_id, index, message)
+    queue_foreign(
+        &base.join("diagnostics-outbox"),
+        launch_id,
+        index,
+        message,
+        level,
+    )
 }
 fn queue_foreign(
     directory: &Path,
     launch_id: &str,
     index: u64,
     message: &str,
+    level: &str,
 ) -> std::io::Result<()> {
     let installation_id = fs::read_to_string(directory.join("installation-id"))?;
-    let mut event = event(message, "error");
+    let mut event = event(message, level);
     event.sequence = FOREIGN_SEQUENCE_BASE + index;
     let mut batch = batch(vec![event])?;
     batch.installation_id = installation_id.trim().to_string();
@@ -738,6 +754,7 @@ mod tests {
             &launch,
             1,
             "EternalMonitor stopped unexpectedly: crash",
+            "error",
         )
         .unwrap();
         let saved: Batch =
@@ -753,8 +770,13 @@ mod tests {
     fn fatal_reports_queue_as_errors_with_their_own_sequence_numbers() {
         let directory = std::env::temp_dir().join(id().unwrap());
         fs::create_dir_all(&directory).unwrap();
-        queue_into(&directory, "EternalMonitor could not start: token=abc").unwrap();
-        queue_into(&directory, "EternalMonitor could not start: again").unwrap();
+        queue_into(
+            &directory,
+            "EternalMonitor could not start: token=abc",
+            "error",
+        )
+        .unwrap();
+        queue_into(&directory, "EternalMonitor could not start: again", "error").unwrap();
         let saved: Vec<Batch> = files(&directory)
             .unwrap()
             .iter()

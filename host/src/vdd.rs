@@ -98,7 +98,7 @@ fn run_task(task: &str, mut progress: impl FnMut()) -> bool {
 pub(crate) fn set_enabled(enabled: bool, progress: impl FnMut()) -> bool {
     #[cfg(windows)]
     {
-        crate::startup::display::change(enabled, progress, |progress| {
+        crate::startup::display::change(enabled, || {
             run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress)
         })
     }
@@ -114,9 +114,16 @@ pub fn disable() {
     set_enabled(false, || {});
 }
 
-/// Disable the virtual display after `host` has ended, unless a running host
-/// owns it now. For the failure reporter.
+/// Disable the virtual display after `host` ended abnormally, if it owned the
+/// display and no other host of this install runs. For the failure reporter.
 #[cfg(windows)]
-pub(crate) fn disable_for_ended(host: crate::startup::ProcessId) -> Result<bool, &'static str> {
-    crate::startup::display::disable_for_ended(host, || run_task(TASK_DISABLE, || {}))
+pub(crate) fn disable_for_ended(
+    host: crate::startup::ProcessId,
+    reporters: &[crate::startup::ProcessId],
+) -> Result<bool, &'static str> {
+    crate::startup::display::disable_for_ended(
+        host,
+        || crate::startup::display::other_host_running(host, reporters),
+        || run_task(TASK_DISABLE, || {}),
+    )
 }
