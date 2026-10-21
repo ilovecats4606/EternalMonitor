@@ -15,9 +15,9 @@ use super::recovery::{
     note_capture_resumed, CaptureBlock, CaptureUnavailable, LossRecovery, LossStep, LOSS_GIVE_UP,
 };
 use super::{
-    client_connected, frame_budget_for, heartbeat, reconcile_virtual_display, resolve_target,
-    FrameSlot, FrameUse, IdleGate, OutputInfo, RawFrame, ACQUIRE_TIMEOUT_MS, FPS_WINDOW,
-    IDLE_KEEPALIVE,
+    client_connected, frame_budget_for, frame_has_image, heartbeat, idle_heartbeat,
+    reconcile_virtual_display, resolve_target, FrameSlot, FrameUse, IdleGate, OutputInfo, RawFrame,
+    ACQUIRE_TIMEOUT_MS, FPS_WINDOW, IDLE_KEEPALIVE,
 };
 use crate::control::SharedControl;
 use crate::stats::PIPELINE_STATS;
@@ -287,6 +287,8 @@ pub fn run_capture_loop(
     let mut recovery = LossRecovery::default();
     let mut resumed = false;
     let mut idle = IdleGate::new();
+    // Set once this duplication has delivered a real desktop image.
+    let mut seen_image = false;
 
     loop {
         if !shared.running.load(Ordering::SeqCst)
@@ -307,7 +309,7 @@ pub fn run_capture_loop(
                 && shared.running.load(Ordering::SeqCst)
                 && crate::supervisor::generation_is_current(generation)
             {
-                heartbeat(&shared.hb_capture_loop_ms);
+                idle_heartbeat(&shared, crate::clock::host_now_us() / 1000);
                 std::thread::sleep(
                     deadline
                         .saturating_duration_since(Instant::now())
@@ -397,6 +399,8 @@ pub fn run_capture_loop(
                 debug!(
                     frame = frame_number,
                     dirty_rects = dirty_count,
+                    last_present = frame_info.LastPresentTime,
+                    accumulated = frame_info.AccumulatedFrames,
                     acquire_us = acquire_us,
                     fps = format!("{rolling_fps:.1}"),
                     "Frame acquired"
@@ -404,6 +408,14 @@ pub fn run_capture_loop(
 
                 // --- Copy desktop texture to staging and read pixels into a
                 // recycled buffer (the readback is the ONLY full-frame copy) ---
+                if !frame_has_image(frame_info.LastPresentTime, seen_image) {
+                    unsafe {
+                        dupl.ReleaseFrame()?;
+                    }
+                    continue;
+                }
+                seen_image = true;
+
                 let frame_data: Option<Arc<Vec<u8>>> = if let Some(ref resource) = desktop_resource
                 {
                     match resource.cast::<ID3D11Texture2D>() {
@@ -497,6 +509,8 @@ pub fn run_capture_loop(
                             height: tex_height,
                         });
                         last_send = now;
+                    } else {
+                        idle_heartbeat(&shared, crate::clock::host_now_us() / 1000);
                     }
                     // The displaced spare (if any) plus last_frame keep at most
                     // two buffers alive; steady state recycles them.
@@ -536,6 +550,7 @@ pub fn run_capture_loop(
                     // restarts the pipeline for virtual-display targets).
                     // The 250 ms naps stay far under the supervisor's 3 s
                     // loop-heartbeat wedge threshold.
+                    idle_heartbeat(&shared, crate::clock::host_now_us() / 1000);
                     std::thread::sleep(Duration::from_millis(250));
                 }
                 continue;
@@ -592,7 +607,10 @@ pub fn run_capture_loop(
                         std::thread::sleep((deadline - now).min(Duration::from_millis(50)));
                     }
                     match unsafe { output1.DuplicateOutput(&device) } {
-                        Ok(d) => duplication = Some(d),
+                        Ok(d) => {
+                            duplication = Some(d);
+                            seen_image = false;
+                        }
                         Err(retry_error) => {
                             debug!(error = %retry_error, "DuplicateOutput retry failed");
                             last_code = retry_error.code();

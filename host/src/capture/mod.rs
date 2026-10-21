@@ -95,6 +95,16 @@ impl IdleGate {
     }
 }
 
+/// Whether an acquired frame's desktop surface can be read back. A frame with
+/// no desktop update (`LastPresentTime == 0`) only moves or reshapes the
+/// pointer. Until the duplication has delivered one real image its surface is
+/// blank: on Windows 11 the first frame after DuplicateOutput read back as
+/// black, then became the encoder's startup keyframe and the idle cache.
+#[cfg(any(windows, test))]
+pub(crate) fn frame_has_image(last_present_time: i64, seen_image: bool) -> bool {
+    last_present_time != 0 || seen_image
+}
+
 pub(crate) fn frame_budget_for(target_fps: u32) -> Duration {
     let fps = target_fps.max(1) as u64;
     Duration::from_micros(1_000_000 / fps)
@@ -292,6 +302,17 @@ fn startup_heartbeat(shared: &SharedControl, now_ms: u64) {
     shared.hb_capture_loop_ms.store(now_ms, Ordering::Relaxed);
     shared.hb_capture_frame_ms.store(now_ms, Ordering::Relaxed);
     shared.hb_encode_frame_ms.store(now_ms, Ordering::Relaxed);
+}
+
+/// Nobody is watching, so nothing is captured or encoded on purpose. The
+/// frame and encode timestamps must stay current anyway: the watchdog read
+/// the idle time as a wedge the moment a viewer arrived ("no captured frame
+/// for 17458ms with a client connected", or "encoder silent while capture
+/// advances" right after the first keepalive) and restarted the pipeline
+/// under the new viewer. 0.3.1 had the same race on a static desktop.
+#[cfg(any(windows, test))]
+pub(crate) fn idle_heartbeat(shared: &SharedControl, now_ms: u64) {
+    startup_heartbeat(shared, now_ms);
 }
 
 #[cfg(windows)]
@@ -575,6 +596,102 @@ fn pick_new_virtual_output<'a>(before: &[String], now: &'a [OutputInfo]) -> Opti
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn pointer_only_frames_are_not_read_back_before_the_first_image() {
+        assert!(!frame_has_image(0, false), "blank first frame");
+        assert!(frame_has_image(756_304_210_358, false));
+        // Once an image exists the surface holds it; pointer moves still render.
+        assert!(frame_has_image(0, true));
+    }
+
+    fn connect_viewer(shared: &SharedControl) {
+        use crate::transport::link::PeerId;
+        use crate::transport::session::ConfigSource;
+        use eternal_wire::v2::control::{ControlMessage, Hello2, StreamConfig, CAP_DECODE_H264};
+        struct Config;
+        impl ConfigSource for Config {
+            fn stream_config(&self) -> StreamConfig {
+                StreamConfig {
+                    stream_epoch: 1,
+                    width: 640,
+                    height: 360,
+                    fps: 60,
+                    codec: 0,
+                    flags: 0,
+                    bitrate_bps: 15_000_000,
+                }
+            }
+            fn host_name(&self) -> String {
+                "TEST".into()
+            }
+        }
+        let hello = ControlMessage::Hello2(Hello2 {
+            proto_min: 2,
+            proto_max: 2,
+            client_nonce: 1,
+            listen_port: 50000,
+            decoder_caps: CAP_DECODE_H264,
+            feature_caps: 0,
+            screen_px_w: 2420,
+            screen_px_h: 1668,
+            screen_pt_w: 1210,
+            screen_pt_h: 834,
+            refresh_hz: 60,
+            device_name: "viewer".into(),
+            device_id: 0,
+            preferred_fps: 0,
+            auth_token: [0; 16],
+            pairing_code: 0,
+        });
+        let peer = PeerId::udp(std::net::SocketAddr::from(([10, 0, 0, 2], 50000)));
+        shared
+            .session
+            .lock()
+            .handle_control(peer, 0, hello, &Config, Instant::now());
+        assert!(shared.client_connected());
+    }
+
+    #[test]
+    fn a_viewer_arriving_after_idle_is_not_taken_for_a_wedge() {
+        use crate::supervisor::{wedge_reason_at, Machine};
+        use std::sync::atomic::Ordering;
+        let machine = Machine::new(1);
+        let start_ms = 1_000_000;
+        let arrival_ms = start_ms + 17_458;
+
+        // Without idle heartbeats (the previous loop): only the loop stamp
+        // advanced while nobody watched.
+        let stale = SharedControl::new(0, 1);
+        startup_heartbeat(&stale, start_ms);
+        stale
+            .hb_capture_loop_ms
+            .store(arrival_ms, Ordering::Relaxed);
+        connect_viewer(&stale);
+        let reason = wedge_reason_at(&stale, &machine, arrival_ms).unwrap();
+        assert!(reason.starts_with("no captured frame"), "{reason}");
+        // The first keepalive refreshes the frame stamp before the encoder
+        // has output anything.
+        stale
+            .hb_capture_frame_ms
+            .store(arrival_ms, Ordering::Relaxed);
+        let reason = wedge_reason_at(&stale, &machine, arrival_ms).unwrap();
+        assert!(reason.starts_with("encoder silent"), "{reason}");
+
+        // With idle heartbeats the arrival is healthy at every step.
+        let idle = SharedControl::new(0, 1);
+        startup_heartbeat(&idle, start_ms);
+        let mut now = start_ms;
+        while now < arrival_ms {
+            now += 50;
+            idle_heartbeat(&idle, now);
+        }
+        connect_viewer(&idle);
+        assert_eq!(wedge_reason_at(&idle, &machine, arrival_ms), None);
+        idle.hb_capture_frame_ms
+            .store(arrival_ms + 10, Ordering::Relaxed);
+        assert_eq!(wedge_reason_at(&idle, &machine, arrival_ms + 10), None);
+    }
 
     #[test]
     fn an_unwatched_desktop_is_acquired_once_a_second_and_never_encoded() {
