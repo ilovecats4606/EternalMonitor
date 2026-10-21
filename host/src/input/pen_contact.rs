@@ -202,6 +202,36 @@ impl PenContact {
         }
     }
 
+    /// The session ended or was taken over: drop samples Windows never
+    /// received, and end only the pointer it holds, where it holds it. If
+    /// Windows is still refusing a frame, recreate the device rather than
+    /// send it a different one.
+    pub fn reset(&mut self, target: &mut impl PenTarget) {
+        if !self.queue.is_empty() {
+            self.queue.clear();
+            target.recreate();
+            self.state = PointerState::Out;
+            return;
+        }
+        let end = match self.state {
+            PointerState::Out => return,
+            PointerState::Contact(last) => PenSample {
+                phase: PenPhase::Cancel,
+                pressure: 0,
+                ..last
+            },
+            PointerState::Hover(last) => PenSample {
+                phase: PenPhase::Leave,
+                pressure: 0,
+                ..last
+            },
+        };
+        if self.end(end, target) == Outcome::NotReady {
+            target.recreate();
+            self.state = PointerState::Out;
+        }
+    }
+
     fn enqueue(&mut self, sample: PenSample) {
         let update = |sample: &PenSample| matches!(sample.phase, PenPhase::Move | PenPhase::Hover);
         let waiting = self.queue.len() > 1;
@@ -924,7 +954,7 @@ mod tests {
     #[test]
     fn random_strokes_end_every_contact_in_order_on_the_current_display() {
         // Relay-shaped streams with Windows not ready at random, refresh
-        // ticks between samples, and the captured display moving or the
+        // ticks between samples, session resets, and the captured display moving or the
         // virtual screen changing, sometimes leaving where Windows last saw
         // the pen off the screen.
         let rect = |left, top, width, height| CaptureGeometry {
@@ -993,6 +1023,15 @@ mod tests {
                     ..pen(phase, x, y)
                 };
                 last = Some(sample);
+                if flaky.rng.below(30) == 0 {
+                    // The session ends; the next one starts out of range.
+                    contact.reset(&mut flaky);
+                    assert!(contact.pending().is_none());
+                    assert_eq!(flaky.windows.state, PointerKind::Out);
+                    intent = PointerKind::Out;
+                    last = None;
+                    continue;
+                }
                 contact.deliver(sample, Some(output), &mut flaky);
                 if flaky.rng.below(2) == 0 {
                     contact.flush(Some(output), &mut flaky);
@@ -1116,5 +1155,73 @@ mod tests {
                 F(Down, 20, 20, Injected),
             ]
         );
+    }
+
+    #[test]
+    fn a_session_reset_drops_unsent_samples_and_ends_only_what_windows_holds() {
+        let off_screen = VirtualScreen {
+            left: -2360,
+            top: 0,
+            width: 4920,
+            height: 1640,
+        };
+        let reset = |setup: &dyn Fn(&mut PenContact, &mut FakeWindows)| {
+            let (mut contact, mut windows) = (PenContact::default(), FakeWindows::default());
+            setup(&mut contact, &mut windows);
+            windows.take();
+            contact.reset(&mut windows);
+            let seen = windows.take();
+            // Nothing from the old session reaches Windows afterwards.
+            contact.flush(Some(OUTPUT), &mut windows);
+            assert!(windows.take().is_empty());
+            assert!(contact.pending().is_none());
+            assert_eq!(windows.state, PointerKind::Out);
+            assert!(windows.illegal.is_empty());
+            seen
+        };
+        // The reviewer's case: a whole stroke Windows was never ready for.
+        // Windows holds nothing, but a new device keeps the next session
+        // from sending something other than the refused down.
+        let unsent = reset(&|contact, windows| {
+            windows.not_ready = usize::MAX;
+            deliver(contact, windows, pen(Down, 10, 10));
+            deliver(contact, windows, pen(Up, 10, 10));
+            windows.not_ready = 0;
+        });
+        assert_eq!(unsent, [Recreated]);
+        let idle = reset(&|_, _| {});
+        assert_eq!(idle, []);
+        let held = reset(&|contact, windows| deliver(contact, windows, pen(Down, 10, 10)));
+        assert_eq!(held, [F(Cancel, 10, 10, Injected)]);
+        let hovering = reset(&|contact, windows| deliver(contact, windows, pen(Hover, 10, 10)));
+        assert_eq!(hovering, [F(Leave, 10, 10, Injected)]);
+        // Windows holds the contact but is refusing a later frame: no other
+        // frame may replace that one.
+        let stuck = reset(&|contact, windows| {
+            deliver(contact, windows, pen(Down, 10, 10));
+            windows.not_ready = 1;
+            deliver(contact, windows, pen(Move, 20, 10));
+        });
+        assert_eq!(stuck, [Recreated]);
+        let moved_away = reset(&|contact, windows| {
+            windows.screen = VirtualScreen {
+                left: 0,
+                ..off_screen
+            };
+            deliver(contact, windows, pen(Down, 3739, 819));
+            windows.screen = off_screen;
+            windows.display_changed();
+        });
+        assert_eq!(moved_away, [Recreated]);
+        let refused = reset(&|contact, windows| {
+            deliver(contact, windows, pen(Down, 10, 10));
+            windows.refuse = 1;
+        });
+        assert_eq!(refused, [F(Cancel, 10, 10, Rejected), Recreated]);
+        let not_ready = reset(&|contact, windows| {
+            deliver(contact, windows, pen(Down, 10, 10));
+            windows.not_ready = 1;
+        });
+        assert_eq!(not_ready, [F(Cancel, 10, 10, NotReady), Recreated]);
     }
 }

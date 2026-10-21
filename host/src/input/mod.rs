@@ -548,6 +548,18 @@ impl InputRelay {
     /// Release keys/buttons when a session ends, expires, or is superseded.
     pub fn reset(&mut self) {
         let releases = self.held.release();
+        // The native device ends only the pointer Windows holds and drops
+        // samples Windows never received, which a release would queue behind.
+        #[cfg(windows)]
+        let releases: Vec<_> = if self.pen_device.available() {
+            self.pen_device.reset();
+            releases
+                .into_iter()
+                .filter(|injection| !matches!(injection, Injection::Pen(_)))
+                .collect()
+        } else {
+            releases
+        };
         self.inject(&releases);
         self.session = None;
         self.pen_sequence = None;
@@ -1578,6 +1590,7 @@ mod tests {
         screen: VirtualScreen,
         outcome: pen_contact::Outcome,
         frames: Vec<pen_contact::PointerFrame>,
+        recreated: usize,
     }
 
     #[cfg(not(windows))]
@@ -1597,7 +1610,7 @@ mod tests {
         }
 
         fn recreate(&mut self) {
-            panic!("no pointer to end off the screen");
+            self.recreated += 1;
         }
     }
 
@@ -1617,6 +1630,7 @@ mod tests {
             screen,
             outcome,
             frames: Vec::new(),
+            recreated: 0,
         };
         if tick {
             contact.flush(Some(output), &mut target);
@@ -1627,6 +1641,7 @@ mod tests {
             };
             contact.deliver(sample, Some(output), &mut target);
         }
+        assert_eq!(target.recreated, 0);
         target.frames
     }
 
@@ -1693,5 +1708,68 @@ mod tests {
             ]
         );
         assert!(contact.pending().is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_stroke_windows_never_received_is_not_sent_after_the_session_ends() {
+        // The reviewer's case, through the relay. On Windows the relay's
+        // reset resets the pen device, as `reset_like_windows` does here.
+        use pen_contact::{Outcome, PenContact};
+        let reset_like_windows = |contact: &mut PenContact| {
+            let mut target = RecordingTarget {
+                screen: SINGLE_SCREEN,
+                outcome: Outcome::Injected,
+                frames: Vec::new(),
+                recreated: 0,
+            };
+            contact.reset(&mut target);
+            (target.frames, target.recreated)
+        };
+        for takeover in [false, true] {
+            let mut relay = InputRelay::default();
+            let mut contact = PenContact::default();
+            let mut e = event(KIND_PENCIL, PHASE_BEGAN, 32_768, 32_768);
+            e.input_ver = 2;
+            relay.relay(7, &e, OUTPUT);
+            inject_like_windows(
+                &mut contact,
+                OUTPUT,
+                SINGLE_SCREEN,
+                Outcome::NotReady,
+                false,
+            );
+            e.event_id = 2;
+            e.phase = PHASE_ENDED;
+            relay.relay(7, &e, OUTPUT);
+            inject_like_windows(
+                &mut contact,
+                OUTPUT,
+                SINGLE_SCREEN,
+                Outcome::NotReady,
+                false,
+            );
+            if takeover {
+                // A new session's first event resets the old one.
+                let hover = event(KIND_HOVER, PHASE_MOVED, 0, 0);
+                relay.relay(8, &hover, OUTPUT);
+                assert!(matches!(
+                    recorder::take().as_slice(),
+                    [Injection::MoveAbs { .. }]
+                ));
+            } else {
+                relay.reset();
+                assert!(recorder::take().is_empty(), "the relay holds no pen");
+            }
+            // Windows never accepted the down, so nothing is ended; a fresh
+            // device replaces the one still refusing it.
+            assert_eq!(reset_like_windows(&mut contact), (Vec::new(), 1));
+            let replayed =
+                inject_like_windows(&mut contact, OUTPUT, SINGLE_SCREEN, Outcome::Injected, true);
+            assert!(
+                replayed.is_empty(),
+                "replayed after session reset: {replayed:?}"
+            );
+        }
     }
 }

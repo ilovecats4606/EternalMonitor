@@ -149,6 +149,21 @@ impl PenDevice {
         self.contact.deliver(sample, context.output, &mut target);
     }
 
+    /// The session ended or was taken over; see `PenContact::reset`.
+    pub fn reset(&mut self) {
+        if !self.available() {
+            return;
+        }
+        let mut target = Target {
+            device: &mut self.device,
+            context: FrameContext {
+                screen: virtual_screen(),
+                output: None,
+            },
+        };
+        self.contact.reset(&mut target);
+    }
+
     /// Deliver samples Windows was not ready for, mapped onto `output`, the
     /// current capture rect. Called on every refresh tick.
     pub fn flush(&mut self, output: Option<CaptureGeometry>) {
