@@ -3,7 +3,7 @@
 //! crashes releases it.
 
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io;
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -37,6 +37,15 @@ pub(crate) fn lock(path: &Path, wait: Duration, mut waiting: impl FnMut()) -> io
     }
 }
 
+impl Locked {
+    pub(crate) fn write(&mut self, text: &str) -> io::Result<()> {
+        self.0.set_len(0)?;
+        self.0.seek(SeekFrom::Start(0))?;
+        self.0.write_all(text.as_bytes())?;
+        self.0.sync_data()
+    }
+}
+
 /// Unlock explicitly: on Unix a child being started at that moment can still
 /// share the handle, and with it the lock.
 impl Drop for Locked {
@@ -59,13 +68,15 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let first = lock(&path, Duration::ZERO, || {}).unwrap();
+        let mut first = lock(&path, Duration::ZERO, || {}).unwrap();
+        first.write("owner").unwrap();
         let mut waited = 0;
         let second = lock(&path, Duration::from_millis(100), || waited += 1);
         assert_eq!(second.err().unwrap().kind(), io::ErrorKind::TimedOut);
         assert!(waited > 0);
         drop(first);
         drop(lock(&path, Duration::ZERO, || {}).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "owner");
         std::fs::remove_file(path).unwrap();
     }
 }

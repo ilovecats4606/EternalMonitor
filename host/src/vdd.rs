@@ -98,7 +98,9 @@ fn run_task(task: &str, mut progress: impl FnMut()) -> bool {
 pub(crate) fn set_enabled(enabled: bool, progress: impl FnMut()) -> bool {
     #[cfg(windows)]
     {
-        run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress)
+        crate::startup::display::change(enabled, progress, |progress| {
+            run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress)
+        })
     }
     #[cfg(not(windows))]
     {
