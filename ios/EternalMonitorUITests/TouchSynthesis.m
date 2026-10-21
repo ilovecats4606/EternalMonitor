@@ -38,3 +38,24 @@ void EMSwipeTwoFingers(CGPoint start, CGFloat distance,
     }
     [[XCUIDevice.sharedDevice eventSynthesizer] synthesizeEvent:record completion:completion];
 }
+
+void EMTapFingers(NSArray<NSValue *> *points,
+                  void (^completion)(BOOL, NSError *)) {
+    Class pathClass = NSClassFromString(@"XCPointerEventPath");
+    Class recordClass = NSClassFromString(@"XCSynthesizedEventRecord");
+    if (![pathClass instancesRespondToSelector:@selector(initForTouchAtPoint:offset:)] ||
+        ![recordClass instancesRespondToSelector:@selector(initWithName:interfaceOrientation:)] ||
+        ![XCUIDevice.sharedDevice respondsToSelector:@selector(eventSynthesizer)]) {
+        completion(NO, [NSError errorWithDomain:@"EMTouchSynthesis" code:1 userInfo:@{
+            NSLocalizedDescriptionKey: @"This XCTest runtime cannot synthesize a multi-finger tap"}]);
+        return;
+    }
+    id record = [[recordClass alloc] initWithName:@"Multi-finger tap"
+                           interfaceOrientation:UIInterfaceOrientationPortrait];
+    for (NSValue *point in points) {
+        id path = [[pathClass alloc] initForTouchAtPoint:point.CGPointValue offset:0];
+        [path liftUpAtOffset:0.1];
+        [record addPointerEventPath:path];
+    }
+    [[XCUIDevice.sharedDevice eventSynthesizer] synthesizeEvent:record completion:completion];
+}
