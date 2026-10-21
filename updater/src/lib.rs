@@ -1,19 +1,32 @@
 //! EternalMonitor-updater.exe, the native helper that installs an update.
 //!
-//! The host downloads and verifies EternalMonitor-Setup.exe, copies this
-//! helper out of the install folder (Setup replaces that folder), starts it and
-//! waits for [`READY`]. Before saying it, the helper opens the installer so no
-//! other process can write, rename or delete it, and checks its SHA-256 from
-//! that open handle. It keeps the handle until Setup has finished, so the
-//! bytes it checked are the bytes Windows runs, including Setup's elevated
-//! restart. After [`READY`] the host closes; from then on every path, failures
-//! included, ends by starting the installed app again.
+//! The host downloads and verifies EternalMonitor-Setup.exe into a fresh
+//! update folder, copies this helper there (Setup replaces the install folder),
+//! starts it suspended, checks it is the copy it verified, and waits for
+//! [`READY`]. Before saying it, the helper pins the update folder (no links
+//! anywhere on its path), opens the installer so no other process can write,
+//! rename or delete it, checks its SHA-256 from that open handle, and opens
+//! the host process so it can wait for that exact process to exit. It keeps the
+//! installer open until Setup has finished and starts Setup suspended, letting
+//! it run only if Windows mapped that very file. After [`READY`] the host
+//! closes; from then on every path, failures included, ends with the
+//! installed app running again.
+//!
+//! Threat model (SECURITY.md): network attackers are fully covered by HTTPS,
+//! the host allowlist and pinned hashes. Against malware already running as
+//! the same user this is defense in depth, not a promise to win every race:
+//! Microsoft does not treat UAC as a security boundary, and such malware can
+//! ask for elevation itself.
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub mod sha256;
+#[cfg(windows)]
+pub mod win;
 
 /// The line the helper prints once the installer is locked and verified.
 pub const READY: &str = "ready";
@@ -111,21 +124,7 @@ pub fn open_locked(path: &Path) -> io::Result<File> {
 /// SHA-256 of the whole file, read through `file` itself.
 pub fn sha256_hex(file: &mut File) -> io::Result<String> {
     file.seek(SeekFrom::Start(0))?;
-    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
-    let mut buffer = vec![0u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    Ok(digest
-        .finish()
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+    sha256::of_reader(&mut *file)
 }
 
 /// The locked installer, or why it may not run.
@@ -139,11 +138,19 @@ pub fn open_verified(path: &Path, sha256: &str) -> Result<File, String> {
     Ok(file)
 }
 
+/// What waiting for the host to close found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HostExit {
+    Closed,
+    StillRunning,
+}
+
 /// Runs the helper. Returns its exit code; `out` is the pipe to the host.
 pub fn run(args: HelperArgs, out: &mut dyn Write) -> i32 {
     let mut log = Log::open(&args.log);
-    let installer = match open_verified(&args.installer, &args.sha256) {
-        Ok(file) => file,
+    let prepared = prepare(&args);
+    let (installer, host) = match prepared {
+        Ok(ready) => ready,
         Err(error) => {
             // The host is still open and shows the failure; nothing to relaunch.
             log.note(&format!("refused: {error}"));
@@ -157,9 +164,16 @@ pub fn run(args: HelperArgs, out: &mut dyn Write) -> i32 {
         return 4;
     }
     let installed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        wait_for_exit(args.host_pid, HOST_EXIT_WAIT);
-        log.note("EternalMonitor closed");
-        run_setup(&args, &installer)
+        match host.wait(HOST_EXIT_WAIT) {
+            HostExit::Closed => log.note("EternalMonitor closed"),
+            HostExit::StillRunning => {
+                // Setup would close it mid-use or fail on its files. Leave
+                // the running app alone; its next start reports the update
+                // did not finish.
+                return Err("EternalMonitor did not close; not installing".to_string());
+            }
+        }
+        run_setup(&args, &installer.file)
     }));
     match installed {
         Ok(Ok(code)) => log.note(&format!("Setup exit code {code}")),
@@ -167,7 +181,8 @@ pub fn run(args: HelperArgs, out: &mut dyn Write) -> i32 {
         Err(_) => log.note("the helper failed while installing"),
     }
     drop(installer);
-    // Whatever happened, the user gets EternalMonitor back.
+    // Whatever happened, the user gets EternalMonitor back. If the old host
+    // is somehow still running, the new start just shows its window.
     match relaunch(&args.app) {
         Ok(()) => {
             log.note("EternalMonitor started");
@@ -180,80 +195,120 @@ pub fn run(args: HelperArgs, out: &mut dyn Write) -> i32 {
     }
 }
 
-fn run_setup(args: &HelperArgs, installer: &File) -> Result<i32, String> {
-    let setup_log = args.log.with_file_name("setup.log");
-    let mut command = Command::new(&args.installer);
-    command.args(SETUP_FLAGS);
+/// The verified installer, kept open with the pinned folder that holds it.
+struct Installer {
+    file: File,
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.raw_arg(format!("/LOG=\"{}\"", setup_log.display()));
-    }
-    #[cfg(not(windows))]
-    command.arg(format!("/LOG={}", setup_log.display()));
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("cannot start Setup: {error}"))?;
-    if let Err(error) = same_image(&child, installer) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
-    }
-    let status = child
-        .wait()
-        .map_err(|error| format!("cannot wait for Setup: {error}"))?;
-    Ok(status.code().unwrap_or(-1))
+    _folder: std::os::windows::io::OwnedHandle,
 }
 
-/// Windows starts programs by path. Make sure the process it started is the
-/// file this helper holds locked, not something put at that path since.
-#[cfg(windows)]
-fn same_image(child: &std::process::Child, installer: &File) -> Result<(), String> {
-    use std::os::windows::io::AsRawHandle;
-    use windows::core::PWSTR;
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED};
-    use windows::Win32::System::Threading::{QueryFullProcessImageNameW, PROCESS_NAME_WIN32};
-
-    let mut locked = vec![0u16; 32_768];
-    let length = unsafe {
-        GetFinalPathNameByHandleW(
-            HANDLE(installer.as_raw_handle()),
-            &mut locked,
-            FILE_NAME_NORMALIZED,
-        )
-    } as usize;
-    if length == 0 || length >= locked.len() {
-        return Err("cannot read the installer's path".into());
-    }
-    let mut image = vec![0u16; 32_768];
-    let mut size = image.len() as u32;
-    unsafe {
-        QueryFullProcessImageNameW(
-            HANDLE(child.as_raw_handle()),
-            PROCESS_NAME_WIN32,
-            PWSTR(image.as_mut_ptr()),
-            &mut size,
-        )
-    }
-    .map_err(|error| format!("cannot read Setup's path: {error}"))?;
-    let normal = |wide: &[u16]| {
-        let text = String::from_utf16_lossy(wide).to_lowercase();
-        text.strip_prefix(r"\\?\")
-            .map(str::to_string)
-            .unwrap_or(text)
+/// Everything the helper checks before it may say [`READY`].
+fn prepare(args: &HelperArgs) -> Result<(Installer, Host), String> {
+    #[cfg(windows)]
+    let folder = {
+        let dir = args
+            .installer
+            .parent()
+            .ok_or("the installer has no folder")?;
+        win::pin_dir(dir)?
     };
-    let (locked, image) = (normal(&locked[..length]), normal(&image[..size as usize]));
-    if locked == image {
-        Ok(())
-    } else {
-        Err(format!("Setup started from {image}, not {locked}"))
+    let file = open_verified(&args.installer, &args.sha256)?;
+    let host = Host::open(args.host_pid)
+        .map_err(|error| format!("cannot watch EternalMonitor: {error}"))?;
+    Ok((
+        Installer {
+            file,
+            #[cfg(windows)]
+            _folder: folder,
+        },
+        host,
+    ))
+}
+
+/// The host process, opened while it is still waiting for [`READY`].
+struct Host {
+    #[cfg(windows)]
+    process: std::os::windows::io::OwnedHandle,
+    #[cfg(not(windows))]
+    pid: u32,
+}
+
+impl Host {
+    #[cfg(windows)]
+    fn open(pid: u32) -> io::Result<Self> {
+        Ok(Self {
+            process: win::open_process(pid)?,
+        })
     }
+
+    #[cfg(not(windows))]
+    fn open(pid: u32) -> io::Result<Self> {
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { pid })
+    }
+
+    #[cfg(windows)]
+    fn wait(&self, timeout: Duration) -> HostExit {
+        match win::wait(&self.process, Some(timeout)) {
+            Some(_) => HostExit::Closed,
+            None => HostExit::StillRunning,
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn wait(&self, timeout: Duration) -> HostExit {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            // A zombie child of ours also counts as closed.
+            let gone = unsafe { libc::kill(self.pid as libc::pid_t, 0) } != 0
+                || unsafe {
+                    libc::waitpid(self.pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG)
+                } == self.pid as libc::pid_t;
+            if gone {
+                return HostExit::Closed;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        HostExit::StillRunning
+    }
+}
+
+/// Setup's command line: the program, the silent flags and its log.
+pub fn setup_command_line(installer: &Path, log: &Path) -> String {
+    let mut line = format!("\"{}\"", installer.display());
+    for flag in SETUP_FLAGS {
+        line.push(' ');
+        line.push_str(flag);
+    }
+    line.push_str(&format!(
+        " /LOG=\"{}\"",
+        log.with_file_name("setup.log").display()
+    ));
+    line
+}
+
+#[cfg(windows)]
+fn run_setup(args: &HelperArgs, installer: &File) -> Result<i32, String> {
+    let command = setup_command_line(&args.installer, &args.log);
+    let process = win::start_verified(&args.installer, &command, installer, 0, None)?;
+    win::wait(&process, None)
+        .map(|code| code as i32)
+        .ok_or_else(|| "cannot wait for Setup".to_string())
 }
 
 #[cfg(not(windows))]
-fn same_image(_child: &std::process::Child, _installer: &File) -> Result<(), String> {
-    Ok(())
+fn run_setup(args: &HelperArgs, _installer: &File) -> Result<i32, String> {
+    let status = Command::new(&args.installer)
+        .args(SETUP_FLAGS)
+        .arg(format!(
+            "/LOG={}",
+            args.log.with_file_name("setup.log").display()
+        ))
+        .status()
+        .map_err(|error| format!("cannot start Setup: {error}"))?;
+    Ok(status.code().unwrap_or(-1))
 }
 
 fn relaunch(app: &Path) -> io::Result<()> {
@@ -262,29 +317,6 @@ fn relaunch(app: &Path) -> io::Result<()> {
         command.current_dir(dir);
     }
     command.spawn().map(drop)
-}
-
-#[cfg(windows)]
-fn wait_for_exit(pid: u32, timeout: Duration) {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{
-        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
-    };
-    // Already gone if it cannot be opened.
-    if let Ok(process) = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) } {
-        unsafe {
-            WaitForSingleObject(process, timeout.as_millis() as u32);
-            let _ = CloseHandle(process);
-        }
-    }
-}
-
-#[cfg(not(windows))]
-fn wait_for_exit(pid: u32, timeout: Duration) {
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout && unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
-        std::thread::sleep(Duration::from_millis(100));
-    }
 }
 
 /// Lines in update.log next to the installer, for Copy logs and support.
@@ -343,6 +375,41 @@ mod tests {
         missing.truncate(8);
         assert!(HelperArgs::parse(missing).is_err());
         assert!(HelperArgs::parse(vec!["--other".into(), "x".into()]).is_err());
+    }
+
+    #[test]
+    fn setup_runs_quoted_with_silent_flags_and_a_log() {
+        let dir = Path::new("A B").join("updates").join("0a1b");
+        let installer = dir.join("EternalMonitor-Setup-0.3.2.exe");
+        let line = setup_command_line(&installer, &dir.join("update.log"));
+        let expected = format!(
+            "\"{}\" /SP- /SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /NORESTARTAPPLICATIONS /LOG=\"{}\"",
+            installer.display(),
+            dir.join("setup.log").display()
+        );
+        assert_eq!(line, expected);
+        assert!(
+            !line.contains("/VERYSILENT"),
+            "people see a progress window"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_host_that_does_not_close_is_reported_not_ignored() {
+        let mut stuck = Command::new("sleep").arg("30").spawn().unwrap();
+        let host = Host::open(stuck.id()).unwrap();
+        assert_eq!(
+            host.wait(Duration::from_millis(300)),
+            HostExit::StillRunning
+        );
+        stuck.kill().unwrap();
+        stuck.wait().unwrap();
+        assert_eq!(host.wait(Duration::from_millis(300)), HostExit::Closed);
+        assert!(
+            Host::open(999_999).is_err(),
+            "a missing host is an error, not 'closed'"
+        );
     }
 
     #[test]

@@ -383,6 +383,7 @@ impl AnalyzerApp {
             let ctx = cc.egui_ctx.clone();
             crate::updates::Updater::start(
                 persisted.check_for_updates,
+                control.shared.session.clone(),
                 std::sync::Arc::new(move |version: Option<&str>| {
                     if let Some(version) = version {
                         update_toast::show(&ctx, version);

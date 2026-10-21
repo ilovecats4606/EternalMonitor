@@ -479,24 +479,24 @@ pub fn stage_helper(source: &Path, dir: &Path) -> Result<(PathBuf, std::fs::File
 
 /// Waits for the helper's `ready`: it holds the verified installer and owns
 /// the relaunch. Anything else (it exits, reports an error or stays silent)
-/// means this process must stay open.
-pub fn await_ready(mut child: std::process::Child, timeout: Duration) -> Result<(), UpdateError> {
+/// means this process must stay open; `stop` ends the helper then.
+pub fn await_ready(
+    stdout: impl std::io::Read + Send + 'static,
+    timeout: Duration,
+    stop: impl FnOnce(),
+) -> Result<(), UpdateError> {
     use std::io::BufRead;
-    let stdout = child.stdout.take();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut line = String::new();
-        if let Some(stdout) = stdout {
-            let _ = std::io::BufReader::new(stdout).read_line(&mut line);
-        }
+        let _ = std::io::BufReader::new(stdout).read_line(&mut line);
         let _ = tx.send(line.trim().to_string());
     });
     let line = rx.recv_timeout(timeout).unwrap_or_default();
     if line == eternal_updater::READY {
         return Ok(());
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    stop();
     tracing::warn!(%line, "The update helper did not start the update");
     if line.contains("SHA-256") {
         Err(UpdateError::UnsafeDownload(line))
@@ -513,7 +513,11 @@ fn start_install(setup: &Path, release: &Release) -> Result<(), UpdateError> {
     let app = std::env::current_exe().map_err(|e| launch(&e))?;
     let source = installed_helper(&app).ok_or_else(|| launch(&"the update helper is missing"))?;
     let dir = setup.parent().ok_or_else(|| launch(&"no update folder"))?;
-    let (helper, _held) = stage_helper(&source, dir)?;
+    // The update folder and every folder above it must be real folders; the
+    // folder stays pinned while the helper starts. (Threat model: SECURITY.md.)
+    #[cfg(windows)]
+    let _folder = eternal_updater::win::pin_dir(dir).map_err(UpdateError::UnsafeDownload)?;
+    let (helper, held) = stage_helper(&source, dir)?;
     let args = eternal_updater::HelperArgs {
         installer: setup.to_path_buf(),
         sha256: release.sha256.clone(),
@@ -521,30 +525,96 @@ fn start_install(setup: &Path, release: &Release) -> Result<(), UpdateError> {
         host_pid: std::process::id(),
         log: dir.join("update.log"),
     };
-    let spawn = |flags: u32| {
-        let mut command = std::process::Command::new(&helper);
-        command
-            .args(args.to_args())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(flags);
-        }
-        #[cfg(not(windows))]
-        let _ = flags;
-        command.spawn()
-    };
+    spawn_helper(&helper, &held, &args)
+}
+
+/// Starts the staged helper suspended and lets it run only if Windows mapped
+/// the copy `held` is open on; then waits for its `ready`.
+#[cfg(windows)]
+fn spawn_helper(
+    helper: &Path,
+    held: &std::fs::File,
+    args: &eternal_updater::HelperArgs,
+) -> Result<(), UpdateError> {
     // The helper must outlive this process. Leave our job object when the
     // job allows it (CREATE_BREAKAWAY_FROM_JOB); otherwise stay in it.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-    let child = spawn(CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB)
-        .or_else(|_| spawn(CREATE_NEW_PROCESS_GROUP))
-        .map_err(|e| launch(&e))?;
-    await_ready(child, HELPER_READY)
+    let line = helper_command_line(helper, args);
+    let flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
+    let (process, stdout) = eternal_updater::win::spawn_verified_piped(
+        helper,
+        &line,
+        held,
+        flags | CREATE_BREAKAWAY_FROM_JOB,
+    )
+    .or_else(|_| eternal_updater::win::spawn_verified_piped(helper, &line, held, flags))
+    .map_err(UpdateError::Launch)?;
+    await_ready(stdout, HELPER_READY, move || {
+        eternal_updater::win::terminate(&process);
+    })
+}
+
+#[cfg(not(windows))]
+fn spawn_helper(
+    helper: &Path,
+    _held: &std::fs::File,
+    args: &eternal_updater::HelperArgs,
+) -> Result<(), UpdateError> {
+    let mut child = std::process::Command::new(helper)
+        .args(args.to_args())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| UpdateError::Launch(e.to_string()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| UpdateError::Launch("no pipe".into()))?;
+    await_ready(stdout, HELPER_READY, move || {
+        let _ = child.kill();
+        let _ = child.wait();
+    })
+}
+
+/// The helper's Windows command line: its own name, then each argument quoted
+/// the way the CRT splits them.
+pub fn helper_command_line(helper: &Path, args: &eternal_updater::HelperArgs) -> String {
+    let mut line = quote_arg(&helper.display().to_string());
+    for arg in args.to_args() {
+        line.push(' ');
+        line.push_str(&quote_arg(&arg.to_string_lossy()));
+    }
+    line
+}
+
+/// Quotes one argument for the Windows CRT's command-line parser.
+fn quote_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_string();
+    }
+    let mut out = String::from("\"");
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.push_str(&"\\".repeat(backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.push_str(&"\\".repeat(backslashes));
+                out.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    out.push_str(&"\\".repeat(backslashes * 2));
+    out.push('"');
+    out
 }
 
 // ── State ───────────────────────────────────────────────────────────────────
@@ -863,6 +933,16 @@ impl State {
         Some((path, release))
     }
 
+    /// A stream started before the handoff: wait for it again, keeping the
+    /// verified download, and don't report an update as pending.
+    fn requeue(&mut self, path: PathBuf) {
+        if self.phase == Phase::Installing {
+            self.phase = Phase::Queued(Some(path));
+            self.idle_since = None;
+            self.saved.pending = None;
+        }
+    }
+
     /// The helper said `ready`.
     fn install_started(&mut self) {
         if self.phase == Phase::Installing {
@@ -1025,6 +1105,10 @@ fn changing<T>(
 /// Called when something changed; `Some(version)` asks for a notification.
 pub type Wake = Arc<dyn Fn(Option<&str>) + Send + Sync>;
 
+/// The streaming session, shared with transport. The update handoff is
+/// decided under its lock so a client can't start streaming in between.
+pub type SharedSession = Arc<Mutex<crate::transport::session::Session>>;
+
 pub struct Updater {
     state: Arc<Mutex<State>>,
     path: Option<PathBuf>,
@@ -1032,7 +1116,7 @@ pub struct Updater {
 }
 
 impl Updater {
-    pub fn start(auto: bool, wake: Wake) -> Self {
+    pub fn start(auto: bool, session: SharedSession, wake: Wake) -> Self {
         let path = state_path();
         let saved = load(path.as_deref());
         let state = Arc::new(Mutex::new(State::new(
@@ -1049,6 +1133,7 @@ impl Updater {
             state: state.clone(),
             path: path.clone(),
             endpoints: Endpoints::from_env(),
+            session,
             wake,
         };
         if let Err(error) = std::thread::Builder::new()
@@ -1142,6 +1227,7 @@ struct Worker {
     state: Arc<Mutex<State>>,
     path: Option<PathBuf>,
     endpoints: Endpoints,
+    session: SharedSession,
     wake: Wake,
 }
 
@@ -1187,14 +1273,7 @@ impl Worker {
                     (self.wake)(None);
                 }
                 Command::Install(path, release) => {
-                    let result = start_install(&path, &release);
-                    self.update(|state| match &result {
-                        Ok(()) => {
-                            tracing::info!(version = %release.version, "Update helper took over; closing");
-                            state.install_started();
-                        }
-                        Err(error) => state.install_failed(error),
-                    });
+                    self.install(&path, &release);
                     (self.wake)(None);
                 }
             }
@@ -1203,6 +1282,33 @@ impl Worker {
 
     fn update<T>(&self, change: impl FnOnce(&mut State) -> T) -> T {
         changing(&self.state, self.path.as_deref(), change)
+    }
+
+    /// Hands over to the helper without cutting a stream. Under the session
+    /// lock: either a client is already streaming (go back to waiting), or new
+    /// clients are refused until the host closes or the handoff fails.
+    fn install(&self, path: &Path, release: &Release) {
+        let started = {
+            let mut session = self.session.lock();
+            session.begin_update()
+        };
+        if !started {
+            tracing::info!(
+                "An iPad connected before the update started; waiting for the stream to stop"
+            );
+            self.update(|state| state.requeue(path.to_path_buf()));
+            return;
+        }
+        match start_install(path, release) {
+            Ok(()) => {
+                tracing::info!(version = %release.version, "Update helper took over; closing");
+                self.update(State::install_started);
+            }
+            Err(error) => {
+                self.session.lock().end_update();
+                self.update(|state| state.install_failed(&error));
+            }
+        }
     }
 }
 

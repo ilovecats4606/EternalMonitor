@@ -36,12 +36,24 @@ fn case(name: &str, installer: &str) -> Case {
             installer: setup,
             sha256,
             app,
-            // A host process that does not exist, as after it closed.
-            host_pid: 999_999,
+            // A host that closes on its own shortly after the helper starts.
+            host_pid: closing_host(),
             log: dir.join("update.log"),
         },
         dir,
     }
+}
+
+/// A stand-in host that exits a moment after the helper opens it.
+fn closing_host() -> u32 {
+    let child = Command::new("sleep").arg("0.5").spawn().unwrap();
+    let pid = child.id();
+    // Reap it in the background so it doesn't linger as a zombie.
+    std::thread::spawn(move || {
+        let mut child = child;
+        let _ = child.wait();
+    });
+    pid
 }
 
 /// Starts the helper, returns its first line and exit code.
@@ -107,6 +119,16 @@ fn a_setup_that_cannot_start_still_brings_the_app_back() {
     assert!(wait_for(&c.dir.join("relaunched")));
     let log = std::fs::read_to_string(&c.args.log).unwrap();
     assert!(log.contains("Setup did not run"), "{log}");
+}
+
+#[test]
+fn a_host_that_is_already_gone_is_refused_before_ready() {
+    let mut c = case("gone", "touch \"$(dirname \"$0\")/ran\"");
+    c.args.host_pid = 999_999;
+    let (line, code) = run(&c);
+    assert!(line.starts_with("error:"), "{line}");
+    assert_eq!(code, 3);
+    assert!(!c.dir.join("ran").exists());
 }
 
 #[test]

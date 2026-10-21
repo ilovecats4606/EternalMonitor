@@ -676,21 +676,30 @@ fn fake_helper(body: &str) -> std::process::Child {
 }
 
 #[cfg(unix)]
+fn wait_ready(mut child: std::process::Child, timeout: Duration) -> Result<(), UpdateError> {
+    let stdout = child.stdout.take().unwrap();
+    await_ready(stdout, timeout, move || {
+        let _ = child.kill();
+        let _ = child.wait();
+    })
+}
+
+#[cfg(unix)]
 #[test]
 fn the_app_closes_only_after_the_helper_takes_over() {
     let quick = Duration::from_millis(500);
     assert_eq!(
-        await_ready(fake_helper("echo ready; sleep 1"), quick),
+        wait_ready(fake_helper("echo ready; sleep 1"), quick),
         Ok(())
     );
     // Exits without a word, as when a policy blocks the helper.
     assert_eq!(
-        await_ready(fake_helper("exit 1"), quick),
+        wait_ready(fake_helper("exit 1"), quick),
         Err(UpdateError::Launch("the update helper stopped".into()))
     );
     // The installer changed before the helper could lock it.
     assert!(matches!(
-        await_ready(
+        wait_ready(
             fake_helper("echo 'error: installer SHA-256 is 00'; exit 3"),
             quick
         ),
@@ -699,12 +708,60 @@ fn the_app_closes_only_after_the_helper_takes_over() {
     // Silent and still running: it is stopped, and the app stays.
     let stuck = fake_helper("sleep 30");
     let pid = stuck.id() as i32;
-    assert!(await_ready(stuck, quick).is_err());
+    assert!(wait_ready(stuck, quick).is_err());
     assert_ne!(
         unsafe { libc::kill(pid, 0) },
         0,
         "the stuck helper is stopped"
     );
+}
+
+#[test]
+fn helper_arguments_survive_windows_quoting() {
+    let args = eternal_updater::HelperArgs {
+        installer: PathBuf::from(
+            r"C:\Users\A B\AppData\Local\EternalMonitor\updates\0a\EternalMonitor-Setup-0.3.2.exe",
+        ),
+        sha256: "0".repeat(64),
+        app: PathBuf::from(r"C:\Program Files\EternalMonitor\EternalMonitor-host.exe"),
+        host_pid: 42,
+        log: PathBuf::from(r"C:\Users\A B\x\"),
+    };
+    let line = helper_command_line(Path::new(r"C:\u\EternalMonitor-updater.exe"), &args);
+    assert!(
+        line.starts_with(r"C:\u\EternalMonitor-updater.exe --installer "),
+        "{line}"
+    );
+    assert!(
+        line.contains(r#" "C:\Program Files\EternalMonitor\EternalMonitor-host.exe""#),
+        "{line}"
+    );
+    // A trailing backslash is doubled so it doesn't escape the closing quote.
+    assert!(line.ends_with(r#""C:\Users\A B\x\\""#), "{line}");
+    assert_eq!(quote_arg("plain"), "plain");
+    assert_eq!(quote_arg(""), "\"\"");
+    assert_eq!(quote_arg(r#"a"b"#), r#""a\"b""#);
+}
+
+#[test]
+fn a_stream_that_starts_during_the_handoff_sends_the_update_back_to_waiting() {
+    let mut s = state(Saved::default());
+    s.finish_check(1000, false, Ok(release("0.3.2")));
+    s.update_now(false);
+    s.download_finished(Ok(PathBuf::from("setup.exe")));
+    let (path, _) = s.take_ready(false).unwrap();
+    assert_eq!(s.phase, Phase::Installing);
+    // The worker found an iPad had connected; it gives the installer back.
+    s.requeue(path.clone());
+    assert_eq!(s.phase, Phase::Queued(Some(path)));
+    assert_eq!(s.saved.pending, None);
+    assert!(!s.close, "nothing closes");
+    assert_eq!(s.notice(1000), Some(Notice::Queued("0.3.2".into())));
+    // When the stream stops, the same verified download is used again.
+    let start = Instant::now();
+    assert!(s.tick(false, start).is_none());
+    assert!(s.tick(false, start + Duration::from_secs(4)).is_none());
+    assert!(matches!(s.phase, Phase::Ready(_)));
 }
 
 #[test]
