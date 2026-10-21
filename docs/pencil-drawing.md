@@ -87,11 +87,15 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   holds it. If that place is off the virtual screen after a display change,
   Windows refuses the end, or Windows is still refusing another frame, the
   host recreates its pen device instead, which ends the pointer.
-- If Windows refuses to create the pen device, Pencil samples become mouse
-  input, without pressure or tilt. The host asks again at the next pen down
-  or hover, at most once a second, and logs the first refusal and the
-  recovery once each. Sessions are still offered native pen input meanwhile,
-  so Drawing mode keeps sending Pencil samples that can recover the device.
+- If Windows refuses to recreate the pen device after the transport started
+  with one, Pencil samples become mouse input, without pressure or tilt. The
+  host asks again at the next pen down or hover, at most once a second, and
+  logs the first refusal and the recovery once each. Sessions are still
+  offered native pen input meanwhile, so Drawing mode keeps sending Pencil
+  samples that can recover the device. If the device could not be created
+  when the transport started, sessions are not offered native pen input:
+  Drawing mode shows it as unavailable and sends no Pencil samples, and
+  Pencil outside Drawing mode works as a mouse.
 - After `ERROR_NOT_READY`, that sample and any behind it wait in order, and
   the next sample or refresh tick retries the same frame first; later
   positions coalesce behind it. A release is never dropped for a later
