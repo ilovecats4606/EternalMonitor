@@ -998,6 +998,22 @@ fn save(path: Option<&Path>, saved: &Saved) {
     }
 }
 
+/// Applies `change` and writes the file only if the saved part changed: the
+/// GUI calls in every frame.
+fn changing<T>(
+    state: &Mutex<State>,
+    path: Option<&Path>,
+    change: impl FnOnce(&mut State) -> T,
+) -> T {
+    let mut state = state.lock();
+    let before = state.saved.clone();
+    let result = change(&mut state);
+    if state.saved != before {
+        save(path, &state.saved);
+    }
+    result
+}
+
 /// Called when something changed; `Some(version)` asks for a notification.
 pub type Wake = Arc<dyn Fn(Option<&str>) + Send + Sync>;
 
@@ -1037,10 +1053,7 @@ impl Updater {
     }
 
     fn with<T>(&self, change: impl FnOnce(&mut State) -> T) -> T {
-        let mut state = self.state.lock();
-        let result = change(&mut state);
-        save(self.path.as_deref(), &state.saved);
-        result
+        changing(&self.state, self.path.as_deref(), change)
     }
 
     fn send(&self, command: Option<Command>) {
@@ -1179,10 +1192,7 @@ impl Worker {
     }
 
     fn update<T>(&self, change: impl FnOnce(&mut State) -> T) -> T {
-        let mut state = self.state.lock();
-        let result = change(&mut state);
-        save(self.path.as_deref(), &state.saved);
-        result
+        changing(&self.state, self.path.as_deref(), change)
     }
 }
 
