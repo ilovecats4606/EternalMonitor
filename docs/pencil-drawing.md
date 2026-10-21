@@ -102,6 +102,14 @@ zero-pressure pen-up, so the check asserts that contact actually ends.
 `-ScreenIndex` can select another display. This does not substitute for an
 actual Pencil stroke in CSP.
 
+`scripts/win/Test-PenMapping.ps1` takes the same executable and an empty
+evidence directory. It covers each attached monitor with the probe window,
+taps the pen and then a touch at the corners and centre, and compares the
+pixels Windows reports with the expected ones. `-WithVirtualDisplay` also
+enables the Virtual Display Driver, places it left of and then above the
+primary, and draws a stroke while it moves. It records the display layout
+first and restores it at the end; `result.json` lists both layouts.
+
 Before release, verify light-to-heavy strokes, pressure-sensitive dots, tilted
 brushes, diagonals and all canvas corners on a physical iPad. Rest a palm before
 and during a stroke. Test both iPad orientations, Windows display scaling,
