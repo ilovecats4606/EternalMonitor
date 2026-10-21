@@ -596,7 +596,13 @@ impl InputRelay {
     /// display moved or changed mode since the Pencil last moved.
     pub fn keep_pen_alive(&mut self, output: Option<CaptureGeometry>) {
         #[cfg(windows)]
-        self.pen_device.flush(output.or(self.output));
+        {
+            // Samples that find the device gone continue on the mouse.
+            let mouse = self.pen_device.flush(output.or(self.output));
+            if !mouse.is_empty() {
+                windows_inject::inject(&mouse, &mut self.pen_device, self.output);
+            }
+        }
         let Some(output) = output else {
             return;
         };

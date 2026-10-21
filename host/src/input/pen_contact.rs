@@ -18,7 +18,7 @@ use super::{CaptureGeometry, PenPhase, PenSample, VirtualScreen};
 
 /// Samples that may wait for Windows. Positions coalesce, so this bounds
 /// strokes that start and end while Windows stays not ready.
-const QUEUE_LIMIT: usize = 8;
+pub(super) const QUEUE_LIMIT: usize = 8;
 
 /// `POINTER_FLAG_*` values from winuser.h, so frames can be built and checked
 /// off Windows. `windows_inject.rs` asserts that they match the SDK's.
@@ -138,6 +138,15 @@ impl NotReadyRetry {
     }
 }
 
+/// `sample` with its desktop pixels mapped from its wire position onto
+/// `output`, the capture rect current now.
+fn mapped(mut sample: PenSample, output: Option<CaptureGeometry>) -> PenSample {
+    if let Some(output) = output {
+        (sample.x, sample.y) = super::norm_to_output_pixel(sample.x_norm, sample.y_norm, output);
+    }
+    sample
+}
+
 /// Where `PenContact` sends frames: the synthetic pen device, or a model of
 /// Windows in tests.
 pub trait PenTarget {
@@ -149,6 +158,11 @@ pub trait PenTarget {
     /// Destroy and recreate the synthetic pen device, which ends any pointer
     /// Windows holds for it.
     fn recreate(&mut self);
+    /// Whether there is a device to inject into. False once Windows refused
+    /// to recreate it: nothing more can be delivered natively.
+    fn available(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Default)]
@@ -190,16 +204,26 @@ impl PenContact {
     /// every refresh tick so an end of contact is not left waiting for the
     /// next Pencil sample.
     pub fn flush(&mut self, output: Option<CaptureGeometry>, target: &mut impl PenTarget) {
-        while let Some(mut sample) = self.pending() {
-            if let Some(output) = output {
-                (sample.x, sample.y) =
-                    super::norm_to_output_pixel(sample.x_norm, sample.y_norm, output);
-            }
-            if !self.bring(sample, target) {
+        while let Some(sample) = self.pending() {
+            if !self.bring(mapped(sample, output), target) {
                 return;
             }
             self.queue.pop_front();
         }
+    }
+
+    /// Take every sample not yet delivered, oldest first, mapped onto
+    /// `output`. Once the device is gone these continue on the mouse.
+    pub fn take_waiting(&mut self, output: Option<CaptureGeometry>) -> Vec<PenSample> {
+        self.queue
+            .drain(..)
+            .map(|sample| mapped(sample, output))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub fn waiting(&self) -> usize {
+        self.queue.len()
     }
 
     /// The session ended or was taken over: drop samples Windows never
@@ -257,13 +281,20 @@ impl PenContact {
     }
 
     /// Plan and send the frames for one sample. Returns false if Windows was
-    /// not ready, leaving the rest to be planned again from where it stopped.
+    /// not ready or the device is gone, leaving this sample and the rest
+    /// waiting: to be planned again from where it stopped, or taken for the
+    /// mouse. Ending the old pointer comes first in every plan, so a sample
+    /// whose plan lost the device has delivered none of its own frames; a
+    /// cancel or leave that lost it is done, since that ended the pointer.
     fn bring(&mut self, sample: PenSample, target: &mut impl PenTarget) -> bool {
         // A rejection cancels the contact; resume it from this same, freshly
         // mapped sample once rather than waiting for the next one.
         for _ in 0..2 {
             let mut rejected = false;
             for frame in self.plan(sample) {
+                if !target.available() {
+                    return false;
+                }
                 let outcome = match frame.phase {
                     PenPhase::Cancel | PenPhase::Leave => self.end(frame, target),
                     _ => self.send(frame, target),
