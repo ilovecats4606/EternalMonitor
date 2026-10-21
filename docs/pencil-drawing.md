@@ -61,7 +61,8 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
 
 ## Protocol and Windows behavior
 
-- `HOSTCAP_PEN = 1 << 4` means the host created its native pen device.
+- `HOSTCAP_PEN = 1 << 4` means the host had its native pen device when the
+  session started.
 - Existing `kind = 1` identifies Pencil. Input version 1 remains 30 bytes.
 - Input version 2 has the same 30-byte prefix and appends `tilt_x: i16` and
   `tilt_y: i16`, in little-endian signed degrees from -90 through 90.
@@ -86,6 +87,11 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   holds it. If that place is off the virtual screen after a display change,
   Windows refuses the end, or Windows is still refusing another frame, the
   host recreates its pen device instead, which ends the pointer.
+- If Windows refuses to create the pen device, Pencil uses the mouse
+  fallback. The host asks again at the next pen down, hover or session, at
+  most once a second, and logs the first refusal and the recovery once each.
+  A session that starts while the device is missing is not offered native
+  pen input; HELLO_ACK is the only message that carries it.
 - After `ERROR_NOT_READY`, that sample and any behind it wait in order, and
   the next sample or refresh tick retries the same frame first; later
   positions coalesce behind it. A release is never dropped for a later
