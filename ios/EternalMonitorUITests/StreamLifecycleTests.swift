@@ -70,9 +70,9 @@ final class StreamLifecycleTests: XCTestCase {
     }
 
     private func disconnect(_ app: XCUIApplication) {
-        if !app.buttons["display.disconnect"].exists { app.tap() }
-        app.buttons["display.disconnect"].tap()
-        XCTAssertTrue(app.textFields["connect.host"].waitForExistence(timeout: 5))
+        // The HUD can hide between a check and the tap (CI: checked at
+        // 25.03 s, gone by the tap at 25.09 s).
+        app.tapHUDControl("display.disconnect", until: app.textFields["connect.host"])
         app.terminate()
     }
 

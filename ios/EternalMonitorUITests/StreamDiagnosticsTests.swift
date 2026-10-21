@@ -16,10 +16,10 @@ final class StreamDiagnosticsTests: XCTestCase {
             app.tap(withNumberOfTaps: 1, numberOfTouches: 3)
         }
         XCTAssertTrue(hud.waitForExistence(timeout: 5), app.debugDescription)
-        hud.tap()
         let repaired = app.descendants(matching: .any)["quality.repaired"].firstMatch
         let jitter = app.descendants(matching: .any)["quality.jitter"].firstMatch
-        XCTAssertTrue(repaired.waitForExistence(timeout: 5))
+        // The HUD can hide between the check above and the tap.
+        app.tapHUDControl("display.hud", until: repaired, reveal: .threeFingerTap)
         XCTAssertTrue(jitter.exists)
         let hasRepairs = NSPredicate { _, _ in
             Int(repaired.value as? String ?? "") ?? 0 > 0
