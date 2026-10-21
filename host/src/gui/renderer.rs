@@ -3,95 +3,191 @@
 //! (UHD 620 with 23.20.16.x, issue #59) offer a Vulkan adapter that lacks
 //! WebGPU features, and the process dies inside the driver while creating the
 //! device, with no error to catch. Prefer a fully capable adapter of the same
-//! GPU type, usually DX12 there. A marker file names the backend while the
-//! window starts; if a launch dies before painting, the next launch avoids it.
+//! GPU type, usually DX12 there.
+//!
+//! Each launch also leaves a marker naming its GPU, driver and backend until a
+//! frame is confirmed presented. A marker whose process has exited means that
+//! launch never drew a frame, so that backend is avoided on that GPU and
+//! driver, and tried again after some clean launches or a driver change.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use eframe::egui;
 use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup};
 use eframe::wgpu::{self, Backend, DeviceType};
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-const STARTING_FILE: &str = "renderer-starting";
-const AVOID_FILE: &str = "renderer-avoid";
+use crate::startup::ProcessId;
+
+/// Clean launches, per recorded failure, before an avoided backend is retried.
+const RETRY_AFTER: u32 = 5;
+const HISTORY_FILE: &str = "history.json";
 
 static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
-static FRAMES: AtomicU32 = AtomicU32::new(0);
+static STARTED: Mutex<Option<Marker>> = Mutex::new(None);
+static PRESENT: Mutex<PresentTracker> = Mutex::new(PresentTracker::new());
+/// Frames whose surface texture could not be acquired, so nothing was presented.
+static FAILED_ACQUIRES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Candidate {
     backend: Backend,
     device_type: DeviceType,
     compliant: bool,
+    avoided: bool,
 }
 
-/// Install the adapter selector, after recording a failed previous start.
+/// What one launch is trying to start with.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Marker {
+    gpu: String,
+    backend: String,
+}
+
+/// A backend that failed to draw on one GPU and driver.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Failure {
+    gpu: String,
+    backend: String,
+    failures: u32,
+    clean_launches: u32,
+}
+
+/// Install the adapter selector, after recording failed earlier starts.
 pub(super) fn configure(config: &mut WgpuConfiguration) {
-    let directory = crate::settings::app_data_dir();
-    let avoid = directory
-        .as_deref()
-        .map(previous_failures)
-        .unwrap_or_default();
-    if let Some(directory) = directory {
-        let _ = STATE_DIR.set(directory);
-    }
+    let history = match crate::settings::app_data_dir() {
+        Some(base) => {
+            let directory = base.join("renderer");
+            let _ = fs::create_dir_all(&directory);
+            let history = sweep(&directory, ProcessId::current());
+            let _ = STATE_DIR.set(directory);
+            history
+        }
+        None => Vec::new(),
+    };
     if let WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup {
         setup.native_adapter_selector = Some(Arc::new(move |adapters, surface| {
-            select(adapters, surface, &avoid)
+            select(adapters, surface, &history)
         }));
+    }
+    let default = config.on_surface_status.clone();
+    config.on_surface_status = Arc::new(move |status| {
+        FAILED_ACQUIRES.fetch_add(1, Ordering::SeqCst);
+        default(status)
+    });
+}
+
+/// Called at the start of each UI pass. A new frame with no failed surface
+/// acquisition since the previous one means that frame was presented.
+pub(super) fn frame_started(ctx: &egui::Context) {
+    let visible = ctx.input(|input| input.viewport().minimized != Some(true));
+    let confirmed = PRESENT.lock().is_ok_and(|mut tracker| {
+        tracker.observe(
+            ctx.cumulative_frame_nr(),
+            FAILED_ACQUIRES.load(Ordering::SeqCst),
+            visible,
+        )
+    });
+    if !confirmed {
+        return;
+    }
+    crate::startup::mark_window_shown();
+    info!("Window renderer presented its first frame");
+    let (Some(directory), Ok(mut started)) = (STATE_DIR.get(), STARTED.lock()) else {
+        return;
+    };
+    if let Some(marker) = started.take() {
+        let mut history = read_history(directory);
+        record_success(&mut history, &marker);
+        write_history(directory, &history);
+        let _ = fs::remove_file(marker_path(directory, ProcessId::current()));
     }
 }
 
-/// Called after each frame. The second frame means the first one was
-/// presented, so the renderer works on this PC.
-pub(super) fn frame_painted() {
-    if FRAMES.fetch_add(1, Ordering::Relaxed) != 1 {
-        return;
+/// Confirms a presented frame from the frame counter and surface failures.
+struct PresentTracker {
+    pending: Option<(u64, u64)>,
+    confirmed: bool,
+}
+
+impl PresentTracker {
+    const fn new() -> Self {
+        Self {
+            pending: None,
+            confirmed: false,
+        }
     }
-    if let Some(directory) = STATE_DIR.get() {
-        let _ = fs::remove_file(directory.join(STARTING_FILE));
+
+    /// True once: when a later frame starts and the frame before it was
+    /// visible and acquired its surface texture. Passes of the same frame do
+    /// not count, because nothing is presented between them.
+    fn observe(&mut self, frame: u64, failed_acquires: u64, visible: bool) -> bool {
+        if self.confirmed {
+            return false;
+        }
+        match self.pending {
+            Some((pending, _)) if frame == pending => return false,
+            Some((_, failures)) if failures == failed_acquires => {
+                self.confirmed = true;
+                return true;
+            }
+            _ => {}
+        }
+        self.pending = visible.then_some((frame, failed_acquires));
+        false
     }
-    crate::startup::mark_window_shown();
-    info!("Window renderer is drawing");
 }
 
 fn select(
     adapters: &[wgpu::Adapter],
     surface: Option<&wgpu::Surface<'_>>,
-    avoid: &[String],
+    history: &[Failure],
 ) -> Result<wgpu::Adapter, String> {
     let usable: Vec<&wgpu::Adapter> = adapters
         .iter()
         .filter(|adapter| surface.is_none_or(|surface| adapter.is_surface_supported(surface)))
         .collect();
+    let gpus: Vec<String> = usable.iter().map(|a| gpu_key(&a.get_info())).collect();
     let candidates: Vec<Candidate> = usable
         .iter()
-        .map(|adapter| {
+        .zip(&gpus)
+        .map(|(adapter, gpu)| {
             let info = adapter.get_info();
             Candidate {
                 backend: info.backend,
                 device_type: info.device_type,
                 compliant: adapter.get_downlevel_capabilities().is_webgpu_compliant(),
+                avoided: avoided(history, gpu, info.backend.to_str()),
             }
         })
         .collect();
-    let index = pick(&candidates, avoid)
+    let index = pick(&candidates)
         .ok_or_else(|| "No graphics adapter can draw the EternalMonitor window".to_string())?;
     let adapter = usable[index].clone();
     let info = adapter.get_info();
+    let marker = Marker {
+        gpu: gpus[index].clone(),
+        backend: info.backend.to_str().to_string(),
+    };
     info!(
         backend = %info.backend,
         adapter = %info.name,
-        driver = %info.driver_info,
+        gpu = %marker.gpu,
         compliant = candidates[index].compliant,
-        avoided = ?avoid,
+        avoided = ?history.iter().filter(|f| avoided(history, &f.gpu, &f.backend)).map(|f| (&f.gpu, &f.backend)).collect::<Vec<_>>(),
         "Window renderer selected"
     );
     if let Some(directory) = STATE_DIR.get() {
-        let _ = fs::write(directory.join(STARTING_FILE), info.backend.to_str());
+        if let Ok(json) = serde_json::to_vec(&marker) {
+            let _ = fs::write(marker_path(directory, ProcessId::current()), json);
+        }
+    }
+    if let Ok(mut started) = STARTED.lock() {
+        *started = Some(marker);
     }
     crate::startup::simulate_renderer_failure()?;
     Ok(adapter)
@@ -99,7 +195,7 @@ fn select(
 
 /// The best candidate: not avoided, then wgpu's high-performance GPU type order,
 /// then fully capable, then wgpu's own backend order.
-fn pick(candidates: &[Candidate], avoid: &[String]) -> Option<usize> {
+fn pick(candidates: &[Candidate]) -> Option<usize> {
     let type_rank = |device_type| match device_type {
         DeviceType::DiscreteGpu => 0,
         DeviceType::IntegratedGpu => 1,
@@ -118,7 +214,7 @@ fn pick(candidates: &[Candidate], avoid: &[String]) -> Option<usize> {
         .enumerate()
         .min_by_key(|(_, c)| {
             (
-                avoid.iter().any(|name| name == c.backend.to_str()),
+                c.avoided,
                 type_rank(c.device_type),
                 !c.compliant,
                 backend_rank(c.backend),
@@ -127,33 +223,132 @@ fn pick(candidates: &[Candidate], avoid: &[String]) -> Option<usize> {
         .map(|(index, _)| index)
 }
 
-/// Backends to avoid. A marker left by the previous launch means it ended
-/// before its window painted, so its backend joins the list for good.
-fn previous_failures(directory: &Path) -> Vec<String> {
-    let avoid_path = directory.join(AVOID_FILE);
-    let mut avoid: Vec<String> = fs::read_to_string(&avoid_path)
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect();
-    let starting = directory.join(STARTING_FILE);
-    if let Ok(backend) = fs::read_to_string(&starting) {
-        let backend = backend.trim().to_string();
-        warn!(
-            backend = %backend,
-            "The previous launch closed before its window appeared; using another renderer"
-        );
-        if !backend.is_empty() && !avoid.contains(&backend) {
-            avoid.push(backend);
-            if let Err(error) = fs::write(&avoid_path, avoid.join("\n")) {
-                warn!(%error, "Could not save the renderer to avoid");
+/// The GPU and its driver version, so a driver update gives every backend a
+/// fresh start.
+fn gpu_key(info: &wgpu::AdapterInfo) -> String {
+    let driver = driver_version(info.vendor, info.device).unwrap_or_else(|| {
+        format!("{} {}", info.driver, info.driver_info)
+            .trim()
+            .to_string()
+    });
+    format!("{:04x}:{:04x} {driver}", info.vendor, info.device)
+}
+
+/// The driver version DXGI reports for the adapter wgpu describes.
+#[cfg(windows)]
+fn driver_version(vendor: u32, device: u32) -> Option<String> {
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIDevice, IDXGIFactory1};
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
+    (0..)
+        .map_while(|index| unsafe { factory.EnumAdapters1(index) }.ok())
+        .find_map(|adapter| {
+            let desc = unsafe { adapter.GetDesc1() }.ok()?;
+            if desc.VendorId != vendor || desc.DeviceId != device {
+                return None;
             }
+            let version = unsafe { adapter.CheckInterfaceSupport(&IDXGIDevice::IID) }.ok()? as u64;
+            Some(format!(
+                "{}.{}.{}.{}",
+                version >> 48,
+                (version >> 32) & 0xffff,
+                (version >> 16) & 0xffff,
+                version & 0xffff
+            ))
+        })
+}
+
+#[cfg(not(windows))]
+fn driver_version(_vendor: u32, _device: u32) -> Option<String> {
+    None
+}
+
+fn avoided(history: &[Failure], gpu: &str, backend: &str) -> bool {
+    history.iter().any(|f| {
+        f.gpu == gpu && f.backend == backend && f.clean_launches < RETRY_AFTER * f.failures
+    })
+}
+
+fn record_failure(history: &mut Vec<Failure>, marker: &Marker) {
+    match history
+        .iter_mut()
+        .find(|f| f.gpu == marker.gpu && f.backend == marker.backend)
+    {
+        Some(failure) => {
+            failure.failures += 1;
+            failure.clean_launches = 0;
         }
-        let _ = fs::remove_file(starting);
+        None => history.push(Failure {
+            gpu: marker.gpu.clone(),
+            backend: marker.backend.clone(),
+            failures: 1,
+            clean_launches: 0,
+        }),
     }
-    avoid
+}
+
+/// A backend that drew is cleared; others on the same GPU move toward a retry.
+fn record_success(history: &mut Vec<Failure>, marker: &Marker) {
+    history.retain(|f| !(f.gpu == marker.gpu && f.backend == marker.backend));
+    for failure in history.iter_mut().filter(|f| f.gpu == marker.gpu) {
+        failure.clean_launches += 1;
+    }
+}
+
+fn marker_path(directory: &Path, owner: ProcessId) -> PathBuf {
+    directory.join(format!("{owner}.start"))
+}
+
+fn read_history(directory: &Path) -> Vec<Failure> {
+    fs::read(directory.join(HISTORY_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn write_history(directory: &Path, history: &[Failure]) {
+    let path = directory.join(HISTORY_FILE);
+    let temp = path.with_extension("tmp");
+    let saved = serde_json::to_vec(history)
+        .map_err(std::io::Error::other)
+        .and_then(|json| fs::write(&temp, json))
+        .and_then(|()| fs::rename(&temp, &path));
+    if let Err(error) = saved {
+        warn!(%error, "Could not save the renderer history");
+    }
+}
+
+/// Count markers left by exited launches as failures and remove them. Markers
+/// of running instances, including this one, are theirs to clear.
+fn sweep(directory: &Path, current: ProcessId) -> Vec<Failure> {
+    let mut history = read_history(directory);
+    let mut changed = false;
+    for entry in fs::read_dir(directory).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(owner) = name.strip_suffix(".start").and_then(ProcessId::from_name) else {
+            continue;
+        };
+        if owner == current || owner.is_running() {
+            continue;
+        }
+        if let Some(marker) = fs::read(entry.path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Marker>(&bytes).ok())
+        {
+            warn!(
+                gpu = %marker.gpu,
+                backend = %marker.backend,
+                "A previous launch closed before its window appeared; avoiding that renderer for now"
+            );
+            record_failure(&mut history, &marker);
+            changed = true;
+        }
+        let _ = fs::remove_file(entry.path());
+    }
+    if changed {
+        write_history(directory, &history);
+    }
+    history
 }
 
 #[cfg(test)]
@@ -165,6 +360,7 @@ mod tests {
             backend,
             device_type,
             compliant,
+            avoided: false,
         }
     }
 
@@ -178,9 +374,53 @@ mod tests {
         ]
     }
 
+    fn avoiding(mut candidates: Vec<Candidate>, backends: &[Backend]) -> Vec<Candidate> {
+        for c in &mut candidates {
+            c.avoided = backends.contains(&c.backend);
+        }
+        candidates
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "eternal-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    fn exited_process() -> ProcessId {
+        let mut child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "true" })
+            .args(if cfg!(windows) {
+                &["/c", "exit"][..]
+            } else {
+                &[][..]
+            })
+            .spawn()
+            .unwrap();
+        let id = ProcessId {
+            pid: child.id(),
+            start: 1,
+        };
+        child.wait().unwrap();
+        id
+    }
+
+    fn marker(gpu: &str, backend: &str) -> Marker {
+        Marker {
+            gpu: gpu.into(),
+            backend: backend.into(),
+        }
+    }
+
     #[test]
     fn an_incomplete_vulkan_driver_yields_to_dx12_on_the_same_gpu() {
-        assert_eq!(pick(&uhd_620(), &[]), Some(1));
+        assert_eq!(pick(&uhd_620()), Some(1));
     }
 
     #[test]
@@ -189,7 +429,7 @@ mod tests {
             candidate(Backend::Vulkan, DeviceType::IntegratedGpu, true),
             candidate(Backend::Dx12, DeviceType::IntegratedGpu, true),
         ];
-        assert_eq!(pick(&candidates, &[]), Some(0));
+        assert_eq!(pick(&candidates), Some(0));
     }
 
     #[test]
@@ -198,42 +438,100 @@ mod tests {
             candidate(Backend::Dx12, DeviceType::IntegratedGpu, true),
             candidate(Backend::Vulkan, DeviceType::DiscreteGpu, false),
         ];
-        assert_eq!(pick(&candidates, &[]), Some(1));
+        assert_eq!(pick(&candidates), Some(1));
     }
 
     #[test]
     fn a_backend_that_failed_before_is_tried_last() {
-        assert_eq!(pick(&uhd_620(), &["dx12".to_string()]), Some(0));
-        let avoid = ["vulkan".to_string(), "dx12".to_string()];
-        assert_eq!(pick(&uhd_620(), &avoid), Some(3));
-        let avoid = ["dx12".to_string(), "gl".to_string(), "vulkan".to_string()];
+        assert_eq!(pick(&avoiding(uhd_620(), &[Backend::Dx12])), Some(0));
+        assert_eq!(
+            pick(&avoiding(uhd_620(), &[Backend::Vulkan, Backend::Dx12])),
+            Some(3)
+        );
         // With everything avoided, the usual order applies again.
-        assert_eq!(pick(&uhd_620(), &avoid), Some(1));
-        assert_eq!(pick(&[], &[]), None);
+        let all = [Backend::Dx12, Backend::Gl, Backend::Vulkan];
+        assert_eq!(pick(&avoiding(uhd_620(), &all)), Some(1));
+        assert_eq!(pick(&[]), None);
     }
 
     #[test]
-    fn a_launch_that_never_painted_adds_its_backend_once() {
-        let directory = std::env::temp_dir().join(format!(
-            "eternal-renderer-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&directory).unwrap();
-        assert!(previous_failures(&directory).is_empty());
+    fn a_failed_backend_is_retried_after_clean_launches_or_a_driver_update() {
+        let old = marker("8086:5917 23.20.16.5038", "vulkan");
+        let fallback = marker("8086:5917 23.20.16.5038", "dx12");
+        let mut history = Vec::new();
+        record_failure(&mut history, &old);
+        assert!(avoided(&history, &old.gpu, "vulkan"));
+        assert!(!avoided(&history, &old.gpu, "dx12"));
+        // A newer driver for the same GPU starts clean.
+        assert!(!avoided(&history, "8086:5917 31.0.101.2127", "vulkan"));
+        for _ in 0..RETRY_AFTER - 1 {
+            record_success(&mut history, &fallback);
+        }
+        assert!(avoided(&history, &old.gpu, "vulkan"));
+        record_success(&mut history, &fallback);
+        assert!(!avoided(&history, &old.gpu, "vulkan"));
+        // Failing again waits twice as long.
+        record_failure(&mut history, &old);
+        for _ in 0..2 * RETRY_AFTER - 1 {
+            record_success(&mut history, &fallback);
+        }
+        assert!(avoided(&history, &old.gpu, "vulkan"));
+        // Drawing with it clears the entry.
+        record_success(&mut history, &old);
+        assert!(history.is_empty());
+    }
 
-        fs::write(directory.join(STARTING_FILE), "vulkan").unwrap();
-        assert_eq!(previous_failures(&directory), ["vulkan"]);
-        assert!(!directory.join(STARTING_FILE).exists());
-        // Remembered after a successful launch, without growing.
-        assert_eq!(previous_failures(&directory), ["vulkan"]);
-        fs::write(directory.join(STARTING_FILE), "vulkan").unwrap();
-        assert_eq!(previous_failures(&directory), ["vulkan"]);
-        fs::write(directory.join(STARTING_FILE), "dx12").unwrap();
-        assert_eq!(previous_failures(&directory), ["vulkan", "dx12"]);
+    #[test]
+    fn only_markers_of_exited_launches_count_as_failures() {
+        let directory = temp_dir("renderer");
+        let gpu = "8086:5917 23.20.16.5038";
+        // A second instance still starting: this test process stands in for it.
+        let running = ProcessId::current();
+        let elsewhere = ProcessId {
+            pid: running.pid,
+            start: running.start + 1,
+        };
+        let json = |m: &Marker| serde_json::to_vec(m).unwrap();
+        fs::write(
+            marker_path(&directory, running),
+            json(&marker(gpu, "vulkan")),
+        )
+        .unwrap();
+        let dead = exited_process();
+        fs::write(marker_path(&directory, dead), json(&marker(gpu, "dx12"))).unwrap();
+
+        let history = sweep(&directory, elsewhere);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].backend, "dx12");
+        assert!(marker_path(&directory, running).exists());
+        assert!(!marker_path(&directory, dead).exists());
+        // Recorded once, and kept for the next launch.
+        assert_eq!(sweep(&directory, elsewhere), history);
+        assert_eq!(read_history(&directory), history);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn several_passes_of_one_frame_are_not_a_presented_frame() {
+        let mut tracker = PresentTracker::new();
+        assert!(!tracker.observe(0, 0, true));
+        // egui repeats a pass when a new Grid or similar needs a second layout.
+        assert!(!tracker.observe(0, 0, true));
+        assert!(tracker.observe(1, 0, true));
+        assert!(!tracker.observe(2, 0, true));
+    }
+
+    #[test]
+    fn a_frame_whose_surface_was_not_acquired_was_not_presented() {
+        let mut tracker = PresentTracker::new();
+        assert!(!tracker.observe(0, 0, true));
+        // Timeout, Lost or Occluded: egui skipped the frame.
+        assert!(!tracker.observe(1, 1, true));
+        assert!(tracker.observe(2, 1, true));
+
+        let mut minimized = PresentTracker::new();
+        assert!(!minimized.observe(0, 0, false));
+        assert!(!minimized.observe(1, 0, true));
+        assert!(minimized.observe(2, 0, true));
     }
 }

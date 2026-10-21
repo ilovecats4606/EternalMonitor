@@ -638,7 +638,7 @@ impl eframe::App for AnalyzerApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        renderer::frame_painted();
+        renderer::frame_started(ui.ctx());
         crate::startup::simulate_window_failure();
         let ctx = ui.ctx().clone();
         if let Some(dirty_at) = self.settings_dirty_at {
