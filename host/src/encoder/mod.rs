@@ -133,6 +133,7 @@ fn run_encode_loop(
     let mut hevc_open_failed = false;
     let mut last_keyframe_reopen: Option<Instant> = None;
     let mut pending_keyframe = false;
+    let mut in_flight = InFlightFrames::default();
 
     // Guarantee the very first frame of every pipeline is an IDR for all encoders, so the
     // iPad never sits in `waitingForSyncSample` after a connect or pipeline restart.
@@ -420,6 +421,7 @@ fn run_encode_loop(
         let encode_start = Instant::now();
         encoder.encoder.send_frame(&encoder.frame)?;
         encoder.frames_submitted += 1;
+        in_flight.submitted(pts, raw_frame.timestamp, raw_frame.frame_number);
 
         loop {
             match encoder.encoder.receive_packet(&mut encoder.packet) {
@@ -511,10 +513,15 @@ fn run_encode_loop(
                         "Frame encoded"
                     );
 
+                    // An encoder with output delay (NVENC holds one frame)
+                    // returns an earlier frame than the one just submitted.
+                    let (timestamp, sequence) = in_flight
+                        .take(encoder.packet.pts())
+                        .unwrap_or((raw_frame.timestamp, raw_frame.frame_number));
                     let nal = NALUnit {
                         data: nal_data,
-                        sequence: raw_frame.frame_number,
-                        timestamp: raw_frame.timestamp,
+                        sequence,
+                        timestamp,
                         encode_duration_us: encode_us,
                         is_keyframe,
                     };
@@ -732,6 +739,42 @@ impl EncoderState {
 /// A compiled-in encoder may have no usable device or driver. Try each other
 /// Windows backend once before using the CPU. Explicit software selection
 /// never enters this path, and non-Windows backends keep their own fallback.
+/// Capture time and number of each frame still inside the encoder, by pts. A
+/// packet must carry the capture time of the frame it encodes: stamping it
+/// with the frame just submitted let NVENC's held frame (the startup frame,
+/// or a previous viewer's last frame) pass as new, so a new viewer's first
+/// keyframe showed an old desktop. It also skewed the latency reported to
+/// the iPad by one frame.
+#[derive(Default)]
+struct InFlightFrames(std::collections::VecDeque<(i64, Instant, u64)>);
+
+impl InFlightFrames {
+    const LIMIT: usize = 64;
+
+    fn submitted(&mut self, pts: i64, captured: Instant, number: u64) {
+        if self.0.len() >= Self::LIMIT {
+            self.0.pop_front();
+        }
+        self.0.push_back((pts, captured, number));
+    }
+
+    /// Frames are emitted in pts order (no B-frames), so older entries
+    /// were dropped by the encoder and can go.
+    fn take(&mut self, pts: Option<i64>) -> Option<(Instant, u64)> {
+        let pts = pts?;
+        while let Some(&(front, captured, number)) = self.0.front() {
+            if front > pts {
+                return None;
+            }
+            self.0.pop_front();
+            if front == pts {
+                return Some((captured, number));
+            }
+        }
+        None
+    }
+}
+
 fn open_remaining_encoders<T>(
     failed: &str,
     mut open: impl FnMut(&str) -> Result<T, Box<dyn std::error::Error + Send + Sync>>,
@@ -1382,6 +1425,25 @@ fn find_ffmpeg_exe() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_delayed_packet_keeps_the_capture_time_of_its_own_frame() {
+        let start = Instant::now();
+        let at = |ms| start + std::time::Duration::from_millis(ms);
+        let mut in_flight = InFlightFrames::default();
+        // NVENC holds the startup keyframe until the next frame arrives,
+        // which can be many seconds later when a viewer connects.
+        in_flight.submitted(0, at(0), 1);
+        in_flight.submitted(16_666, at(9_000), 2);
+        assert_eq!(in_flight.take(Some(0)), Some((at(0), 1)));
+        in_flight.submitted(33_333, at(9_016), 3);
+        in_flight.submitted(50_000, at(9_033), 4);
+        // A frame the encoder dropped is skipped, not reused.
+        assert_eq!(in_flight.take(Some(33_333)), Some((at(9_016), 3)));
+        assert_eq!(in_flight.take(Some(50_000)), Some((at(9_033), 4)));
+        assert_eq!(in_flight.take(Some(66_666)), None);
+        assert_eq!(in_flight.take(None), None);
+    }
 
     #[test]
     fn startup_tries_other_hardware_before_software() {
