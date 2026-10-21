@@ -97,6 +97,14 @@ jobs:
           }
           .\scripts\build-installer.ps1
 
+      - name: Check the update helper's imports
+        shell: pwsh
+        run: |
+          # The shipped helper runs from the user's update folder: only system
+          # DLLs, resolved from System32 (updater/tests/imports.rs).
+          $env:EM_UPDATER_EXE = (Resolve-Path "target\release\eternal-updater.exe").Path
+          cargo test -p eternal-updater --test imports --locked
+
       - name: Compute SHA-256
         id: hash
         shell: pwsh
