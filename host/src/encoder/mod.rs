@@ -133,7 +133,6 @@ fn run_encode_loop(
     let mut hevc_open_failed = false;
     let mut last_keyframe_reopen: Option<Instant> = None;
     let mut pending_keyframe = false;
-    let mut in_flight = InFlightFrames::default();
 
     // Guarantee the very first frame of every pipeline is an IDR for all encoders, so the
     // iPad never sits in `waitingForSyncSample` after a connect or pipeline restart.
@@ -390,19 +389,7 @@ fn run_encode_loop(
         // Conversion finished synchronously. Recycle capture's buffer before
         // the codec or sender can block, including on the direct macOS path.
         drop(raw_frame.data);
-        let pts = if encoder.legacy_pts {
-            raw_frame.frame_number as i64
-        } else {
-            let epoch = *encoder.pts_epoch.get_or_insert(raw_frame.timestamp);
-            let real = raw_frame
-                .timestamp
-                .saturating_duration_since(epoch)
-                .as_micros() as i64;
-            // Strict monotonicity (keepalive resends and clock quirks).
-            let pts = real.max(encoder.last_pts + 1);
-            encoder.last_pts = pts;
-            pts
-        };
+        let pts = encoder.next_pts(raw_frame.timestamp, raw_frame.frame_number);
         encoder.frame.set_pts(Some(pts));
         let force_idr = take_keyframe_request(
             &mut pending_keyframe,
@@ -419,9 +406,7 @@ fn run_encode_loop(
         );
 
         let encode_start = Instant::now();
-        encoder.encoder.send_frame(&encoder.frame)?;
-        encoder.frames_submitted += 1;
-        in_flight.submitted(pts, raw_frame.timestamp, raw_frame.frame_number);
+        encoder.send_frame(pts, raw_frame.timestamp, raw_frame.frame_number)?;
 
         loop {
             match encoder.encoder.receive_packet(&mut encoder.packet) {
@@ -513,11 +498,8 @@ fn run_encode_loop(
                         "Frame encoded"
                     );
 
-                    // An encoder with output delay (NVENC holds one frame)
-                    // returns an earlier frame than the one just submitted.
-                    let (timestamp, sequence) = in_flight
-                        .take(encoder.packet.pts())
-                        .unwrap_or((raw_frame.timestamp, raw_frame.frame_number));
+                    let (timestamp, sequence) =
+                        encoder.packet_origin((raw_frame.timestamp, raw_frame.frame_number));
                     let nal = NALUnit {
                         data: nal_data,
                         sequence,
@@ -563,6 +545,11 @@ struct EncoderState {
     /// First frame's capture instant — the PTS epoch for this session.
     pts_epoch: Option<std::time::Instant>,
     last_pts: i64,
+    /// Frames sent to this session that have not come back as packets. It
+    /// belongs to the session because its PTS restart at 0: a frame the old
+    /// session still held could otherwise label a new packet with the same
+    /// PTS, seconds stale.
+    in_flight: InFlightFrames,
     /// ETERNAL_LEGACY_PTS=1 restores the old dense frame-counter PTS at
     /// time_base 1/60 (escape hatch until the real-PTS path is verified on
     /// NVENC/AMF hardware).
@@ -715,8 +702,42 @@ impl EncoderState {
             frames_submitted: 0,
             pts_epoch: None,
             last_pts: -1,
+            in_flight: InFlightFrames::default(),
             legacy_pts,
         })
+    }
+
+    fn next_pts(&mut self, captured: Instant, frame_number: u64) -> i64 {
+        if self.legacy_pts {
+            return frame_number as i64;
+        }
+        let epoch = *self.pts_epoch.get_or_insert(captured);
+        let real = captured.saturating_duration_since(epoch).as_micros() as i64;
+        // Strict monotonicity (keepalive resends and clock quirks).
+        let pts = real.max(self.last_pts + 1);
+        self.last_pts = pts;
+        pts
+    }
+
+    fn send_frame(
+        &mut self,
+        pts: i64,
+        captured: Instant,
+        frame_number: u64,
+    ) -> Result<(), ffmpeg_next::Error> {
+        self.encoder.send_frame(&self.frame)?;
+        self.frames_submitted += 1;
+        self.in_flight.submitted(pts, captured, frame_number);
+        Ok(())
+    }
+
+    /// Capture time and number of the frame in `self.packet`. An encoder
+    /// with output delay (NVENC holds one frame) returns an earlier frame
+    /// than the one just submitted.
+    fn packet_origin(&mut self, just_submitted: (Instant, u64)) -> (Instant, u64) {
+        self.in_flight
+            .take(self.packet.pts())
+            .unwrap_or(just_submitted)
     }
 
     fn accepts_frame(&self, width: u32, height: u32) -> bool {
@@ -1443,6 +1464,44 @@ mod tests {
         assert_eq!(in_flight.take(Some(50_000)), Some((at(9_033), 4)));
         assert_eq!(in_flight.take(Some(66_666)), None);
         assert_eq!(in_flight.take(None), None);
+    }
+
+    #[test]
+    fn a_reopened_encoder_labels_packets_with_their_own_capture_time() {
+        ffmpeg_next::init().unwrap();
+        let start = Instant::now();
+        // A fixed cadence, like the synthetic source, so both sessions use
+        // the same PTS values.
+        let at = |n: u64| start + std::time::Duration::from_micros(n * 1_000_000 / 60);
+        let open =
+            || EncoderState::new("libx264", 640, 360, 8_000_000, 60, EncoderInput::Yuv420).unwrap();
+        // Sends frames through the encode loop's calls. With `hold_last`,
+        // the last frame's packet is never collected, as when NVENC still
+        // holds a viewer's last frame at a reopen.
+        let run = |state: &mut EncoderState, frames: std::ops::Range<u64>, hold_last: bool| {
+            let mut labels = Vec::new();
+            for n in frames.clone() {
+                let pts = state.next_pts(at(n), n);
+                state.frame.set_pts(Some(pts));
+                state.send_frame(pts, at(n), n).unwrap();
+                if hold_last && n + 1 == frames.end {
+                    break;
+                }
+                while state.encoder.receive_packet(&mut state.packet).is_ok() {
+                    labels.push(state.packet_origin((at(n), n)));
+                }
+            }
+            labels
+        };
+        // A viewer watches and leaves with frame 5 inside the encoder, the
+        // host idles for 8 s, and a new viewer's arrival reopens the encoder.
+        let mut first = open();
+        let labels = run(&mut first, 0..6, true);
+        assert_eq!(labels, (0..5).map(|n| (at(n), n)).collect::<Vec<_>>());
+        drop(first);
+        let mut second = open();
+        let labels = run(&mut second, 480..490, false);
+        assert_eq!(labels, (480..490).map(|n| (at(n), n)).collect::<Vec<_>>());
     }
 
     #[test]
