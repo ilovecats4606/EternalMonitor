@@ -3,7 +3,10 @@ param(
     [Parameter(Mandatory=$true)][string]$EvidenceDirectory,
     # Also enable the Virtual Display Driver and place it left of, then above,
     # the primary. The layout is recorded first and restored afterwards.
-    [switch]$WithVirtualDisplay
+    [switch]$WithVirtualDisplay,
+    # Also record which raw pen frame sequences Windows rejects, at the
+    # centre of the probe window on the primary display.
+    [switch]$PenSequences
 )
 # Checks where Pencil and touch land on a whole monitor, for monitors whose
 # desktop origin differs from the virtual screen's. Run it in the interactive
@@ -178,8 +181,10 @@ public sealed class EMPlacementProbe : Form {
                 }
                 if (UsedPoints.Count == 0) { Close(); return; }
                 arguments = String.Join(" ", UsedPoints.ToArray());
-            } else {
+            } else if (mode == "stroke") {
                 arguments = steps.ToString();
+            } else {
+                arguments = "";
             }
             child = new Process();
             child.StartInfo = new ProcessStartInfo(executable, String.Format("{0} {1} {2} {3} {4} {5} {6}",
@@ -306,6 +311,16 @@ function Invoke-Case([string]$Name, $Display, [string]$Mode = 'mapping', $MoveDi
         }
         $case.points = $rows
         $case.passed = $ok -and !$rejected
+    } elseif ($Mode -eq 'sequences') {
+        $results = [ordered]@{}
+        foreach ($line in ($probe.ChildOutput -split "`r?`n" | Where-Object { $_ -like 'SEQ *' })) {
+            $parts = $line -split ' '
+            $results[$parts[1]] = @($results[$parts[1]]) + $parts[3] | Where-Object { $_ }
+        }
+        $case.sequences = $results
+        $case.passed = $probe.ChildExit -eq 0 -and
+            (@($results['control_stroke']) -join ',') -eq 'ok,ok,ok' -and
+            (@($results['control_hover_then_down_elsewhere']) -join ',') -eq 'ok,ok,ok'
     } else {
         $y = (Expected $bounds 0 32768).y
         $allowed = @{}
@@ -333,6 +348,9 @@ try {
     Invoke-Case 'current layout, primary' $primary
     foreach ($other in @($original | Where-Object { !$_.primary })) {
         Invoke-Case "current layout, $($other.name)" $other
+    }
+    if ($PenSequences) {
+        Invoke-Case 'raw pen sequences, primary' $primary 'sequences'
     }
     if ($WithVirtualDisplay) {
         if (!$vddWasPresent) {

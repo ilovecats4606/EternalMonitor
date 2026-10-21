@@ -12,6 +12,9 @@ fn main() {
     if mode == "mapping" || mode == "stroke" {
         return placement(&mode);
     }
+    if mode == "sequences" {
+        return sequences();
+    }
     let args: Vec<i32> = std::env::args()
         .skip(1)
         .map(|s| s.parse().unwrap())
@@ -76,7 +79,7 @@ fn main() {
     }
     for _ in 0..30 {
         std::thread::sleep(std::time::Duration::from_millis(50));
-        relay.keep_pen_alive();
+        relay.keep_pen_alive(Some(output));
     }
     relay.reset(); // disconnect mid-stroke must deliver a cancelled pen-up
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -168,6 +171,99 @@ fn placement(mode: &str) {
     }
     relay.reset();
     std::thread::sleep(Duration::from_millis(100));
+}
+
+/// `sequences <pid> <left> <top> <width> <height>` sends raw frame sequences
+/// to the centre of the probe window, each on a fresh pen device, and prints
+/// what Windows returns for every frame. It records which sequences Windows
+/// rejects: those the 0.3.1 injector could send after a lost datagram, and a
+/// contact with zero pressure. It bypasses the relay and the probe guard, so
+/// every frame stays within a few pixels of the window centre.
+#[cfg(windows)]
+fn sequences() {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::Controls::{
+        CreateSyntheticPointerDevice, DestroySyntheticPointerDevice, POINTER_FEEDBACK_NONE,
+        POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
+    };
+    use windows::Win32::UI::Input::Pointer::{
+        InjectSyntheticPointerInput, POINTER_FLAGS, POINTER_FLAG_DOWN, POINTER_FLAG_FIRSTBUTTON,
+        POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE, POINTER_FLAG_PRIMARY, POINTER_FLAG_UP,
+        POINTER_FLAG_UPDATE, POINTER_INFO, POINTER_PEN_INFO,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{PEN_MASK_PRESSURE, PT_PEN};
+    let args: Vec<i32> = std::env::args()
+        .skip(2)
+        .map(|s| s.parse().unwrap())
+        .collect();
+    assert_eq!(args.len(), 5, "expected PID, left, top, width, height");
+    let (cx, cy) = (args[1] + args[3] / 2, args[2] + args[4] / 2);
+    let screen = eternal_host::input::windows_inject::virtual_screen();
+    let contact = POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_FIRSTBUTTON;
+    let down = POINTER_FLAG_DOWN | contact;
+    let moved = POINTER_FLAG_UPDATE | contact;
+    let hover = POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE;
+    let cases: [(&str, &[(POINTER_FLAGS, i32, u32)]); 8] = [
+        (
+            "control_stroke",
+            &[(down, 0, 512), (moved, 0, 512), (POINTER_FLAG_UP, 0, 0)],
+        ),
+        (
+            "control_hover_then_down_elsewhere",
+            &[(hover, 0, 0), (down, 5, 512), (POINTER_FLAG_UP, 5, 0)],
+        ),
+        (
+            "down_zero_pressure",
+            &[(down, 0, 0), (moved, 0, 0), (POINTER_FLAG_UP, 0, 0)],
+        ),
+        ("leave_without_hover", &[(POINTER_FLAG_UPDATE, 0, 0)]),
+        ("up_without_contact", &[(POINTER_FLAG_UP, 0, 0)]),
+        (
+            "update_contact_without_down",
+            &[(moved, 0, 512), (POINTER_FLAG_UP, 0, 0)],
+        ),
+        (
+            "down_while_in_contact",
+            &[(down, 0, 512), (down, 5, 512), (POINTER_FLAG_UP, 5, 0)],
+        ),
+        (
+            "up_away_from_last_update",
+            &[(down, 0, 512), (POINTER_FLAG_UP, 5, 0)],
+        ),
+    ];
+    for (name, frames) in cases {
+        let device = unsafe { CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_NONE) }
+            .expect("native pen creation failed");
+        for (index, &(flags, dx, pressure)) in frames.iter().enumerate() {
+            let (x, y) =
+                eternal_host::input::desktop_pixel_to_pointer_location(cx + dx, cy, screen);
+            let info = POINTER_TYPE_INFO {
+                r#type: PT_PEN,
+                Anonymous: POINTER_TYPE_INFO_0 {
+                    penInfo: POINTER_PEN_INFO {
+                        pointerInfo: POINTER_INFO {
+                            pointerType: PT_PEN,
+                            pointerId: 1,
+                            pointerFlags: flags | POINTER_FLAG_PRIMARY,
+                            ptPixelLocation: POINT { x, y },
+                            ..Default::default()
+                        },
+                        penMask: PEN_MASK_PRESSURE,
+                        pressure,
+                        ..Default::default()
+                    },
+                },
+            };
+            let result = match unsafe { InjectSyntheticPointerInput(device, &[info]) } {
+                Ok(()) => "ok".to_string(),
+                Err(error) => format!("{:#010x}", error.code().0),
+            };
+            println!("SEQ {name} {index} {result}");
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        unsafe { DestroySyntheticPointerDevice(device) };
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
 }
 
 #[cfg(not(windows))]
