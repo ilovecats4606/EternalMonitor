@@ -525,14 +525,7 @@ impl InputRelay {
 
     fn inject(&mut self, injections: &[Injection]) {
         #[cfg(windows)]
-        {
-            // Pen samples go to the native device, or to the mouse while
-            // Windows refuses to create one.
-            let screen = windows_inject::virtual_screen();
-            let now = std::time::Instant::now();
-            let routed = self.pen_device.route(injections, screen, now);
-            windows_inject::inject(&routed, &mut self.pen_device, self.output);
-        }
+        windows_inject::inject(injections, &mut self.pen_device, self.output);
         #[cfg(not(windows))]
         {
             recorder::record(injections);

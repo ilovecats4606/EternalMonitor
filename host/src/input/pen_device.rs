@@ -139,49 +139,44 @@ impl<A: PenApi> PenDevice<A> {
         self.contact = PenContact::default();
     }
 
-    /// Keep pen samples for this device, or turn them into their mouse
-    /// equivalent while it is missing. A missing device is asked for again
-    /// where a stroke or hover starts; the relay has ended any earlier
-    /// stroke there, so the mouse holds no button for it.
-    pub fn route(
-        &mut self,
-        injections: &[Injection],
-        screen: VirtualScreen,
-        now: Instant,
-    ) -> Vec<Injection> {
-        let mut routed = Vec::with_capacity(injections.len());
-        for &injection in injections {
-            let Injection::Pen(sample) = injection else {
-                routed.push(injection);
-                continue;
-            };
-            if matches!(sample.phase, PenPhase::Down | PenPhase::Hover) {
-                self.revive(now);
-            }
-            if self.available() {
-                routed.push(injection);
-            } else {
-                routed.extend(pen_to_mouse(sample, screen));
-            }
-        }
-        routed
-    }
-
-    pub fn inject(
+    /// Deliver one pen sample to this device, or return its mouse
+    /// equivalent while the device is missing. A missing device is asked
+    /// for again where a stroke or hover starts; the relay has ended any
+    /// earlier stroke there, so the mouse holds no button for it. Samples
+    /// are delivered one at a time because delivering one can lose the
+    /// device, and the next must then take the mouse path.
+    pub fn deliver(
         &mut self,
         sample: PenSample,
         screen: VirtualScreen,
         output: Option<CaptureGeometry>,
-    ) {
-        if !self.available() {
-            return;
+        now: Instant,
+    ) -> Vec<Injection> {
+        if matches!(sample.phase, PenPhase::Down | PenPhase::Hover) {
+            self.revive(now);
         }
-        let mut target = Target {
-            slot: &mut self.slot,
-            screen,
-            output,
-        };
-        self.contact.deliver(sample, output, &mut target);
+        if self.available() {
+            let mut target = Target {
+                slot: &mut self.slot,
+                screen,
+                output,
+            };
+            self.contact.deliver(sample, output, &mut target);
+            // Ending the old pointer before this sample's frames may have
+            // recreated the device, and Windows may have refused the new
+            // one. A stroke or hover this sample starts or continues then
+            // goes on with the mouse; ending the device already ended the
+            // native pointer, so an end needs nothing more.
+            if self.available()
+                || matches!(
+                    sample.phase,
+                    PenPhase::Up | PenPhase::Cancel | PenPhase::Leave
+                )
+            {
+                return Vec::new();
+            }
+        }
+        pen_to_mouse(sample, screen)
     }
 
     /// The session ended or was taken over; see `PenContact::reset`.
@@ -305,16 +300,15 @@ mod tests {
         })
     }
 
-    /// Route a batch and inject what stays native, as the relay and
-    /// `windows_inject::inject` do; returns what went to the mouse.
+    /// Deliver a batch as `windows_inject::inject` does; returns what went
+    /// to the mouse.
     fn send(device: &mut PenDevice<FakeApi>, phases: &[PenPhase], now: Instant) -> Vec<Injection> {
-        let batch: Vec<_> = phases.iter().map(|&phase| pen(phase)).collect();
         let mut mouse = Vec::new();
-        for injection in device.route(&batch, SCREEN, now) {
-            match injection {
-                Injection::Pen(sample) => device.inject(sample, SCREEN, None),
-                other => mouse.push(other),
-            }
+        for &phase in phases {
+            let Injection::Pen(sample) = pen(phase) else {
+                unreachable!()
+            };
+            mouse.extend(device.deliver(sample, SCREEN, None, now));
         }
         mouse
     }
@@ -516,14 +510,14 @@ mod tests {
             }
             recorder::take()
         };
-        // Route and inject as `InputRelay::inject` does on Windows.
+        // Deliver as `windows_inject::inject` does.
         let deliver = |device: &mut PenDevice<FakeApi>, batch: &[Injection], now| {
             let mut mouse = Vec::new();
-            for injection in device.route(batch, SCREEN, now) {
-                match injection {
-                    Injection::Pen(sample) => device.inject(sample, SCREEN, Some(output)),
-                    other => mouse.push(other),
-                }
+            for &injection in batch {
+                let Injection::Pen(sample) = injection else {
+                    panic!("expected only pen input, got {injection:?}");
+                };
+                mouse.extend(device.deliver(sample, SCREEN, Some(output), now));
             }
             mouse
         };
@@ -571,5 +565,38 @@ mod tests {
             device.slot.api.frames,
             [(3, PenPhase::Down), (3, PenPhase::Up)]
         );
+    }
+
+    #[test]
+    fn a_stroke_that_loses_the_device_at_its_cancel_still_presses_the_mouse() {
+        // The reviewer's case: the previous up was lost, so the relay sends
+        // Cancel, Down. Windows refuses the cancel, then refuses to recreate
+        // the device that would end the old contact. Without the relay's
+        // cancel, PenContact ends the old contact itself, inside the down.
+        let (x, y) = super::super::desktop_pixel_to_abs(100, 100, SCREEN);
+        for ends_first in [true, false] {
+            let mut device = PenDevice::new(FakeApi::new(&[true, false]));
+            let now = Instant::now();
+            send(&mut device, &[PenPhase::Down], now);
+            device.slot.api.answer = Outcome::Rejected;
+            let mut strokes = vec![PenPhase::Down, PenPhase::Move, PenPhase::Up];
+            if ends_first {
+                strokes.insert(0, PenPhase::Cancel);
+            }
+            let mouse = send(&mut device, &strokes, now);
+            assert!(!device.available());
+            assert_eq!(device.slot.api.created, 2);
+            assert_eq!(
+                mouse,
+                [
+                    Injection::MoveAbs { x, y },
+                    Injection::LeftDown { x, y },
+                    Injection::MoveAbs { x, y },
+                    Injection::MoveAbs { x, y },
+                    Injection::LeftUp { x, y },
+                ],
+                "cancel first: {ends_first}"
+            );
+        }
     }
 }

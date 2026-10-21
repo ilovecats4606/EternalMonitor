@@ -270,8 +270,8 @@ pub fn become_per_monitor_dpi_aware() {
     let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 }
 
-/// Execute a resolved injection batch, after `PenDevice::route`. `output` is
-/// the captured display the batch was mapped onto, for diagnostics.
+/// Execute a resolved injection batch. `output` is the captured display the
+/// batch was mapped onto, for diagnostics.
 pub(crate) fn inject(
     injections: &[Injection],
     pen: &mut PenDevice,
@@ -282,78 +282,22 @@ pub(crate) fn inject(
         return;
     }
     let screen = virtual_screen();
+    let now = std::time::Instant::now();
     let mut inputs: Vec<INPUT> = Vec::with_capacity(injections.len() * 2);
-    for injection in injections {
-        let input = match *injection {
-            Injection::Pen(sample) => {
-                // Flush keyboard releases first when a session is cancelled.
-                if !inputs.is_empty() {
-                    unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-                    inputs.clear();
-                }
-                pen.inject(sample, screen, output);
-                continue;
-            }
-            Injection::KeyDown { scan, extended } | Injection::KeyUp { scan, extended } => {
-                let mut flags = KEYEVENTF_SCANCODE;
-                if extended {
-                    flags |= KEYEVENTF_EXTENDEDKEY;
-                }
-                if matches!(injection, Injection::KeyUp { .. }) {
-                    flags |= KEYEVENTF_KEYUP;
-                }
-                keyboard_input(scan, flags)
-            }
-            Injection::Unicode(unit) => {
-                inputs.push(keyboard_input(unit, KEYEVENTF_UNICODE));
-                keyboard_input(unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)
-            }
-            Injection::MoveAbs { x, y } => mouse_input(
-                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                i32::from(x),
-                i32::from(y),
-                0,
-            ),
-            Injection::LeftDown { x, y } => mouse_input(
-                MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                i32::from(x),
-                i32::from(y),
-                0,
-            ),
-            Injection::LeftUp { x, y } => mouse_input(
-                MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                i32::from(x),
-                i32::from(y),
-                0,
-            ),
-            Injection::RightDown { x, y } => mouse_input(
-                MOUSEEVENTF_RIGHTDOWN | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                i32::from(x),
-                i32::from(y),
-                0,
-            ),
-            Injection::RightUp { x, y } => mouse_input(
-                MOUSEEVENTF_RIGHTUP | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                i32::from(x),
-                i32::from(y),
-                0,
-            ),
-            Injection::Wheel { delta } => mouse_input(MOUSEEVENTF_WHEEL, 0, 0, delta),
-            Injection::MiddleDown { x, y } => mouse_input(
-                MOUSEEVENTF_MIDDLEDOWN | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                i32::from(x),
-                i32::from(y),
-                0,
-            ),
-            Injection::MiddleUp { x, y } => mouse_input(
-                MOUSEEVENTF_MIDDLEUP | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                i32::from(x),
-                i32::from(y),
-                0,
-            ),
-            Injection::HWheel { delta } => mouse_input(MOUSEEVENTF_HWHEEL, 0, 0, delta),
+    for &injection in injections {
+        let Injection::Pen(sample) = injection else {
+            push_input(&mut inputs, injection);
+            continue;
         };
-        inputs.push(input);
+        // Flush keyboard releases first when a session is cancelled.
+        if !inputs.is_empty() {
+            unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+            inputs.clear();
+        }
+        // Mouse input instead while Windows refuses the pen device.
+        for mouse in pen.deliver(sample, screen, output, now) {
+            push_input(&mut inputs, mouse);
+        }
     }
     if inputs.is_empty() {
         return;
@@ -368,6 +312,71 @@ pub(crate) fn inject(
             "SendInput injected fewer events than requested"
         );
     }
+}
+
+fn push_input(inputs: &mut Vec<INPUT>, injection: Injection) {
+    let input = match injection {
+        Injection::Pen(_) => unreachable!("pen samples go through PenDevice::deliver"),
+        Injection::KeyDown { scan, extended } | Injection::KeyUp { scan, extended } => {
+            let mut flags = KEYEVENTF_SCANCODE;
+            if extended {
+                flags |= KEYEVENTF_EXTENDEDKEY;
+            }
+            if matches!(injection, Injection::KeyUp { .. }) {
+                flags |= KEYEVENTF_KEYUP;
+            }
+            keyboard_input(scan, flags)
+        }
+        Injection::Unicode(unit) => {
+            inputs.push(keyboard_input(unit, KEYEVENTF_UNICODE));
+            keyboard_input(unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)
+        }
+        Injection::MoveAbs { x, y } => mouse_input(
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            i32::from(x),
+            i32::from(y),
+            0,
+        ),
+        Injection::LeftDown { x, y } => mouse_input(
+            MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            i32::from(x),
+            i32::from(y),
+            0,
+        ),
+        Injection::LeftUp { x, y } => mouse_input(
+            MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            i32::from(x),
+            i32::from(y),
+            0,
+        ),
+        Injection::RightDown { x, y } => mouse_input(
+            MOUSEEVENTF_RIGHTDOWN | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            i32::from(x),
+            i32::from(y),
+            0,
+        ),
+        Injection::RightUp { x, y } => mouse_input(
+            MOUSEEVENTF_RIGHTUP | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            i32::from(x),
+            i32::from(y),
+            0,
+        ),
+        Injection::Wheel { delta } => mouse_input(MOUSEEVENTF_WHEEL, 0, 0, delta),
+        Injection::MiddleDown { x, y } => mouse_input(
+            MOUSEEVENTF_MIDDLEDOWN | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            i32::from(x),
+            i32::from(y),
+            0,
+        ),
+        Injection::MiddleUp { x, y } => mouse_input(
+            MOUSEEVENTF_MIDDLEUP | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            i32::from(x),
+            i32::from(y),
+            0,
+        ),
+        Injection::HWheel { delta } => mouse_input(MOUSEEVENTF_HWHEEL, 0, 0, delta),
+    };
+    inputs.push(input);
 }
 
 fn probe_guard_allows(injections: &[Injection]) -> bool {
