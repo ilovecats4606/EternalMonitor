@@ -25,9 +25,8 @@ final class AudioStreamTests: XCTestCase {
         openSettings(app)
         XCTAssertTrue(toggle.waitForExistence(timeout: 5))
         setSwitch(toggle, to: "1")
-        app.swipeUp()
         let audio = app.descendants(matching: .any)["settings.hostAudio"].firstMatch
-        XCTAssertTrue(audio.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.swipeUp(toReveal: audio), app.debugDescription)
         let activeAudio = NSPredicate(format: "value CONTAINS %@", "Opus 128 kbps, buffer")
         expectation(for: activeAudio, evaluatedWith: audio)
         waitForExpectations(timeout: 5)

@@ -39,8 +39,7 @@ final class PairingFlowTests: XCTestCase {
         capture("pairing-token-reconnect", app: app)
         tapControl("display.settings", in: app, until: app.navigationBars["Settings"])
         let forget = app.buttons["settings.forgetPairings"]
-        for _ in 0..<3 where !forget.isHittable { app.swipeUp() }
-        XCTAssertTrue(forget.isHittable)
+        XCTAssertTrue(app.swipeUp(toReveal: forget))
         forget.tap()
         app.buttons["settings.done"].tap()
         disconnect(app)

@@ -66,24 +66,6 @@ struct SettingsView: View {
                 .listRowBackground(Theme.surfaceRaised)
 
                 Section {
-                    Label {
-                        Text("Your PC chooses whether this iPad mirrors its screen or works as a second screen. "
-                            + "In EternalMonitor on the PC, pick Mirror my screen or Second screen at the top of the Stream page. "
-                            + "This iPad reconnects by itself.")
-                            .font(.app(15, relativeTo: .callout))
-                            .foregroundStyle(Theme.text)
-                            .fixedSize(horizontal: false, vertical: true)
-                    } icon: {
-                        Image(systemName: "rectangle.on.rectangle")
-                            .foregroundStyle(Theme.textMuted)
-                    }
-                    .accessibilityIdentifier("settings.screenMode")
-                } header: {
-                    sectionHeader("Second screen or mirror")
-                }
-                .listRowBackground(Theme.surfaceRaised)
-
-                Section {
                     Toggle(isOn: $settings.controlPC) {
                         rowLabel("Control PC", "hand.point.up.left")
                     }
@@ -165,6 +147,26 @@ struct SettingsView: View {
                     sectionHeader("Connected PC")
                 } footer: {
                     footnote("These are set in EternalMonitor on your PC.")
+                }
+                .listRowBackground(Theme.surfaceRaised)
+
+                // After Connected PC: the audio status there stays close to the
+                // Play PC audio switch, and this explains what the PC decides.
+                Section {
+                    Label {
+                        Text("Your PC chooses whether this iPad mirrors its screen or works as a second screen. "
+                            + "In EternalMonitor on the PC, pick Mirror my screen or Second screen at the top of the Stream page. "
+                            + "This iPad reconnects by itself.")
+                            .font(.app(15, relativeTo: .callout))
+                            .foregroundStyle(Theme.text)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } icon: {
+                        Image(systemName: "rectangle.on.rectangle")
+                            .foregroundStyle(Theme.textMuted)
+                    }
+                    .accessibilityIdentifier("settings.screenMode")
+                } header: {
+                    sectionHeader("Second screen or mirror")
                 }
                 .listRowBackground(Theme.surfaceRaised)
 

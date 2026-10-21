@@ -85,8 +85,7 @@ final class ConnectScreenTests: XCTestCase {
         XCTAssertTrue(app.buttons["settings.button"].waitForExistence(timeout: 10))
         app.buttons["settings.button"].tap()
         let diagnostics = app.buttons["settings.diagnostics"]
-        for _ in 0..<5 where !diagnostics.isHittable { app.swipeUp() }
-        XCTAssertTrue(diagnostics.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.swipeUp(toReveal: diagnostics))
         diagnostics.tap()
         let copy = app.buttons["diagnostics.copy"]
         XCTAssertTrue(copy.waitForExistence(timeout: 5))
