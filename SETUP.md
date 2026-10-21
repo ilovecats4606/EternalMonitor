@@ -68,8 +68,10 @@ invite link.
    Tap **Allow**. Without this, the iPad cannot see your PC.
 3. Choose one of these ways to connect:
    - **Tap your PC.** The iPad looks for PCs by itself. Tap your PC under
-     **Found on this network** and it connects. Tap **Find PCs** to look
-     again.
+     **Found on this network** and it connects. While it says **Finding…**,
+     wait a moment. If it says **Couldn't get its address**, type the
+     **Address** instead. Tap **Find PCs** to look again. PCs you used before
+     stay under **Recent**.
    - **Scan the QR code.** On the PC, click **QR code**. On the iPad, tap
      **Scan QR code**, allow the camera, and point it at the code on the PC.
    - **Type the address.** Type the **Address** shown in the PC window into
@@ -193,6 +195,7 @@ or in the controls while streaming.
 | **Your PC answered, but no picture arrived** | Look at EternalMonitor on the PC and follow any message it shows, click **Restart**, then tap **Try again** on the iPad. |
 | **Lost the connection to your PC** or **Couldn't reconnect to your PC** | The PC may have gone to sleep or closed EternalMonitor. Wake it, check EternalMonitor is open, then tap **Try again**. |
 | **EternalMonitor isn't allowed on your local network** | Tap **Open Settings** and turn on **Local Network**. |
+| **The connection over the cable stopped** | Keep EternalMonitor and Apple Devices open on the PC, unlock the iPad, then unplug the cable and plug it in again. |
 | **That code didn't match** | Type the six digits currently shown on the PC. The code changes when you click **New code**. |
 | **Too many attempts** | Wait a minute, then enter the code again. |
 | **This app and EternalMonitor on your PC are different versions** | Install matching versions on both, then connect again. |
