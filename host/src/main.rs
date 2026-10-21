@@ -9,6 +9,11 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Helper modes (for example a `--failure-reporter` started by a crashed
+    // host) are dispatched here, before logging and before the single-instance
+    // check below: they run alongside the host and must never be turned away
+    // as a second instance or show its window.
+
     // Anchor the process-wide media clock before anything else runs.
     clock::init();
 
@@ -40,7 +45,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // One host per installation; a second launch shows the first one. Checked
-    // before the virtual display reset below, which would cut its stream.
+    // after any helper-mode dispatch above and before the virtual display
+    // reset below, which would cut the first host's stream.
     let Some(_instance) = eternal_host::single_instance::acquire() else {
         info!("EternalMonitor is already running; showing its window");
         eternal_host::single_instance::show_existing();

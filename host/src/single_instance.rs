@@ -3,9 +3,11 @@
 //! (Setup's /CLOSEAPPLICATIONS), cutting the other one's stream. A second
 //! launch brings the running window forward and exits.
 //!
-//! The key is the executable path plus the settings folder, so test harnesses
-//! that give each host its own APPDATA keep running side by side. The mutex is
-//! per Windows session.
+//! The key is the executable plus the settings folder, so test harnesses that
+//! give each host its own APPDATA keep running side by side. Both are resolved
+//! from open handles to their final paths, so a short (8.3) name, a junction
+//! or a `\\?\` spelling of the same install reaches the same key. The mutex
+//! is per Windows session.
 use std::path::Path;
 
 /// `Local\EternalMonitor-<hash>` for this executable and settings folder.
@@ -35,7 +37,38 @@ pub fn acquire() -> Option<Guard> {
     let Some(app_data) = crate::settings::app_data_dir() else {
         return Some(Guard::none());
     };
-    acquire_named(&mutex_name(&exe, &app_data))
+    // The settings folder may not exist yet on a first run.
+    let _ = std::fs::create_dir_all(&app_data);
+    acquire_named(&mutex_name(&canonical(&exe), &canonical(&app_data)))
+}
+
+/// The final path of an existing file or folder, as Windows resolves it from
+/// an open handle (links followed, short names expanded, `\\?\` removed).
+/// Falls back to the path as given when it can't be opened.
+pub fn canonical(path: &Path) -> std::path::PathBuf {
+    resolve(path).unwrap_or_else(|| path.to_path_buf())
+}
+
+#[cfg(windows)]
+fn resolve(path: &Path) -> Option<std::path::PathBuf> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    // FILE_FLAG_BACKUP_SEMANTICS opens folders too; no access needed.
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode(0x7)
+        .custom_flags(0x0200_0000)
+        .open(path)
+        .ok()?;
+    let handle = windows::Win32::Foundation::HANDLE(file.as_raw_handle());
+    eternal_updater::win::final_path(handle)
+        .ok()
+        .map(std::path::PathBuf::from)
+}
+
+#[cfg(not(windows))]
+fn resolve(path: &Path) -> Option<std::path::PathBuf> {
+    std::fs::canonicalize(path).ok()
 }
 
 #[cfg(windows)]
@@ -178,6 +211,63 @@ mod tests {
             name,
             mutex_name(Path::new(r"D:\other\EternalMonitor-host.exe"), data)
         );
+    }
+
+    /// Aliases of one install and settings folder reach one key.
+    #[test]
+    fn aliases_of_the_same_install_share_a_key() {
+        let dir = std::env::temp_dir().join(format!("eternal-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("install")).unwrap();
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let exe = dir.join("install").join("EternalMonitor-host.exe");
+        std::fs::write(&exe, b"MZ").unwrap();
+        let link = dir.join("alias");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("install"), &link).unwrap();
+        #[cfg(windows)]
+        assert!(std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(dir.join("install"))
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let key = |exe: &Path, data: &Path| mutex_name(&canonical(exe), &canonical(data));
+        let real = key(&exe, &dir.join("data"));
+        assert_eq!(
+            real,
+            key(&link.join("EternalMonitor-host.exe"), &dir.join("data")),
+            "through a link"
+        );
+        assert_eq!(
+            real,
+            key(&exe, &dir.join("install").join("..").join("data")),
+            "with .."
+        );
+        #[cfg(windows)]
+        {
+            let verbatim = format!(r"\\?\{}", exe.display());
+            assert_eq!(
+                real,
+                key(Path::new(&verbatim), &dir.join("data")),
+                "\\\\?\\ prefix"
+            );
+        }
+        assert_ne!(
+            real,
+            key(&exe, &dir.join("install")),
+            "another settings folder"
+        );
+        #[cfg(windows)]
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", "rmdir"])
+            .arg(&link)
+            .status();
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&link);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(windows)]
