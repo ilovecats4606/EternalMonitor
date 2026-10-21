@@ -7,6 +7,12 @@ use windows::Win32::UI::Controls::{
     CreateSyntheticPointerDevice, DestroySyntheticPointerDevice, HSYNTHETICPOINTERDEVICE,
     POINTER_FEEDBACK_NONE, POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
 };
+use windows::Win32::UI::HiDpi::{
+    AreDpiAwarenessContextsEqual, GetAwarenessFromDpiAwarenessContext,
+    GetThreadDpiAwarenessContext, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, DPI_AWARENESS_PER_MONITOR_AWARE,
+    DPI_AWARENESS_SYSTEM_AWARE, DPI_AWARENESS_UNAWARE,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
@@ -31,7 +37,10 @@ use super::{Injection, PenPhase, PenSample, VirtualScreen};
 #[derive(Debug)]
 pub struct PenDevice {
     handle: Option<HSYNTHETICPOINTERDEVICE>,
-    warned: bool,
+    /// Error codes already logged, so a repeated refusal logs once.
+    warned: Vec<windows::core::HRESULT>,
+    /// Windows dropped our contact after a rejected sample.
+    lost: bool,
 }
 
 // This is a process-owned User32 handle, not a pointer we dereference. Tokio
@@ -50,7 +59,8 @@ impl Default for PenDevice {
         };
         Self {
             handle,
-            warned: false,
+            warned: Vec::new(),
+            lost: false,
         }
     }
 }
@@ -60,10 +70,20 @@ impl PenDevice {
         self.handle.is_some()
     }
 
-    fn inject(&mut self, sample: PenSample) {
+    fn inject(&mut self, mut sample: PenSample, screen: VirtualScreen) {
         let Some(handle) = self.handle else {
             return;
         };
+        if self.lost {
+            match super::resume_pen_phase(sample.phase) {
+                Some(phase) => sample.phase = phase,
+                None => {
+                    self.lost = false;
+                    return;
+                }
+            }
+        }
+        let (x, y) = super::desktop_pixel_to_pointer_location(sample.x, sample.y, screen);
         let flags = match sample.phase {
             PenPhase::Down => {
                 POINTER_FLAG_DOWN
@@ -92,10 +112,7 @@ impl PenDevice {
                         pointerType: PT_PEN,
                         pointerId: 1,
                         pointerFlags: flags | POINTER_FLAG_PRIMARY,
-                        ptPixelLocation: POINT {
-                            x: sample.x,
-                            y: sample.y,
-                        },
+                        ptPixelLocation: POINT { x, y },
                         ..Default::default()
                     },
                     penMask: PEN_MASK_PRESSURE | PEN_MASK_TILT_X | PEN_MASK_TILT_Y,
@@ -110,11 +127,13 @@ impl PenDevice {
         // samples can arrive together; retry that same sample if the OS clock
         // has not advanced, instead of silently losing a stroke point or up.
         let started = std::time::Instant::now();
+        let not_ready = windows::core::HRESULT::from_win32(ERROR_NOT_READY.0);
         let result = loop {
             let result = unsafe { InjectSyntheticPointerInput(handle, &[info]) };
-            if result.as_ref().is_err_and(|error| {
-                error.code() == windows::core::HRESULT::from_win32(ERROR_NOT_READY.0)
-            }) && started.elapsed() < std::time::Duration::from_millis(2)
+            if result
+                .as_ref()
+                .is_err_and(|error| error.code() == not_ready)
+                && started.elapsed() < std::time::Duration::from_millis(2)
             {
                 std::thread::yield_now();
                 continue;
@@ -122,12 +141,36 @@ impl PenDevice {
             break result;
         };
         match result {
-            Ok(()) => super::log_injections(&[Injection::Pen(sample)]),
-            Err(error) if !self.warned => {
-                self.warned = true;
-                warn!(%error, "Windows rejected native pen input");
+            Ok(()) => {
+                self.lost = false;
+                super::log_injections(&[Injection::Pen(sample)]);
             }
-            Err(_) => {}
+            Err(error) => {
+                // ERROR_NOT_READY drops one sample but keeps the contact.
+                // Any other refusal cancels it; an end of contact leaves
+                // nothing to resume.
+                self.lost =
+                    error.code() != not_ready && super::resume_pen_phase(sample.phase).is_some();
+                if !self.warned.contains(&error.code()) {
+                    self.warned.push(error.code());
+                    // E_ACCESSDENIED: the secure desktop or an elevated window
+                    // has focus; SendInput is blocked there too, so there is no
+                    // useful fallback. Other codes point at the sample itself.
+                    warn!(
+                        %error,
+                        phase = ?sample.phase,
+                        desktop_x = sample.x,
+                        desktop_y = sample.y,
+                        location_x = x,
+                        location_y = y,
+                        virtual_left = screen.left,
+                        virtual_top = screen.top,
+                        virtual_width = screen.width,
+                        virtual_height = screen.height,
+                        "Windows rejected native pen input"
+                    );
+                }
+            }
         }
     }
 }
@@ -189,12 +232,39 @@ fn mouse_input(
     }
 }
 
+/// The injecting thread's DPI awareness. Anything other than per-monitor
+/// means Windows rescales the coordinates we pass.
+pub fn dpi_awareness() -> &'static str {
+    unsafe {
+        let context = GetThreadDpiAwarenessContext();
+        if AreDpiAwarenessContextsEqual(context, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+            .as_bool()
+        {
+            return "per_monitor_v2";
+        }
+        match GetAwarenessFromDpiAwarenessContext(context) {
+            DPI_AWARENESS_PER_MONITOR_AWARE => "per_monitor",
+            DPI_AWARENESS_SYSTEM_AWARE => "system",
+            DPI_AWARENESS_UNAWARE => "unaware",
+            _ => "unknown",
+        }
+    }
+}
+
+/// Desktop duplication, monitor rects, the virtual screen and every injected
+/// coordinate must share one physical pixel space. Call before any window,
+/// DXGI factory or GUI exists; a manifest or an earlier call wins otherwise.
+pub fn become_per_monitor_dpi_aware() {
+    let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+}
+
 /// Execute a resolved injection batch.
 pub fn inject(injections: &[Injection], pen: &mut PenDevice) {
     if !probe_guard_allows(injections) {
         warn!("Input probe guard rejected an injection batch");
         return;
     }
+    let screen = virtual_screen();
     let mut inputs: Vec<INPUT> = Vec::with_capacity(injections.len() * 2);
     for injection in injections {
         let input = match *injection {
@@ -204,7 +274,7 @@ pub fn inject(injections: &[Injection], pen: &mut PenDevice) {
                     unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
                     inputs.clear();
                 }
-                pen.inject(sample);
+                pen.inject(sample, screen);
                 continue;
             }
             Injection::KeyDown { scan, extended } | Injection::KeyUp { scan, extended } => {

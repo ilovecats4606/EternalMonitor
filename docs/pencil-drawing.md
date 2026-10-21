@@ -32,9 +32,11 @@ connection from iPad to PC cannot add pressure sensing to that Pencil. Hover
 availability depends on the Pencil and iPad hardware.
 
 Older hosts continue to receive the existing mouse-style Pencil events outside
-drawing mode. Drawing mode shows an unavailable message if the connected host
-does not advertise native pen support. The host logs failures to create or
-inject the Windows pen device.
+drawing mode. A current host that cannot create the Windows pen device turns
+those Pencil events into mouse input at the same position. Drawing mode shows
+an unavailable message if the connected host does not advertise native pen
+support. The host logs failures to create or inject the Windows pen device once
+per error code, with the sample's position and the virtual screen.
 
 ## Stroke delivery and latency
 
@@ -67,8 +69,18 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   1024 range. Positive X tilt points right; positive Y tilt points down the view.
 - Button bit 0 distinguishes contact from hover in version 2. Contact phases
   are down, move, up and cancel. Hover uses move to enter/update and end to leave.
-- Native pen events use physical desktop coordinates, including capture-display
-  offsets. Disconnect, backgrounding and view cancellation release contact.
+- The host maps Pencil to physical desktop pixels on the captured display, then
+  passes them to `InjectSyntheticPointerInput` relative to the virtual screen's
+  top-left, as that API requires. Desktop coordinates are only equivalent when
+  no monitor sits left of or above the primary; 0.3.1 used them directly, so a
+  monitor on the left moved the pen left by its width. The host is per-monitor
+  DPI aware from startup, so scaled displays use physical pixels throughout.
+- Disconnect, backgrounding and view cancellation release contact. If Windows
+  rejects a sample or cancels the contact after a display change, the next
+  sample starts a new contact instead of losing the rest of the stroke.
+- Each session logs `Input mapping geometry` once, and again when it changes:
+  the captured display and virtual screen rectangles, the pen origin, the DPI
+  awareness and whether Pencil uses the native pen or the mouse fallback.
 - The injector retries `ERROR_NOT_READY` for up to 2 ms because Windows can
   reject calls spaced less than its 0.1 ms timestamp resolution.
 - A held contact or hover refreshes after 50 ms without a new sample, preventing

@@ -1,3 +1,28 @@
+## EternalMonitor (unreleased)
+
+### What changed
+
+- Apple Pencil lands under the tip when another monitor sits to the left of or
+  above the main display, including an extended iPad display placed there.
+  Previously the pen moved left or up by that monitor's size, and strokes near
+  the far edge stopped with "Windows rejected native pen input".
+- After Windows cancels a pen contact, for example when a display changes mode,
+  the next Pencil sample starts a new stroke instead of being dropped until the
+  Pencil lifts.
+- The Windows host uses physical pixels from startup on scaled displays, and
+  touch clicks land on the exact pixel on every monitor layout.
+- If Windows cannot create its pen device, Pencil outside Drawing mode works as
+  a mouse instead of doing nothing.
+- The host log records the input mapping geometry for each session.
+
+### What to test
+
+With two monitors, place the second one to the left of the main display in
+Windows Display settings. Mirror the main display, then touch each corner and
+the centre of the iPad picture with Apple Pencil; the pointer should appear
+under the tip each time. Repeat with the extended iPad display placed to the
+left of and above the main display, and with display scaling at 125%.
+
 ## EternalMonitor v0.3.1
 
 Install the Windows and iPad 0.3.1 updates together. This release includes Intel
