@@ -9,7 +9,9 @@ use super::{
     value_or_unknown, AnalyzerApp, ClientSnapshot, Copied, StatsSnapshot, StreamState,
     CAPTURE_AUTO_LABEL, CAPTURE_VIRTUAL_LABEL, CAPTURE_VIRTUAL_SENTINEL, ENCODER_AUTO_LABEL,
 };
+use crate::capture::recovery::CaptureBlock;
 use crate::control::VddStatus;
+use crate::vdd::VddTaskHealth;
 
 impl AnalyzerApp {
     pub(super) fn stream_page(
@@ -97,16 +99,23 @@ impl AnalyzerApp {
             }
             ui.add_space(GAP - 10.0);
         }
+        #[allow(unused_mut)] // Debug builds may simulate a problem below.
+        let (mut capture_block, mut vdd_status, mut vdd_health) = (
+            *self.control.shared.capture_block.lock(),
+            *self.control.shared.vdd_status.lock(),
+            crate::vdd::task_health(),
+        );
+        #[cfg(debug_assertions)]
+        simulate_problem(&mut capture_block, &mut vdd_status, &mut vdd_health);
+        if let Some((icon, title, body)) =
+            capture_block_notice(capture_block, snap.pipeline_running)
+        {
+            widgets::banner(ui, WARNING, icon, title, body, 0.0, |_| {});
+            ui.add_space(GAP - 10.0);
+        }
         // The user asked for the extended (virtual) display but it could not be brought up,
         // so capture silently fell back to the primary monitor. Say so.
-        let vdd_status = *self.control.shared.vdd_status.lock();
-        if matches!(vdd_status, VddStatus::Failed | VddStatus::TaskFailed) {
-            let task_failed = vdd_status == VddStatus::TaskFailed;
-            let body = if task_failed {
-                "Part of the EternalMonitor install is missing or blocked. Download EternalMonitor-Setup.exe and run it again to repair it, then click Try again."
-            } else {
-                "Windows didn't add the second screen in time. Click Try again. If it keeps happening, run EternalMonitor-Setup.exe again to repair the display driver."
-            };
+        if let Some(notice) = second_screen_notice(vdd_status, vdd_health) {
             let mut copy_logs = false;
             let mut retry = false;
             widgets::banner(
@@ -114,14 +123,17 @@ impl AnalyzerApp {
                 WARNING,
                 Icon::Warning,
                 SECOND_SCREEN_FAILED_TITLE,
-                body,
-                if task_failed { 330.0 } else { 220.0 },
+                notice.body,
+                110.0 * (1 + notice.retry as u8 + notice.installer as u8) as f32,
                 |ui| {
                     copy_logs =
                         widgets::button(ui, Tone::Ghost, Some(Icon::Logs), "Copy logs").clicked();
-                    retry = widgets::button(ui, Tone::Secondary, Some(Icon::Refresh), "Try again")
-                        .clicked();
-                    if task_failed {
+                    if notice.retry {
+                        retry =
+                            widgets::button(ui, Tone::Secondary, Some(Icon::Refresh), "Try again")
+                                .clicked();
+                    }
+                    if notice.installer {
                         widgets::link(ui, "Download installer", INSTALLER_URL);
                     }
                 },
@@ -601,6 +613,117 @@ pub(super) const SOFTWARE_FALLBACK_TITLE: &str =
 pub(super) const SECOND_SCREEN_FAILED_TITLE: &str =
     "The second screen couldn't start, so your main screen is mirrored";
 const INSTALLER_URL: &str = "https://eternalmonitor.dev/download.html";
+
+/// Debug builds only, for screenshots: `ETERNAL_SIMULATE_PROBLEM` names one
+/// problem for the Stream page to show without it happening.
+#[cfg(debug_assertions)]
+fn simulate_problem(
+    block: &mut Option<CaptureBlock>,
+    vdd: &mut VddStatus,
+    health: &mut VddTaskHealth,
+) {
+    let Ok(name) = std::env::var("ETERNAL_SIMULATE_PROBLEM") else {
+        return;
+    };
+    match name.as_str() {
+        "secure-desktop" => *block = Some(CaptureBlock::SecureDesktop),
+        "display-changing" => *block = Some(CaptureBlock::DisplayChanging),
+        "unsupported-gpu" => *block = Some(CaptureBlock::UnsupportedOnThisGpu),
+        "too-many-capture-apps" => *block = Some(CaptureBlock::TooManyCaptureApps),
+        "session-disconnected" => *block = Some(CaptureBlock::SessionDisconnected),
+        "driver-not-responding" => {
+            (*vdd, *health) = (VddStatus::TaskFailed, VddTaskHealth::NotResponding)
+        }
+        "driver-tasks-missing" => {
+            (*vdd, *health) = (VddStatus::TaskFailed, VddTaskHealth::TasksMissing)
+        }
+        _ => {}
+    }
+}
+
+/// What the second screen notice says and offers.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct SecondScreenNotice {
+    pub body: &'static str,
+    pub retry: bool,
+    pub installer: bool,
+}
+
+/// The notice for a second screen that could not start, by what the display
+/// driver tasks report. `None` unless the second screen failed.
+pub(super) fn second_screen_notice(
+    status: VddStatus,
+    health: VddTaskHealth,
+) -> Option<SecondScreenNotice> {
+    let notice = |body, retry, installer| {
+        Some(SecondScreenNotice {
+            body,
+            retry,
+            installer,
+        })
+    };
+    match (status, health) {
+        (VddStatus::Failed | VddStatus::TaskFailed, VddTaskHealth::NotResponding) => notice(
+            "Windows' display driver stopped responding. Restart the PC to use the second screen.",
+            false,
+            false,
+        ),
+        (VddStatus::Failed | VddStatus::TaskFailed, VddTaskHealth::TasksMissing) => notice(
+            "The second screen isn't installed. Download EternalMonitor-Setup.exe and run it again to add it, then click Try again.",
+            true,
+            true,
+        ),
+        (VddStatus::TaskFailed, VddTaskHealth::Ok) => notice(
+            "Part of the EternalMonitor install is missing or blocked. Download EternalMonitor-Setup.exe and run it again to repair it, then click Try again.",
+            true,
+            true,
+        ),
+        (VddStatus::Failed, VddTaskHealth::Ok) => notice(
+            "Windows didn't add the second screen in time. Click Try again. If it keeps happening, run EternalMonitor-Setup.exe again to repair the display driver.",
+            true,
+            false,
+        ),
+        _ => None,
+    }
+}
+
+/// The notice while Windows keeps the screen from EternalMonitor. It goes
+/// away when the picture comes back or the stream stops.
+pub(super) fn capture_block_notice(
+    block: Option<CaptureBlock>,
+    running: bool,
+) -> Option<(Icon, &'static str, &'static str)> {
+    if !running {
+        return None;
+    }
+    Some(match block? {
+        CaptureBlock::SecureDesktop => (
+            Icon::Lock,
+            "Your PC is showing the lock screen or a permission prompt",
+            "The iPad keeps the last picture. Your desktop comes back on the iPad when you unlock the PC or answer the prompt.",
+        ),
+        CaptureBlock::DisplayChanging => (
+            Icon::Display,
+            "Windows is changing the display",
+            "This happens when the resolution changes or a full-screen game or app starts. The picture comes back by itself when it's done.",
+        ),
+        CaptureBlock::UnsupportedOnThisGpu => (
+            Icon::Display,
+            "Windows won't share this screen from the graphics card EternalMonitor uses",
+            "Open Settings > System > Display > Graphics, choose EternalMonitor, and pick the graphics card your screen is connected to (on a laptop, usually Power saving). Then quit EternalMonitor and open it again. Windows applies this choice only when the app opens.",
+        ),
+        CaptureBlock::TooManyCaptureApps => (
+            Icon::Warning,
+            "Another app is recording or sharing your screen",
+            "Windows lets only a few apps do this at once. Close the screen recorder or meeting app, and the picture comes back by itself.",
+        ),
+        CaptureBlock::SessionDisconnected => (
+            Icon::Lock,
+            "This Windows session is disconnected",
+            "This happens when Remote Desktop disconnects. Sign in at the PC itself to stream again.",
+        ),
+    })
+}
 
 /// What the Stream page says under the mirror / second screen choice.
 pub(super) fn screen_mode_text(

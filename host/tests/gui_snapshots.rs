@@ -6,6 +6,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use eframe::egui;
 use eframe::egui::accesskit::Role;
 use egui_kittest::{kittest::Queryable, Harness};
+use eternal_host::capture::recovery::CaptureBlock;
 use eternal_host::control::{GuiControl, SharedControl, VddStatus};
 use eternal_host::gui::AnalyzerApp;
 use eternal_host::settings::SettingsFile;
@@ -341,6 +342,17 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
         eternal_host::encoder::input::EncoderInput::Yuv420
     );
 
+    // Windows keeping the screen from the app is explained until frames
+    // flow again.
+    *shared.capture_block.lock() = Some(CaptureBlock::SecureDesktop);
+    harness.run_steps(4);
+    harness.get_by_label("Your PC is showing the lock screen or a permission prompt");
+    *shared.capture_block.lock() = None;
+    harness.run_steps(4);
+    assert!(harness
+        .query_by_label("Your PC is showing the lock screen or a permission prompt")
+        .is_none());
+
     // Choosing Second screen applies at once: no separate restart prompt.
     *shared.vdd_status.lock() = VddStatus::WaitingForClient;
     PIPELINE_STATS.lock().using_software_fallback = false;
@@ -446,12 +458,33 @@ fn review_screens() {
     PIPELINE_STATS.lock().using_software_fallback = false;
     let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
     save(&mut h, "problem-display-timeout");
+    // Why the second screen failed, as the driver tasks report it.
+    for name in ["driver-not-responding", "driver-tasks-missing"] {
+        std::env::set_var("ETERNAL_SIMULATE_PROBLEM", name);
+        let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
+        save(&mut h, &format!("problem-{name}"));
+    }
+    std::env::remove_var("ETERNAL_SIMULATE_PROBLEM");
     *shared.vdd_status.lock() = VddStatus::Inactive;
     SettingsFile {
         check_for_updates: false,
         ..Default::default()
     }
     .save();
+
+    // Windows keeping the screen from the app, in each way it can.
+    for (name, block) in [
+        ("secure-desktop", CaptureBlock::SecureDesktop),
+        ("display-changing", CaptureBlock::DisplayChanging),
+        ("unsupported-gpu", CaptureBlock::UnsupportedOnThisGpu),
+        ("too-many-capture-apps", CaptureBlock::TooManyCaptureApps),
+        ("session-disconnected", CaptureBlock::SessionDisconnected),
+    ] {
+        *shared.capture_block.lock() = Some(block);
+        let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
+        save(&mut h, &format!("problem-{name}"));
+    }
+    *shared.capture_block.lock() = None;
 
     connect_ipad(&shared);
     let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);

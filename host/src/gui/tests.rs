@@ -1,4 +1,6 @@
-use super::page_stream::{audio_summary, usb_cable_notice, usb_summary};
+use super::page_stream::{
+    audio_summary, capture_block_notice, second_screen_notice, usb_cable_notice, usb_summary,
+};
 use super::*;
 
 #[test]
@@ -268,4 +270,79 @@ fn display_choices_use_the_names_shared_with_the_ipad() {
     ] {
         assert!(body.contains("Wi-Fi") && !body.contains("WiFi"), "{body}");
     }
+}
+
+#[test]
+fn a_blocked_screen_is_explained_only_while_the_stream_runs() {
+    use crate::capture::recovery::CaptureBlock;
+    let blocks = [
+        CaptureBlock::SecureDesktop,
+        CaptureBlock::DisplayChanging,
+        CaptureBlock::UnsupportedOnThisGpu,
+        CaptureBlock::TooManyCaptureApps,
+        CaptureBlock::SessionDisconnected,
+    ];
+    assert!(capture_block_notice(None, true).is_none());
+    let mut titles = Vec::new();
+    for block in blocks {
+        // Stopping the stream clears the notice with the condition.
+        assert!(capture_block_notice(Some(block), false).is_none());
+        let (_, title, body) = capture_block_notice(Some(block), true).unwrap();
+        for jargon in ["DXGI", "duplication", "capture", "HRESULT", "GPU"] {
+            assert!(
+                !title.contains(jargon) && !body.contains(jargon),
+                "{title} {body}"
+            );
+        }
+        titles.push(title);
+    }
+    titles.dedup();
+    assert_eq!(titles.len(), blocks.len());
+    let (_, _, gpu) = capture_block_notice(Some(CaptureBlock::UnsupportedOnThisGpu), true).unwrap();
+    assert!(
+        gpu.contains("Settings > System > Display > Graphics"),
+        "{gpu}"
+    );
+    assert!(gpu.contains("open it again"), "{gpu}");
+    let (_, lock, _) = capture_block_notice(Some(CaptureBlock::SecureDesktop), true).unwrap();
+    assert!(lock.contains("lock screen"), "{lock}");
+}
+
+#[test]
+fn the_second_screen_notice_says_which_driver_problem_applies() {
+    use crate::control::VddStatus;
+    use crate::vdd::VddTaskHealth;
+    for status in [
+        VddStatus::Inactive,
+        VddStatus::WaitingForClient,
+        VddStatus::Attaching,
+        VddStatus::Active,
+    ] {
+        for health in [
+            VddTaskHealth::Ok,
+            VddTaskHealth::NotResponding,
+            VddTaskHealth::TasksMissing,
+        ] {
+            assert_eq!(second_screen_notice(status, health), None);
+        }
+    }
+    for status in [VddStatus::Failed, VddStatus::TaskFailed] {
+        // A hung driver needs a Windows restart; trying again cannot help.
+        let hung = second_screen_notice(status, VddTaskHealth::NotResponding).unwrap();
+        assert!(hung.body.contains("Restart the PC"), "{}", hung.body);
+        assert!(!hung.retry && !hung.installer);
+        // Missing driver tasks need the installer.
+        let missing = second_screen_notice(status, VddTaskHealth::TasksMissing).unwrap();
+        assert!(missing.body.contains("isn't installed"), "{}", missing.body);
+        assert!(missing.retry && missing.installer);
+    }
+    // Without a known driver problem the earlier wording stays.
+    let task = second_screen_notice(VddStatus::TaskFailed, VddTaskHealth::Ok).unwrap();
+    assert!(task.body.starts_with("Part of the EternalMonitor install"));
+    assert!(task.installer);
+    let slow = second_screen_notice(VddStatus::Failed, VddTaskHealth::Ok).unwrap();
+    assert!(slow
+        .body
+        .starts_with("Windows didn't add the second screen in time"));
+    assert!(slow.retry && !slow.installer);
 }
