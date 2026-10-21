@@ -36,6 +36,8 @@ pub const SEND_DEADLINE_US: u64 = 100_000;
 
 pub struct SessionPacket {
     pub session_id: u32,
+    /// The capture session that numbered this packet (`AudioStats::stream`).
+    pub stream: u64,
     pub packet: AudioPacket,
 }
 
@@ -187,6 +189,13 @@ impl AudioStats {
             stream: NEXT_STREAM.fetch_add(1, Ordering::Relaxed),
             ..Self::default()
         }
+    }
+
+    /// These stats, if they belong to the capture that numbered a packet.
+    /// Capture replaces the stats when audio restarts, and a retired
+    /// capture's leftover packets must never be charged to its replacement.
+    pub fn of_stream(&mut self, stream: u64) -> Option<&mut Self> {
+        (self.stream == stream).then_some(self)
     }
 
     /// Note the wire stream of a packet from this capture session.

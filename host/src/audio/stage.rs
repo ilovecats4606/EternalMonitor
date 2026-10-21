@@ -108,6 +108,7 @@ struct CaptureSession {
     mark_discontinuity: bool,
     next_input_us: Option<u64>,
     started_us: Option<u64>,
+    stream: u64,
 }
 
 impl CaptureSession {
@@ -120,6 +121,7 @@ impl CaptureSession {
             mark_discontinuity: true,
             next_input_us: None,
             started_us: None,
+            stream: 0,
         })
     }
 
@@ -187,15 +189,17 @@ impl CaptureSession {
             packet.discontinuity |= self.mark_discontinuity;
             match tx.try_send(SessionPacket {
                 session_id: self.id,
+                stream: self.stream,
                 packet,
             }) {
                 Ok(()) => self.mark_discontinuity = false,
                 Err(TrySendError::Full(rejected)) => {
                     self.mark_discontinuity = true;
-                    let mut stats = PIPELINE_STATS.lock();
-                    stats.audio.dropped += 1;
-                    stats.audio.capture_queue_dropped += 1;
-                    stats.audio.late_seqs.record(rejected.packet.seq);
+                    if let Some(audio) = PIPELINE_STATS.lock().audio.of_stream(rejected.stream) {
+                        audio.dropped += 1;
+                        audio.capture_queue_dropped += 1;
+                        audio.late_seqs.record(rejected.packet.seq);
+                    }
                 }
                 Err(TrySendError::Closed(_)) => return Ok(false),
             }
@@ -252,11 +256,13 @@ pub fn run_audio_stage(
                 .is_none_or(|session| session.id != session_id)
             {
                 active = None;
-                let session = CaptureSession::new(session_id)?;
+                let mut session = CaptureSession::new(session_id)?;
                 if !generation_is_current(generation) || !shared.running.load(Ordering::SeqCst) {
                     return Ok(false);
                 }
-                PIPELINE_STATS.lock().audio = AudioStats::started(session.source.name());
+                let stats = AudioStats::started(session.source.name());
+                session.stream = stats.stream;
+                PIPELINE_STATS.lock().audio = stats;
                 tracing::info!(
                     session_id,
                     device = session.source.name(),
@@ -395,6 +401,7 @@ mod tests {
             mark_discontinuity: true,
             next_input_us: None,
             started_us: None,
+            stream: 0,
         };
         assert!(unstarted.read().unwrap().is_none());
         assert!(unstarted.started_us.is_some_and(|at| at >= before));
@@ -408,6 +415,7 @@ mod tests {
                 mark_discontinuity: true,
                 next_input_us: None,
                 started_us: Some(START),
+                stream: 0,
             };
             let (tx, mut rx) = tokio::sync::mpsc::channel(super::super::QUEUE_CAPACITY);
             let mut sent = Vec::new();
@@ -468,6 +476,7 @@ mod tests {
                     mark_discontinuity: true,
                     next_input_us: None,
                     started_us: None,
+                    stream: 0,
                 };
                 let (tx, mut rx) = tokio::sync::mpsc::channel(super::super::QUEUE_CAPACITY);
                 let (mut sent, mut stale, mut first_age, mut blocks) = (0, 0, None, 0);
