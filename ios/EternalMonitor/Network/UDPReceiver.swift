@@ -28,7 +28,7 @@ final class UDPReceiver: MediaLink {
     let datagrams = MediaDatagrams()
     var onClosed: (() -> Void)?
     var onConnectionEstablished: (() -> Void)?
-    var onError: ((String) -> Void)?
+    var onError: ((LinkError) -> Void)?
     var onListenerReady: ((UInt16) -> Void)?
 
     private var connection: NWConnection?
@@ -71,7 +71,7 @@ final class UDPReceiver: MediaLink {
     @discardableResult
     func start(host: String) -> Bool {
         guard port != 0 else {
-            onError?("Invalid port \(port)")
+            onError?(LinkError(.invalidConfiguration, "Invalid port \(port)"))
             return false
         }
         queue.async { [self] in
@@ -88,7 +88,7 @@ final class UDPReceiver: MediaLink {
         let params = NWParameters.udp
 
         guard let remotePort = NWEndpoint.Port(rawValue: port) else {
-            onError?("Invalid port \(port)")
+            onError?(LinkError(.invalidConfiguration, "Invalid port \(port)"))
             return
         }
         let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: remotePort)
@@ -107,10 +107,12 @@ final class UDPReceiver: MediaLink {
                 self.receiveLoop()
             case .waiting(let error):
                 SupportDiagnostics.shared.record("warning", "udp", "Network.framework waiting: \(error)")
-                self.onError?("UDP path not ready: \(error.localizedDescription)")
+                let denied = connection.currentPath?.unsatisfiedReason == .localNetworkDenied
+                self.onError?(LinkError(denied ? .localNetworkDenied : .pathUnavailable,
+                    "UDP path not ready: \(error.localizedDescription)", underlying: error))
             case .failed(let error):
                 SupportDiagnostics.shared.record("error", "udp", "Network.framework failed: \(error)")
-                self.onError?("UDP connection failed: \(error.localizedDescription)")
+                self.onError?(LinkError(.connectionFailed, "UDP connection failed: \(error.localizedDescription)", underlying: error))
                 self.stopOnQueue()
             case .cancelled:
                 break
@@ -131,7 +133,7 @@ final class UDPReceiver: MediaLink {
         var addresses: UnsafeMutablePointer<addrinfo>?
         let result = getaddrinfo(host, String(port), &hints, &addresses)
         guard result == 0, let first = addresses else {
-            onError?("Cannot resolve \(host): \(String(cString: gai_strerror(result)))")
+            onError?(LinkError(.resolve, "Cannot resolve \(host): \(String(cString: gai_strerror(result)))"))
             return
         }
         defer { freeaddrinfo(first) }
@@ -184,7 +186,7 @@ final class UDPReceiver: MediaLink {
             startRepairTimer()
             return
         }
-        onError?("UDP socket failed: \(lastError)")
+        onError?(LinkError(.connectionFailed, "UDP socket failed: \(lastError)"))
     }
 
     /// Send one datagram to the host (control plane). Safe from any thread.
@@ -266,7 +268,8 @@ final class UDPReceiver: MediaLink {
             if count < 0 {
                 if errno == EINTR { continue }
                 if errno != EAGAIN && errno != EWOULDBLOCK && errno != ECONNREFUSED {
-                    onError?("UDP receive error: \(String(cString: strerror(errno)))")
+                    onError?(LinkError(.receive, "UDP receive error: \(String(cString: strerror(errno)))",
+                        underlying: POSIXErrorCode(rawValue: errno).map { POSIXError($0) }))
                 }
                 return
             }
@@ -298,7 +301,7 @@ final class UDPReceiver: MediaLink {
                 // restarts its pipeline, a path blip) must not silently kill
                 // reception forever — re-arm after a short delay as long as the
                 // connection object is still live.
-                self.onError?("UDP receive error: \(error.localizedDescription)")
+                self.onError?(LinkError(.receive, "UDP receive error: \(error.localizedDescription)", underlying: error))
                 if self.connection != nil {
                     self.queue.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self, weak connection] in
                         guard let self, let connection, self.connection === connection else { return }

@@ -89,7 +89,7 @@ final class UDPReceiverTests: XCTestCase {
         }
         // Avoid callback retaining the receiver after the assertions.
         defer { receiver.onListenerReady = nil }
-        receiver.onError = { XCTFail($0) }
+        receiver.onError = { XCTFail($0.message) }
         receiver.onControlDatagram = { data in
             XCTAssertEqual(data, packet)
             received.fulfill()

@@ -569,12 +569,12 @@ final class ConnectionManager: ObservableObject {
                 self.record(.info, isUSB ? "usb" : "udp", "Accepted stream from selected host")
             }
         }
-        receiver.onError = { [weak self] message in
+        receiver.onError = { [weak self] error in
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
-                self.record(.error, isUSB ? "usb" : "udp", "state=\(self.state) \(message)")
+                self.record(.error, isUSB ? "usb" : "udp", "state=\(self.state) \(error.message)")
                 guard self.state == .connecting else { return }
-                self.problem = .receiverError(message, host: normalizedHost)
+                self.problem = .linkFailure(error, isUSB: isUSB, host: normalizedHost)
                 if !isUSB { self.disconnect() }
             }
         }

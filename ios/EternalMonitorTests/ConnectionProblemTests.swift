@@ -1,3 +1,4 @@
+import Network
 import XCTest
 @testable import EternalMonitor
 
@@ -13,23 +14,47 @@ final class ConnectionProblemTests: XCTestCase {
         XCTAssertEqual(ConnectionProblem.timeout(listenerReady: true, helloAttempts: 1, handshakeDone: true, datagramsReceived: 0, isUSB: true), .noPicture)
     }
 
-    func testReceiverErrorsBecomePlainProblems() {
-        XCTAssertEqual(ConnectionProblem.receiverError("Cannot resolve pc.local: nodename nor servname provided", host: "pc.local"), .badAddress("pc.local"))
-        XCTAssertEqual(ConnectionProblem.receiverError("UDP path not ready: The operation couldn’t be completed. (Network.NWError error 50 - Network is down)", host: "x"), .noNetwork)
-        XCTAssertEqual(ConnectionProblem.receiverError("UDP connection failed: Local network prohibited", host: "x"), .localNetworkBlocked)
-        XCTAssertEqual(ConnectionProblem.receiverError("UDP socket failed: 48", host: "x"), .couldNotConnect("UDP socket failed: 48"))
+    func testLinkFailuresBecomePlainProblemsForTheirTransport() {
+        let wifi = { (error: LinkError) in ConnectionProblem.linkFailure(error, isUSB: false, host: "studio-pc") }
+        // DNS: a name that doesn't resolve, through either socket backend.
+        let noSuchRecord = LinkError(.pathUnavailable,
+            "UDP path not ready: The operation couldn’t be completed. (Network.NWError error -65554 - NoSuchRecord)",
+            underlying: NWError.dns(-65554))
+        XCTAssertEqual(wifi(noSuchRecord), .badAddress("studio-pc"))
+        XCTAssertEqual(wifi(LinkError(.resolve, "Cannot resolve studio-pc: nodename nor servname provided")), .badAddress("studio-pc"))
+        // Permission: Local Network access off, reported either way.
+        XCTAssertEqual(wifi(LinkError(.localNetworkDenied, "UDP path not ready: denied", underlying: NWError.posix(.EPERM))), .localNetworkBlocked)
+        XCTAssertEqual(wifi(LinkError(.connectionFailed, "UDP connection failed: PolicyDenied", underlying: NWError.dns(-65570))), .localNetworkBlocked)
+        // Offline.
+        XCTAssertEqual(wifi(LinkError(.pathUnavailable, "UDP path not ready: Network is down", underlying: NWError.posix(.ENETDOWN))), .noNetwork)
+        XCTAssertEqual(wifi(LinkError(.receive, "UDP receive error: No route to host", underlying: POSIXError(.EHOSTUNREACH))), .noNetwork)
+        // Unknown failures get general advice, never the raw error.
+        let unknown = LinkError(.connectionFailed, "UDP socket failed: Address already in use", underlying: POSIXError(.EADDRINUSE))
+        XCTAssertEqual(wifi(unknown), .couldNotConnect)
+        XCTAssertFalse(ConnectionProblem.couldNotConnect.detail.contains("Address already in use"))
+        // USB: a cable failure is never a Wi-Fi or DNS problem.
+        let usbReset = LinkError(.receive, "USB receive failed: The operation couldn’t be completed. (Network.NWError error 54 - Connection reset by peer)",
+            underlying: NWError.posix(.ECONNRESET))
+        for error in [usbReset, noSuchRecord, LinkError(.timeout, "USB handshake timed out.")] {
+            let problem = ConnectionProblem.linkFailure(error, isUSB: true, host: "USB")
+            XCTAssertEqual(problem, .usbFailed, error.message)
+        }
+        let usb = ConnectionProblem.usbFailed
+        XCTAssertTrue(usb.detail.contains("cable") && usb.detail.contains("Apple Devices"), usb.detail)
+        XCTAssertFalse(usb.detail.contains("Wi-Fi"), usb.detail)
+        XCTAssertEqual(usb.actions, [.retry])
     }
 
     func testEveryProblemSaysWhatToDoWithoutTransportJargon() {
         let all: [ConnectionProblem] = [
             .noReply(usb: false), .noReply(usb: true), .noPicture, .receiverNotReady, .badAddress("pc"),
-            .noNetwork, .localNetworkBlocked, .lost(.pcStoppedResponding), .lost(.cableUnplugged),
+            .noNetwork, .localNetworkBlocked, .couldNotConnect, .usbFailed, .lost(.pcStoppedResponding), .lost(.cableUnplugged),
             .lost(.usbTurnedOff), .reconnecting(attempt: 2, of: 6), .reconnectFailed, .pcEndedSession,
         ]
         for problem in all {
             XCTAssertFalse(problem.title.isEmpty)
             XCTAssertFalse(problem.detail.isEmpty)
-            for jargon in ["HELLO", "datagram", "heartbeat", "host", "UDP", "VideoToolbox", "FramePacket"] {
+            for jargon in ["HELLO", "datagram", "heartbeat", "host", "UDP", "VideoToolbox", "FramePacket", "NWError", "POSIX", "NoSuchRecord"] {
                 XCTAssertFalse(problem.title.contains(jargon) || problem.detail.contains(jargon), "\(problem): \(jargon)")
             }
         }

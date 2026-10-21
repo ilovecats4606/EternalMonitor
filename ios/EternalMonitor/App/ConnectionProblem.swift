@@ -1,4 +1,5 @@
 import Foundation
+import Network
 
 /// A connection problem told in plain words: what happened, what to do, and
 /// the button that does it. The technical detail stays in Connection details
@@ -14,7 +15,9 @@ enum ConnectionProblem: Equatable {
     case badAddress(String)
     case noNetwork
     case localNetworkBlocked
-    case couldNotConnect(String)
+    case couldNotConnect
+    /// The cable connection failed after it had opened.
+    case usbFailed
     /// A live session stopped: heartbeats ran out or the cable came out.
     case lost(LostReason)
     case reconnecting(attempt: Int, of: Int)
@@ -42,6 +45,7 @@ enum ConnectionProblem: Equatable {
         case .noNetwork: return "This iPad isn't connected to a network"
         case .localNetworkBlocked: return "EternalMonitor isn't allowed on your local network"
         case .couldNotConnect: return "Couldn't connect to your PC"
+        case .usbFailed: return "The connection over the cable stopped"
         case .lost(.pcStoppedResponding): return "Lost the connection to your PC"
         case .lost(.cableUnplugged): return "The USB cable was disconnected"
         case .lost(.usbTurnedOff): return "USB connections were turned off"
@@ -70,8 +74,10 @@ enum ConnectionProblem: Equatable {
             return "Turn on Wi-Fi and join the same network as your PC, or connect with a USB cable."
         case .localNetworkBlocked:
             return "Open Settings and turn on Local Network for EternalMonitor, then try again."
-        case .couldNotConnect(let reason):
-            return "Check that this iPad is on the same Wi-Fi as your PC, then try again. (\(reason))"
+        case .couldNotConnect:
+            return "Check that this iPad and your PC are on the same Wi-Fi and that EternalMonitor is open on the PC, then try again."
+        case .usbFailed:
+            return "Keep EternalMonitor and Apple Devices open on the PC, unlock this iPad, then unplug the cable and plug it in again."
         case .lost(.pcStoppedResponding):
             return "The PC may have gone to sleep, closed EternalMonitor, or lost its network. Wake the PC, check EternalMonitor is open, then try again."
         case .lost(.cableUnplugged):
@@ -105,18 +111,32 @@ enum ConnectionProblem: Equatable {
         return datagramsReceived == 0 ? .noReply(usb: isUSB) : .noPicture
     }
 
-    /// A receiver error string, as the iPad's network stack reported it.
-    static func receiverError(_ message: String, host: String) -> ConnectionProblem {
-        let lower = message.lowercased()
-        if lower.contains("local network") || lower.contains("prohibited") || lower.contains("-65570") {
-            return .localNetworkBlocked
+    /// What a link failure means for the user. The raw error stays in the
+    /// support log; nothing here shows it.
+    static func linkFailure(_ error: LinkError, isUSB: Bool, host: String) -> ConnectionProblem {
+        // The cable is a local tunnel: Wi-Fi, DNS and Local Network don't apply.
+        if isUSB { return .usbFailed }
+        if error.kind == .localNetworkDenied { return .localNetworkBlocked }
+        if let nw = error.underlying as? NWError {
+            switch nw {
+            case .dns(let code):
+                // kDNSServiceErr_PolicyDenied: Local Network access is off.
+                return code == -65570 ? .localNetworkBlocked : .badAddress(host)
+            case .posix(let code) where offline.contains(code):
+                return .noNetwork
+            default:
+                break
+            }
         }
-        if message.hasPrefix("Cannot resolve") { return .badAddress(host) }
-        if message.hasPrefix("UDP path not ready") || lower.contains("network is down") || lower.contains("no route") {
-            return .noNetwork
+        if let posix = error.underlying as? POSIXError, offline.contains(posix.code) { return .noNetwork }
+        switch error.kind {
+        case .resolve: return .badAddress(host)
+        case .pathUnavailable: return .noNetwork
+        default: return .couldNotConnect
         }
-        return .couldNotConnect(message)
     }
+
+    private static let offline: Set<POSIXErrorCode> = [.ENETDOWN, .ENETUNREACH, .EHOSTUNREACH]
 }
 
 /// What the USB cable card says for each listener status.
