@@ -34,9 +34,10 @@ const READY_WAIT: Duration = Duration::from_secs(3);
 /// How long the crash message waits for the virtual display to turn off.
 #[cfg(windows)]
 const CLEANUP_WAIT: Duration = Duration::from_secs(5);
-/// How long the reporter waits for the turn-off at most. With no message on
-/// screen it exits by then; a message keeps it until the user closes it, but
-/// nothing else waits for the message.
+/// How long the reporter waits for the turn-off at most. This ends the wait,
+/// not the turn-off: with no message open the reporter then exits, which ends
+/// the turn-off too; while a message keeps the reporter open the turn-off may
+/// run on. The driver task inside it gives up after 20 s (`vdd::run_task`).
 #[cfg(windows)]
 const CLEANUP_CAP: Duration = Duration::from_secs(30);
 
@@ -260,10 +261,22 @@ fn run(args: &[String]) -> i32 {
     let _ = fs::write(file(READY), ProcessId::current().to_string());
 
     // Each message on its own thread: an open message never holds the
-    // watching, the report or the cleanup.
+    // watching, the report or the cleanup. Without a thread, a message waits
+    // until everything else is done.
     let mut messages = Vec::new();
+    let mut waiting = Vec::new();
     let mut show_soon = |title: String, body: String| {
-        messages.push(std::thread::spawn(move || show(&title, &body)));
+        let (thread_title, thread_body) = (title.clone(), body.clone());
+        match std::thread::Builder::new()
+            .name("failure-message".into())
+            .spawn(move || show(&thread_title, &thread_body))
+        {
+            Ok(thread) => messages.push(thread),
+            Err(error) => {
+                note(owner, &format!("could not start a message thread: {error}"));
+                waiting.push((title, body));
+            }
+        }
     };
     let mut report = None;
     if let Some(process) = process {
@@ -316,25 +329,26 @@ fn run(args: &[String]) -> i32 {
 
     // After any abnormal end, whatever the report says, turn the virtual
     // display off while the report is saved. The crash message waits for it
-    // at most CLEANUP_WAIT; it then runs on its own, for at most CLEANUP_CAP.
+    // at most CLEANUP_WAIT, and this process at most CLEANUP_CAP.
     let cleanup_started = Instant::now();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     if exit_code != Some(0) {
         let reporters = reporters(&directory);
-        std::thread::spawn(move || {
-            let note = match crate::vdd::disable_for_ended(owner, &reporters) {
-                Ok(true) => Some("turned the virtual display off".to_string()),
-                Ok(false) => Some("could not turn the virtual display off".to_string()),
-                Err(reason) if reason == super::display::NO_OWNER => None,
-                Err(note) => Some(note),
-            };
-            if let Some(note) = note {
-                let _ = crate::logging::append_now(&super::info_line(&format!(
-                    "Failure reporter for {owner} {note}"
-                )));
-            }
-            let _ = done_tx.send(());
-        });
+        let thread_reporters = reporters.clone();
+        let spawned = std::thread::Builder::new()
+            .name("display-cleanup".into())
+            .spawn(move || {
+                clean_up(owner, &thread_reporters);
+                let _ = done_tx.send(());
+            });
+        // The sender went with the closure, so the waits below end at once.
+        if let Err(error) = spawned {
+            note(
+                owner,
+                &format!("could not start the cleanup thread: {error}"),
+            );
+            clean_up(owner, &reporters);
+        }
     } else {
         // Nothing to clean up after a normal quit: the waits below end at once.
         drop(done_tx);
@@ -377,12 +391,35 @@ fn run(args: &[String]) -> i32 {
     let _ = done_rx.recv_timeout(CLEANUP_CAP.saturating_sub(cleanup_started.elapsed()));
     let saved = report.as_ref().is_none_or(|(_, saved)| saved.is_ok());
     remove_files(&directory, owner, saved);
-    // Everything is saved and cleaned up; stay only for open messages.
+    // Everything is saved and cleaned up; stay only for messages.
+    for (title, body) in waiting {
+        show(&title, &body);
+    }
     for message in messages {
         let _ = message.join();
     }
     let _ = fs::remove_file(file(READY));
     0
+}
+
+/// Turn the virtual display off after `owner` ended, if it still should be,
+/// and log what happened.
+#[cfg(windows)]
+fn clean_up(owner: ProcessId, reporters: &[ProcessId]) {
+    match crate::vdd::disable_for_ended(owner, reporters) {
+        Ok(true) => note(owner, "turned the virtual display off"),
+        Ok(false) => note(owner, "could not turn the virtual display off"),
+        Err(reason) if reason == super::display::NO_OWNER => {}
+        Err(reason) => note(owner, &reason),
+    }
+}
+
+/// One line about the reporter's own work in the session log.
+#[cfg(windows)]
+fn note(owner: ProcessId, text: &str) {
+    let _ = crate::logging::append_now(&super::info_line(&format!(
+        "Failure reporter for {owner} {text}"
+    )));
 }
 
 /// The module of another process that contains `address`, and the offset.
