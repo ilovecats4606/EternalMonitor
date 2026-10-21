@@ -27,12 +27,14 @@ static SHOWN_AT: OnceLock<Instant> = OnceLock::new();
 /// Test hook for the failure paths. Set `ETERNAL_SIMULATE_STARTUP_FAILURE` to
 /// `error`, `panic`, `hang` (30 s) or, on Windows, `crash`, `crash-thread`
 /// (on another thread) or `crash-heap` (while another thread holds the heap
-/// lock) to fail while the window renderer starts, or `panic-later` to panic
-/// 15 s after the window appears. A `-quiet` suffix skips the message box.
+/// lock) to fail while the window renderer starts, `panic-later` to panic
+/// 15 s after the window appears, or `surface-error` to report a surface
+/// error on every frame of the first two seconds. A `-quiet` suffix skips the
+/// message box.
 pub const SIMULATE_ENV: &str = "ETERNAL_SIMULATE_STARTUP_FAILURE";
 
-/// Called once a frame has been presented, so later failures read as a stop,
-/// not a failed start.
+/// Called once the window works, so later failures read as a stop, not a
+/// failed start.
 pub fn mark_window_shown() {
     WINDOW_SHOWN.store(true, Ordering::Relaxed);
     let _ = SHOWN_AT.set(Instant::now());
@@ -325,6 +327,17 @@ pub(crate) fn simulate_window_failure() {
             .is_some_and(|shown| shown.elapsed() > Duration::from_secs(15))
     {
         panic!("Simulated panic after the window appeared, from {SIMULATE_ENV}");
+    }
+}
+
+/// Count surface errors for the first two seconds of frames, when
+/// [`SIMULATE_ENV`] asks.
+pub(crate) fn simulate_surface_error(failures: &std::sync::atomic::AtomicU64) {
+    static FIRST_FRAME: OnceLock<Instant> = OnceLock::new();
+    if simulated() == "surface-error"
+        && FIRST_FRAME.get_or_init(Instant::now).elapsed() < Duration::from_secs(2)
+    {
+        failures.fetch_add(1, Ordering::SeqCst);
     }
 }
 
