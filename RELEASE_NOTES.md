@@ -1,3 +1,30 @@
+## Unreleased
+
+### What changed
+
+- Windows shows a banner on every page and one notification when a new
+  version is ready. **Update now** downloads the installer, checks it against
+  the SHA-256 published with the release, installs it with only the Windows
+  permission prompt and a progress window, and restarts EternalMonitor. If an
+  iPad is streaming, the update waits until streaming stops. If anything fails,
+  the current version keeps running and the banner links to the website.
+- Windows Settings has **Check for updates automatically** and **Check now**.
+  **Later** hides the banner for that version for a day.
+- The iPad connect screen and Settings say when a newer build is ready in
+  TestFlight, with an **Open TestFlight** button.
+- When the PC and iPad cannot connect because one is older, both apps say which
+  one to update and how.
+- Both apps read https://eternalmonitor.dev/latest.json, which is published
+  only after Apple approves the matching iPad build. Requests carry no
+  identifiers.
+
+### What to test
+
+Install the previous version on Windows, then click **Update now** when the
+banner appears. Approve the Windows prompt and check that EternalMonitor opens
+again on the new version. Try it once while streaming. On the iPad, tap
+**Open TestFlight** from the banner.
+
 ## EternalMonitor v0.3.1
 
 Install the Windows and iPad 0.3.1 updates together. This release includes Intel

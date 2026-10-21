@@ -178,6 +178,27 @@ an older EternalMonitor or a Windows 10 version before 1809. Update both.
 The app's settings open from the gear button, at the top of the connect screen
 or in the controls while streaming.
 
+## Keep both apps up to date
+
+Update both devices when a new version comes out. Each app tells you.
+
+**On the PC:** a banner says **EternalMonitor 0.3.2 is available** (with the
+new version number), and Windows shows one notification. Click **Update now**.
+When Windows asks for permission, click **Yes**. EternalMonitor closes,
+installs the update and opens again by itself. If you are streaming, the update
+waits until you stop. **Later** hides the banner until the next day.
+
+In the PC window's **Settings**, **Check for updates automatically** turns the
+daily check on or off. **Check now** checks right away.
+
+**On the iPad:** the connect screen says **A new version is ready in
+TestFlight**. Tap **Open TestFlight**, then **Update**. The app's settings show
+the same message under **Updates**. To get new versions without asking, open
+TestFlight, tap **EternalMonitor** and turn on **Automatic Updates**.
+
+The update check reads a small file from eternalmonitor.dev. It sends nothing
+about you or your devices.
+
 ## If something goes wrong
 
 | What you see | What to do |
@@ -186,7 +207,11 @@ or in the controls while streaming.
 | **Couldn't reach your PC after 6 tries** | Make sure EternalMonitor is open on the PC and the PC is awake. Check that both are on the same network. |
 | **That code didn't match** | Type the six digits currently shown on the PC. The code changes when you click **New code**. |
 | **Too many attempts** | Wait a minute, then enter the code again. |
+| **This iPad app is older than EternalMonitor on your PC** | Tap **Open TestFlight**, then **Update**. Connect again. |
+| **EternalMonitor on your PC is older than this iPad app** | On the PC, click **Update now**. Or download the new version from [eternalmonitor.dev](https://eternalmonitor.dev/download.html). |
+| **Update the iPad app to connect** on the PC | On the iPad, open TestFlight and tap **Update**. |
 | **This app and EternalMonitor on your PC are different versions** | Install matching versions on both, then connect again. |
+| **The update did not finish** on the PC | Click **Try again**. If it fails again, click **Download from the website** and run the installer. |
 | **Your PC is already streaming to another device** | Disconnect the other iPad first. |
 | The iPad never connects over USB | Open Apple Devices on the PC and leave it open. Unlock the iPad, accept **Trust**, and try another cable. Then unplug and plug in again. |
 | The iPad can't find the PC at all | Open the iPad's **Settings** app, then **Privacy & Security**, then **Local Network**, and turn on **EternalMonitor**. |
