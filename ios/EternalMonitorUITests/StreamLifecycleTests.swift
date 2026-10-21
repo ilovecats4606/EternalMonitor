@@ -63,10 +63,40 @@ final class StreamLifecycleTests: XCTestCase {
 
     private func readHostLog() -> String { (try? String(contentsOf: hostLog, encoding: .utf8)) ?? "" }
 
-    private func waitForSignal(_ label: String, app: XCUIApplication, timeout: TimeInterval) {
-        let signal = app.descendants(matching: .any)["display.signal"].firstMatch
-        expectation(for: NSPredicate(format: "exists == true AND label == %@", label), evaluatedWith: signal)
-        waitForExpectations(timeout: timeout)
+    /// The signal pill is part of the HUD, which hides itself after five
+    /// seconds, so the stream can be on air with the pill gone. Read one
+    /// accessibility snapshot per check, and once the display is up (the
+    /// connect screen's settings button is gone) with the pill off screen,
+    /// reveal the HUD, at most every two seconds so a reveal that is still
+    /// animating in isn't toggled off again.
+    private func waitForSignal(_ label: String, app: XCUIApplication, timeout: TimeInterval,
+                               file: StaticString = #filePath, line: UInt = #line) {
+        let deadline = Date().addingTimeInterval(timeout)
+        var revealed = Date.distantPast
+        while Date() < deadline {
+            if let tree = try? app.snapshot() {
+                if let signal = Self.find("display.signal", in: tree), Self.onScreen(signal) {
+                    if signal.label == label { return }
+                } else if Self.find("settings.button", in: tree) == nil, Date().timeIntervalSince(revealed) > 2 {
+                    app.revealHUD(.tap)
+                    revealed = Date()
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        XCTFail("The display never showed \"\(label)\"", file: file, line: line)
+    }
+
+    private static func find(_ identifier: String, in element: XCUIElementSnapshot) -> XCUIElementSnapshot? {
+        if element.identifier == identifier { return element }
+        for child in element.children {
+            if let found = find(identifier, in: child) { return found }
+        }
+        return nil
+    }
+
+    private static func onScreen(_ element: XCUIElementSnapshot) -> Bool {
+        element.frame.minX.isFinite && element.frame.minY.isFinite && !element.frame.isEmpty
     }
 
     private func disconnect(_ app: XCUIApplication) {
