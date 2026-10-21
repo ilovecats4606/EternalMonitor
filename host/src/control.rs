@@ -231,6 +231,7 @@ pub struct GuiControl {
 
 impl GuiControl {
     pub fn request_restart(&self) {
+        crate::vdd::recheck_tasks();
         if let Err(error) = self.supervisor_tx.send(SupervisorCommand::Restart) {
             warn!(error = %error, "Failed to send restart command");
         }
@@ -243,6 +244,7 @@ impl GuiControl {
     }
 
     pub fn request_start(&self) {
+        crate::vdd::recheck_tasks();
         if let Err(error) = self.supervisor_tx.send(SupervisorCommand::Start) {
             warn!(error = %error, "Failed to send start command");
         }

@@ -124,6 +124,14 @@ impl TaskGate {
         }
     }
 
+    /// Forget that the tasks were missing, so the next attempt finds out
+    /// whether Setup put them back. Still missing, that attempt fails fast.
+    fn recheck(&mut self) {
+        if self.health == VddTaskHealth::TasksMissing {
+            self.health = VddTaskHealth::Ok;
+        }
+    }
+
     fn after(&mut self, enabled: bool, outcome: TaskOutcome, now: Instant) {
         self.known_enabled = None;
         if enabled && outcome != TaskOutcome::Missing {
@@ -151,6 +159,12 @@ impl TaskGate {
 /// Current health of the driver tasks, for the GUI.
 pub fn task_health() -> VddTaskHealth {
     TASKS.health()
+}
+
+/// The user started or restarted the stream: missing driver tasks are looked
+/// for again at the next attempt, since Setup may have repaired them.
+pub fn recheck_tasks() {
+    TASKS.gate.lock().recheck();
 }
 
 /// Runs one driver request at a time, from the gate check through the state
@@ -450,6 +464,61 @@ mod tests {
         gate.after(true, TaskOutcome::Done, now);
         gate.after(false, TaskOutcome::Failed, now);
         assert_eq!(gate.before(false, Purpose::Cleanup, now), Gate::Run);
+    }
+
+    #[test]
+    fn try_again_after_setup_repairs_missing_tasks_runs_the_task() {
+        let tasks = DriverTasks::new();
+        let missing = |_: bool, _: &mut dyn FnMut()| TaskOutcome::Missing;
+        assert!(!tasks.set_enabled(true, Purpose::Attempt, || {}, missing));
+        assert_eq!(tasks.health(), VddTaskHealth::TasksMissing);
+        // Restarts on their own still do not run PowerShell for nothing.
+        assert!(!tasks.set_enabled(
+            true,
+            Purpose::Attempt,
+            || {},
+            |_, _| { panic!("missing tasks are not retried without the user") }
+        ));
+        // Try again before Setup ran: the task is looked for, and still missing.
+        tasks.gate.lock().recheck();
+        assert!(!tasks.set_enabled(true, Purpose::Attempt, || {}, missing));
+        assert_eq!(tasks.health(), VddTaskHealth::TasksMissing);
+        // Setup repaired the tasks; Try again turns the second screen on.
+        tasks.gate.lock().recheck();
+        let mut ran = 0;
+        assert!(tasks.set_enabled(
+            true,
+            Purpose::Attempt,
+            || {},
+            |_, _| {
+                ran += 1;
+                TaskOutcome::Done
+            }
+        ));
+        assert_eq!(ran, 1);
+        assert_eq!(tasks.health(), VddTaskHealth::Ok);
+    }
+
+    #[test]
+    fn try_again_and_start_in_the_window_look_for_repaired_tasks() {
+        // The only test that touches the process-wide gate.
+        let (supervisor_tx, _commands) = std::sync::mpsc::channel();
+        let control = crate::control::GuiControl {
+            shared: crate::control::SharedControl::new(9876, 15_000_000),
+            supervisor_tx,
+        };
+        for request in [
+            crate::control::GuiControl::request_restart,
+            crate::control::GuiControl::request_start,
+        ] {
+            TASKS
+                .gate
+                .lock()
+                .after(true, TaskOutcome::Missing, Instant::now());
+            assert_eq!(task_health(), VddTaskHealth::TasksMissing);
+            request(&control);
+            assert_eq!(task_health(), VddTaskHealth::Ok);
+        }
     }
 
     #[test]
