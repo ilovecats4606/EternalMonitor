@@ -14,9 +14,7 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 use tracing::{info, warn};
 
-#[cfg(windows)]
-static TASK_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-static GATE: parking_lot::Mutex<TaskGate> = parking_lot::Mutex::new(TaskGate::new());
+static TASKS: DriverTasks = DriverTasks::new();
 
 /// Whether the installer-owned driver tasks can be used. Stable values the GUI
 /// can explain; the extended display falls back to mirroring in both failures.
@@ -124,7 +122,59 @@ impl TaskGate {
 
 /// Current health of the driver tasks, for the GUI.
 pub fn task_health() -> VddTaskHealth {
-    GATE.lock().health
+    TASKS.health()
+}
+
+/// Runs one driver request at a time, from the gate check through the state
+/// update. A Disable at shutdown must wait for an Enable that is still
+/// running; checking the gate first let it read the old state, return
+/// "already off", and leave the monitor on when the Enable finished.
+struct DriverTasks {
+    serial: parking_lot::Mutex<()>,
+    gate: parking_lot::Mutex<TaskGate>,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))] // Driver tasks exist only on Windows.
+impl DriverTasks {
+    const fn new() -> Self {
+        Self {
+            serial: parking_lot::Mutex::new(()),
+            gate: parking_lot::Mutex::new(TaskGate::new()),
+        }
+    }
+
+    fn health(&self) -> VddTaskHealth {
+        self.gate.lock().health
+    }
+
+    fn set_enabled(
+        &self,
+        enabled: bool,
+        mut progress: impl FnMut(),
+        run: impl FnOnce(bool, &mut dyn FnMut()) -> TaskOutcome,
+    ) -> bool {
+        let _serial = loop {
+            if let Some(guard) = self.serial.try_lock_for(Duration::from_millis(50)) {
+                break guard;
+            }
+            progress();
+        };
+        // The gate guard ends with this statement. Logging below reads the
+        // health through the same mutex, which deadlocked when the guard
+        // lived through the whole match.
+        let decision = self.gate.lock().before(enabled, Instant::now());
+        match decision {
+            Gate::AlreadyDone => return true,
+            Gate::Refuse => {
+                tracing::debug!(enabled, health = ?self.health(), "Skipping VDD task");
+                return false;
+            }
+            Gate::Run => {}
+        }
+        let outcome = run(enabled, &mut progress);
+        self.gate.lock().after(enabled, outcome, Instant::now());
+        outcome == TaskOutcome::Done
+    }
 }
 
 /// Scheduled task names — must match the ones the installer registers.
@@ -135,14 +185,8 @@ pub const TASK_DISABLE: &str = "EternalMonitor VDD Disable";
 /// (e.g. a build installed without the VDD feature) just log a warning and return false —
 /// the caller falls back to the primary display.
 #[cfg(windows)]
-fn run_task(task: &str, mut progress: impl FnMut()) -> TaskOutcome {
+fn run_task(task: &str, progress: &mut dyn FnMut()) -> TaskOutcome {
     use std::os::windows::process::CommandExt;
-    let _guard = loop {
-        if let Some(guard) = TASK_LOCK.try_lock_for(Duration::from_millis(50)) {
-            break guard;
-        }
-        progress();
-    };
     let started = Instant::now();
     let script = format!("& {{ {} }} -Task '{}'", include_str!("vdd_task.ps1"), task);
     let mut command = Command::new("powershell.exe");
@@ -215,17 +259,9 @@ fn run_task(task: &str, mut progress: impl FnMut()) -> TaskOutcome {
 pub(crate) fn set_enabled(enabled: bool, progress: impl FnMut()) -> bool {
     #[cfg(windows)]
     {
-        match GATE.lock().before(enabled, Instant::now()) {
-            Gate::AlreadyDone => return true,
-            Gate::Refuse => {
-                tracing::debug!(enabled, health = ?task_health(), "Skipping VDD task");
-                return false;
-            }
-            Gate::Run => {}
-        }
-        let outcome = run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress);
-        GATE.lock().after(enabled, outcome, Instant::now());
-        outcome == TaskOutcome::Done
+        TASKS.set_enabled(enabled, progress, |enabled, progress| {
+            run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress)
+        })
     }
     #[cfg(not(windows))]
     {
@@ -286,6 +322,94 @@ mod tests {
         assert_eq!(gate.before(false, now), Gate::Run);
         gate.after(false, TaskOutcome::Missing, now);
         assert_eq!(gate.before(true, now + STUCK_COOLDOWN * 10), Gate::Refuse);
+    }
+
+    #[test]
+    fn a_refused_task_with_debug_logging_returns_instead_of_deadlocking() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let tasks = DriverTasks::new();
+            tasks
+                .gate
+                .lock()
+                .after(true, TaskOutcome::Missing, Instant::now());
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(std::io::sink)
+                .finish();
+            let ran = tracing::subscriber::with_default(subscriber, || {
+                tasks.set_enabled(true, || {}, |_, _| panic!("a refused task must not run"))
+            });
+            let _ = done_tx.send(ran);
+        });
+        let ran = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("set_enabled deadlocked on the gate mutex");
+        assert!(!ran);
+    }
+
+    #[test]
+    fn a_disable_waits_for_a_running_enable_instead_of_reading_stale_state() {
+        use std::sync::mpsc::channel;
+        use std::sync::{Arc, Mutex};
+        let tasks = Arc::new(DriverTasks::new());
+        let runs = Arc::new(Mutex::new(Vec::new()));
+        let record = |runs: &Arc<Mutex<Vec<bool>>>, enabled| runs.lock().unwrap().push(enabled);
+        // Startup leaves the device known to be off.
+        assert!(tasks.set_enabled(
+            false,
+            || {},
+            |e, _| {
+                record(&runs, e);
+                TaskOutcome::Done
+            }
+        ));
+
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel::<()>();
+        let enable = {
+            let (tasks, runs) = (Arc::clone(&tasks), Arc::clone(&runs));
+            std::thread::spawn(move || {
+                tasks.set_enabled(
+                    true,
+                    || {},
+                    |e, _| {
+                        record(&runs, e);
+                        started_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        TaskOutcome::Done
+                    },
+                )
+            })
+        };
+        started_rx.recv().unwrap();
+
+        // Shutdown asks for Disable while Enable is still running.
+        let (waiting_tx, waiting_rx) = channel();
+        let disable = {
+            let (tasks, runs) = (Arc::clone(&tasks), Arc::clone(&runs));
+            std::thread::spawn(move || {
+                tasks.set_enabled(
+                    false,
+                    || {
+                        let _ = waiting_tx.send(());
+                    },
+                    |e, _| {
+                        record(&runs, e);
+                        TaskOutcome::Done
+                    },
+                )
+            })
+        };
+        assert!(
+            waiting_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "Disable returned without waiting for the running Enable"
+        );
+        release_tx.send(()).unwrap();
+        assert!(enable.join().unwrap());
+        assert!(disable.join().unwrap());
+        assert_eq!(*runs.lock().unwrap(), vec![false, true, false]);
+        assert_eq!(tasks.gate.lock().known_enabled, Some(false));
     }
 
     #[test]
