@@ -225,7 +225,7 @@ pub async fn start_sender(
             // Random branch selection can delay a NACK by multiple frame
             // bursts on platforms with coarse sleep granularity.
             biased;
-            _ = pen_tick.tick(), if input_relay.pen_available() => {
+            _ = pen_tick.tick(), if input_relay.pen_tick_needed() => {
                 input_relay.keep_pen_alive(*shared.capture_geometry.lock());
             }
             _ = tokio::time::sleep_until(fault.next_deadline().unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)).into()), if fault.enabled() => {

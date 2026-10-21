@@ -96,6 +96,25 @@ impl PenApi for Win32Pen {
             &mut self.retry,
         )
     }
+
+    fn send_mouse(&mut self, injections: &[Injection]) -> usize {
+        let mut inputs = Vec::with_capacity(injections.len());
+        for &injection in injections {
+            push_input(&mut inputs, injection);
+        }
+        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) } as usize;
+        if sent == inputs.len() {
+            super::log_injections(injections);
+        } else {
+            // UIPI or a desktop switch; PenDevice tries a refused release again.
+            debug!(
+                sent,
+                requested = inputs.len(),
+                "SendInput inserted fewer pen fallback events than requested"
+            );
+        }
+        sent
+    }
 }
 
 pub(crate) type PenDevice = super::pen_device::PenDevice<Win32Pen>;
@@ -294,10 +313,7 @@ pub(crate) fn inject(
             unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
             inputs.clear();
         }
-        // Mouse input instead while Windows refuses the pen device.
-        for mouse in pen.deliver(sample, screen, output, now) {
-            push_input(&mut inputs, mouse);
-        }
+        pen.deliver(sample, screen, output, now);
     }
     if inputs.is_empty() {
         return;

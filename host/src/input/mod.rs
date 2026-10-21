@@ -511,6 +511,19 @@ impl InputRelay {
         }
     }
 
+    /// Whether the transport's refresh tick has pen work: a native device to
+    /// keep alive, or a mouse fallback release Windows refused.
+    pub fn pen_tick_needed(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.pen_device.available() || self.pen_device.owes_release()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
     pub fn pen_path(&self) -> PenPath {
         if cfg!(windows) {
             if self.pen_available() {
@@ -536,17 +549,16 @@ impl InputRelay {
     /// Release keys/buttons when a session ends, expires, or is superseded.
     pub fn reset(&mut self) {
         let releases = self.held.release();
-        // The native device ends only the pointer Windows holds and drops
-        // samples Windows never received, which a release would queue behind.
+        // The pen device ends only the pointer Windows holds, natively or on
+        // the mouse fallback, and drops samples Windows never received,
+        // which a release would queue behind.
         #[cfg(windows)]
-        let releases: Vec<_> = if self.pen_device.available() {
+        let releases: Vec<_> = {
             self.pen_device.reset();
             releases
                 .into_iter()
                 .filter(|injection| !matches!(injection, Injection::Pen(_)))
                 .collect()
-        } else {
-            releases
         };
         self.inject(&releases);
         self.session = None;
@@ -596,13 +608,7 @@ impl InputRelay {
     /// display moved or changed mode since the Pencil last moved.
     pub fn keep_pen_alive(&mut self, output: Option<CaptureGeometry>) {
         #[cfg(windows)]
-        {
-            // Samples that find the device gone continue on the mouse.
-            let mouse = self.pen_device.flush(output.or(self.output));
-            if !mouse.is_empty() {
-                windows_inject::inject(&mouse, &mut self.pen_device, self.output);
-            }
-        }
+        self.pen_device.flush(output.or(self.output));
         let Some(output) = output else {
             return;
         };

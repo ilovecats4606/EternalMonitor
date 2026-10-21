@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 use super::{CaptureGeometry, PenPhase, PenSample, VirtualScreen};
 
 /// Samples that may wait for Windows. Positions coalesce, so this bounds
-/// strokes that start and end while Windows stays not ready.
+/// strokes that start and end while Windows stays not ready; past it native
+/// input counts as stuck and the waiting samples go to the mouse.
 pub(super) const QUEUE_LIMIT: usize = 8;
 
 /// `POINTER_FLAG_*` values from winuser.h, so frames can be built and checked
@@ -175,6 +176,20 @@ pub struct PenContact {
     /// the rest of it, and mapped from its wire position onto the capture
     /// rect current at that moment.
     queue: VecDeque<PenSample>,
+    /// Samples that cannot be delivered natively, oldest first, for the
+    /// mouse; see `take_abandoned`.
+    abandoned: Vec<PenSample>,
+}
+
+/// What became of one sample.
+enum Brought {
+    Delivered,
+    /// Windows was not ready: it waits, to be planned again from where it
+    /// stopped.
+    Waiting,
+    /// It cannot be delivered natively: the device is gone, or Windows
+    /// rejected a frame for it that a fresh start did not fix.
+    Abandoned,
 }
 
 impl PenContact {
@@ -196,6 +211,17 @@ impl PenContact {
         output: Option<CaptureGeometry>,
         target: &mut impl PenTarget,
     ) {
+        if self.queue.len() >= QUEUE_LIMIT && !self.coalesces(&sample) {
+            // Windows has refused the first waiting frame for a whole queue
+            // of samples: native input is stuck. Recreating the device ends
+            // any pointer it holds and the retry it is owed; every waiting
+            // sample, and this one, goes to the mouse instead of being lost.
+            target.recreate();
+            self.state = PointerState::Out;
+            self.abandon(output);
+            self.abandoned.push(mapped(sample, output));
+            return;
+        }
         self.enqueue(sample);
         self.flush(output, target);
     }
@@ -205,20 +231,26 @@ impl PenContact {
     /// next Pencil sample.
     pub fn flush(&mut self, output: Option<CaptureGeometry>, target: &mut impl PenTarget) {
         while let Some(sample) = self.pending() {
-            if !self.bring(mapped(sample, output), target) {
-                return;
+            match self.bring(mapped(sample, output), target) {
+                Brought::Delivered => {
+                    self.queue.pop_front();
+                }
+                Brought::Waiting => return,
+                Brought::Abandoned => return self.abandon(output),
             }
-            self.queue.pop_front();
         }
     }
 
-    /// Take every sample not yet delivered, oldest first, mapped onto
-    /// `output`. Once the device is gone these continue on the mouse.
-    pub fn take_waiting(&mut self, output: Option<CaptureGeometry>) -> Vec<PenSample> {
-        self.queue
-            .drain(..)
-            .map(|sample| mapped(sample, output))
-            .collect()
+    /// Samples that cannot be delivered natively, oldest first: each one
+    /// left the queue without reaching Windows, and so did every sample
+    /// behind it. The caller sends them to the mouse.
+    pub fn take_abandoned(&mut self) -> Vec<PenSample> {
+        std::mem::take(&mut self.abandoned)
+    }
+
+    fn abandon(&mut self, output: Option<CaptureGeometry>) {
+        let waiting = self.queue.drain(..).map(|sample| mapped(sample, output));
+        self.abandoned.extend(waiting);
     }
 
     #[cfg(test)]
@@ -256,44 +288,39 @@ impl PenContact {
         }
     }
 
-    fn enqueue(&mut self, sample: PenSample) {
+    /// Whether `sample` replaces the last waiting one: only the latest
+    /// position matters, but the first sample is being retried, and Windows
+    /// must get that same frame again.
+    fn coalesces(&self, sample: &PenSample) -> bool {
         let update = |sample: &PenSample| matches!(sample.phase, PenPhase::Move | PenPhase::Hover);
-        let waiting = self.queue.len() > 1;
-        match self.queue.back_mut() {
-            // Only the latest position matters, but the first sample is
-            // being retried: Windows must get that same frame again.
-            Some(last) if waiting && update(last) && update(&sample) => *last = sample,
-            _ => {
-                // Drop the oldest waiting sample, but never the first, which
-                // may be part way through, the first end of contact, which
-                // the contact Windows has is owed, or this one.
-                if self.queue.len() == QUEUE_LIMIT {
-                    let owed = self
-                        .queue
-                        .iter()
-                        .position(|s| matches!(s.phase, PenPhase::Up | PenPhase::Cancel));
-                    let oldest = if owed == Some(1) { 2 } else { 1 };
-                    self.queue.remove(oldest);
-                }
-                self.queue.push_back(sample);
-            }
+        self.queue.len() > 1 && self.queue.back().is_some_and(update) && update(sample)
+    }
+
+    fn enqueue(&mut self, sample: PenSample) {
+        if self.coalesces(&sample) {
+            *self
+                .queue
+                .back_mut()
+                .expect("coalesces only behind the first") = sample;
+        } else {
+            self.queue.push_back(sample);
         }
     }
 
-    /// Plan and send the frames for one sample. Returns false if Windows was
-    /// not ready or the device is gone, leaving this sample and the rest
-    /// waiting: to be planned again from where it stopped, or taken for the
-    /// mouse. Ending the old pointer comes first in every plan, so a sample
-    /// whose plan lost the device has delivered none of its own frames; a
-    /// cancel or leave that lost it is done, since that ended the pointer.
-    fn bring(&mut self, sample: PenSample, target: &mut impl PenTarget) -> bool {
-        // A rejection cancels the contact; resume it from this same, freshly
-        // mapped sample once rather than waiting for the next one.
-        for _ in 0..2 {
+    /// Plan and send the frames for one sample. Ending the old pointer comes
+    /// first in every plan, so a sample abandoned on the way has delivered
+    /// none of its own frames; a cancel or leave is delivered once the
+    /// pointer has ended, even by recreating the device.
+    fn bring(&mut self, sample: PenSample, target: &mut impl PenTarget) -> Brought {
+        // A rejection cancels the contact; resume a move or hover from this
+        // same, freshly mapped sample once. A frame still rejected after
+        // that, or a rejected down or up, gives the sample up.
+        let mut restarted = false;
+        loop {
             let mut rejected = false;
             for frame in self.plan(sample) {
                 if !target.available() {
-                    return false;
+                    return Brought::Abandoned;
                 }
                 let outcome = match frame.phase {
                     PenPhase::Cancel | PenPhase::Leave => self.end(frame, target),
@@ -301,18 +328,21 @@ impl PenContact {
                 };
                 match outcome {
                     Outcome::Injected => {}
-                    Outcome::NotReady => return false,
+                    Outcome::NotReady => return Brought::Waiting,
                     Outcome::Rejected => {
                         rejected = true;
                         break;
                     }
                 }
             }
-            if !rejected || !matches!(sample.phase, PenPhase::Move | PenPhase::Hover) {
-                break;
+            if !rejected {
+                return Brought::Delivered;
             }
+            if restarted || !matches!(sample.phase, PenPhase::Move | PenPhase::Hover) {
+                return Brought::Abandoned;
+            }
+            restarted = true;
         }
-        true
     }
 
     /// End the pointer Windows holds with `frame`, a cancel or leave where
@@ -852,29 +882,36 @@ mod tests {
     }
 
     #[test]
-    fn a_full_queue_keeps_the_owed_release_and_the_latest_sample() {
+    fn a_full_queue_hands_every_waiting_sample_over_in_order() {
+        // Windows stays not ready while strokes queue behind a held
+        // contact. Rather than evict a sample, the edge that would overflow
+        // the queue counts native input as stuck: the device is recreated,
+        // ending the contact, and every waiting sample and that edge are
+        // handed over for the mouse, in order.
         let (mut contact, mut windows) = (PenContact::default(), FakeWindows::default());
         deliver(&mut contact, &mut windows, pen(Down, 10, 10));
-        windows.take();
         windows.not_ready = usize::MAX;
-        // A move waits ahead of the release; neither may be dropped.
-        deliver(&mut contact, &mut windows, pen(Move, 12, 10));
-        deliver(&mut contact, &mut windows, pen(Up, 12, 10));
-        for x in 20..40 {
-            deliver(&mut contact, &mut windows, pen(Down, x, 10));
-            deliver(&mut contact, &mut windows, pen(Move, x, 11));
-            deliver(&mut contact, &mut windows, pen(Up, x, 11));
-            assert!(contact.queue.len() <= QUEUE_LIMIT);
+        let mut queued = vec![pen(Move, 12, 10), pen(Up, 12, 10)];
+        for x in 20..22 {
+            queued.extend([pen(Down, x, 10), pen(Move, x, 11), pen(Up, x, 11)]);
         }
-        windows.not_ready = 0;
+        for &sample in &queued {
+            deliver(&mut contact, &mut windows, sample);
+            assert!(contact.take_abandoned().is_empty());
+        }
+        assert_eq!(contact.queue.len(), QUEUE_LIMIT);
         windows.take();
-        contact.flush(Some(OUTPUT), &mut windows);
-        let frames = windows.take();
-        assert_eq!(
-            frames[..2],
-            [F(Move, 12, 10, Injected), F(Up, 12, 10, Injected)]
-        );
-        assert_eq!(frames.last(), Some(&F(Up, 39, 11, Injected)));
+        deliver(&mut contact, &mut windows, pen(Down, 22, 10));
+        assert_eq!(windows.take(), [Recreated]);
+        queued.push(pen(Down, 22, 10));
+        let handed: Vec<_> = contact
+            .take_abandoned()
+            .iter()
+            .map(|s| (s.phase, s.x, s.y))
+            .collect();
+        let expected: Vec<_> = queued.iter().map(|s| (s.phase, s.x, s.y)).collect();
+        assert_eq!(handed, expected);
+        assert!(contact.pending().is_none());
         assert_eq!(contact.state(), PointerState::Out);
         assert!(windows.illegal.is_empty());
     }
