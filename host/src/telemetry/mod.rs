@@ -17,11 +17,16 @@ const BATCH_SIZE: usize = 4;
 const WAKE: &str = "";
 /// Longest a normal quit waits for uploads. Unsent batches stay in the outbox.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+/// Events another process adds to a launch number from here, clear of the
+/// launch's own sequence, which the backend keeps unique per launch.
+pub const FOREIGN_SEQUENCE_BASE: u64 = 1 << 40;
 static SENDER: OnceLock<mpsc::SyncSender<String>> = OnceLock::new();
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static STATUS: Mutex<String> = Mutex::new(String::new());
 static IDENTITY: OnceLock<(String, String)> = OnceLock::new();
+static OUTBOX: OnceLock<PathBuf> = OnceLock::new();
+// Shared by the upload thread and fatal reports, so events never reuse a number.
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Deserialize)]
@@ -121,6 +126,11 @@ pub fn status() -> String {
             }),
         DROPPED.load(Ordering::Relaxed)
     )
+}
+
+/// This launch's upload id, once uploads are configured.
+pub fn launch_id() -> Option<String> {
+    IDENTITY.get().map(|(_, launch)| launch.clone())
 }
 
 pub fn enabled() -> bool {
@@ -238,6 +248,7 @@ impl UploadGuard {
         let directory = crate::settings::app_data_dir()
             .unwrap()
             .join("diagnostics-outbox");
+        // Ready before any thread runs, so a fatal report can queue at once.
         let identity = match identity(&directory) {
             Ok(identity) => identity,
             Err(_) => {
@@ -249,6 +260,7 @@ impl UploadGuard {
             return Self { _uploader: None };
         }
         let _ = IDENTITY.set(identity);
+        let _ = OUTBOX.set(directory.clone());
         let (sender, uploader) = Uploader::spawn(config, directory);
         let _ = SENDER.set(sender);
         Self {
@@ -275,6 +287,65 @@ pub fn record(line: &str) {
             }
         }
     }
+}
+/// Queue one event (`level` is `error` or `info`) on disk now. The upload
+/// thread sends it, or the next launch does if this process ends first. Ok
+/// when the event is saved or uploads are off.
+pub fn queue_now(message: &str, level: &str) -> std::io::Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let Some(directory) = OUTBOX.get() else {
+        return Ok(());
+    };
+    let queued = queue_into(directory, message, level);
+    if queued.is_err() {
+        DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+    queued
+}
+fn queue_into(directory: &Path, message: &str, level: &str) -> std::io::Result<()> {
+    persist(directory, &batch(vec![event(message, level)])?)
+}
+/// Queue an event for another launch of this installation, from the failure
+/// reporter process. `index` keeps several such events distinct. Ok when the
+/// event is saved or uploads are off.
+pub fn queue_for_launch(
+    launch_id: &str,
+    index: u64,
+    message: &str,
+    level: &str,
+) -> std::io::Result<()> {
+    let Some(base) = crate::settings::app_data_dir() else {
+        return Ok(());
+    };
+    if base.join("diagnostics-upload-disabled").exists()
+        || !Config::load().is_some_and(|c| c.enabled)
+    {
+        return Ok(());
+    }
+    queue_foreign(
+        &base.join("diagnostics-outbox"),
+        launch_id,
+        index,
+        message,
+        level,
+    )
+}
+fn queue_foreign(
+    directory: &Path,
+    launch_id: &str,
+    index: u64,
+    message: &str,
+    level: &str,
+) -> std::io::Result<()> {
+    let installation_id = fs::read_to_string(directory.join("installation-id"))?;
+    let mut event = event(message, level);
+    event.sequence = FOREIGN_SEQUENCE_BASE + index;
+    let mut batch = batch(vec![event])?;
+    batch.installation_id = installation_id.trim().to_string();
+    batch.launch_id = launch_id.to_string();
+    persist(directory, &batch)
 }
 fn identity(directory: &Path) -> std::io::Result<(String, String)> {
     fs::create_dir_all(directory)?;
@@ -335,7 +406,7 @@ fn files(directory: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 fn persist(directory: &Path, batch: &Batch) -> std::io::Result<()> {
-    // The upload thread and a bounded shutdown may both write.
+    // The upload thread, a bounded shutdown and fatal reports may all write.
     static PERSIST: Mutex<()> = Mutex::new(());
     let _guard = PERSIST
         .lock()
@@ -785,6 +856,70 @@ mod tests {
             assert_eq!(path.exists(), !accepted);
         }
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reporter_events_join_the_crashed_launch_outside_its_sequence() {
+        let directory = std::env::temp_dir().join(id().unwrap());
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("installation-id"), "ab".repeat(16)).unwrap();
+        let launch = "cd".repeat(16);
+        queue_foreign(
+            &directory,
+            &launch,
+            1,
+            "EternalMonitor stopped unexpectedly: crash",
+            "error",
+        )
+        .unwrap();
+        let saved: Batch =
+            serde_json::from_slice(&fs::read(&files(&directory).unwrap()[0]).unwrap()).unwrap();
+        assert_eq!(saved.launch_id, launch);
+        assert_eq!(saved.installation_id, "ab".repeat(16));
+        assert_eq!(saved.events[0].sequence, FOREIGN_SEQUENCE_BASE + 1);
+        assert_eq!(saved.events[0].level, "error");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn fatal_reports_queue_as_errors_with_their_own_sequence_numbers() {
+        let directory = std::env::temp_dir().join(id().unwrap());
+        fs::create_dir_all(&directory).unwrap();
+        queue_into(
+            &directory,
+            "EternalMonitor could not start: token=abc",
+            "error",
+        )
+        .unwrap();
+        queue_into(&directory, "EternalMonitor could not start: again", "error").unwrap();
+        let saved: Vec<Batch> = files(&directory)
+            .unwrap()
+            .iter()
+            .map(|path| serde_json::from_slice(&fs::read(path).unwrap()).unwrap())
+            .collect();
+        assert_eq!(saved.len(), 2);
+        for batch in &saved {
+            assert_eq!(batch.events.len(), 1);
+            assert_eq!(batch.events[0].level, "error");
+            assert_eq!(batch.events[0].category, "host");
+        }
+        assert!(saved
+            .iter()
+            .any(|b| b.events[0].message == "EternalMonitor could not start: token=[REDACTED]"));
+        assert_ne!(saved[0].events[0].sequence, saved[1].events[0].sequence);
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn drained_events_keep_their_level() {
+        assert_eq!(level("2026-10-20T20:47:20Z ERROR Host panic"), "error");
+        assert_eq!(
+            level("2026-10-20T20:47:20Z  WARN Missing downlevel flags"),
+            "warning"
+        );
+        assert_eq!(
+            level("2026-10-20T20:47:20Z  INFO EternalMonitor shutting down"),
+            "info"
+        );
     }
     #[test]
     fn rejects_plaintext_and_credentials_in_urls() {

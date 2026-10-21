@@ -260,7 +260,12 @@ pub(crate) fn set_enabled(enabled: bool, progress: impl FnMut()) -> bool {
     #[cfg(windows)]
     {
         TASKS.set_enabled(enabled, progress, |enabled, progress| {
-            run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress)
+            let mut outcome = TaskOutcome::Failed;
+            crate::startup::display::change(enabled, || {
+                outcome = run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress);
+                outcome == TaskOutcome::Done
+            });
+            outcome
         })
     }
     #[cfg(not(windows))]
@@ -273,6 +278,20 @@ pub(crate) fn set_enabled(enabled: bool, progress: impl FnMut()) -> bool {
 /// Disable the virtual display device (best effort — failures are non-fatal).
 pub fn disable() {
     set_enabled(false, || {});
+}
+
+/// Disable the virtual display after `host` ended abnormally, if it owned the
+/// display and no other host of this install runs. For the failure reporter.
+#[cfg(windows)]
+pub(crate) fn disable_for_ended(
+    host: crate::startup::ProcessId,
+    reporters: &[crate::startup::ProcessId],
+) -> Result<bool, String> {
+    crate::startup::display::disable_for_ended(
+        host,
+        || crate::startup::display::other_host(host, reporters),
+        || run_task(TASK_DISABLE, &mut || {}) == TaskOutcome::Done,
+    )
 }
 
 #[cfg(test)]

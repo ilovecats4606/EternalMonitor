@@ -40,20 +40,14 @@ fn open_session_log() -> Option<RollingLogFile> {
         let _ = fs::create_dir_all(parent);
     }
 
-    let rotated = match rotate_session_logs(&path) {
-        Ok(()) => true,
-        Err(error) => {
-            eprintln!("Could not rotate session logs: {error}");
-            note_storage_error(&error);
-            false
-        }
-    };
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(rotated)
-        .append(!rotated)
-        .open(&path);
+    if let Err(error) = rotate_session_logs(&path) {
+        eprintln!("Could not rotate session logs: {error}");
+        note_storage_error(&error);
+    }
+    // Append mode, also after rotation moved the old file away: a fatal
+    // report appends with its own handle, and a positioned write would
+    // overwrite it.
+    let file = OpenOptions::new().create(true).append(true).open(&path);
     if let Err(error) = &file {
         note_storage_error(error);
     }
@@ -88,9 +82,7 @@ impl RollingLogFile {
             let rotated = rotate_session_logs(&self.path).is_ok();
             let file = OpenOptions::new()
                 .create(true)
-                .write(true)
-                .truncate(rotated)
-                .append(!rotated)
+                .append(true)
                 .open(&self.path)?;
             self.bytes = file.metadata()?.len();
             self.file = Some(file);
@@ -390,6 +382,20 @@ pub fn flush_before_exit<S, U, C>(session_log: S, uploads: U, console: C) {
     drop(session_log);
     drop(uploads);
     drop(console);
+}
+
+/// Write one line straight to the session log. A fatal failure can end the
+/// process before the output worker writes what is queued.
+pub fn append_now(line: &str) -> io::Result<()> {
+    append_line(&session_log_path(), line)
+}
+
+fn append_line(path: &Path, line: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(format!("{}\n", redact_support_text(line)).as_bytes())
 }
 
 fn resolve_session_log_path() -> PathBuf {
@@ -893,5 +899,55 @@ mod tests {
             "2"
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fatal_lines_append_redacted_without_the_output_worker() {
+        let directory = std::env::temp_dir().join(format!(
+            "eternal-append-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = directory.join("logs").join(SESSION_LOG_FILE_NAME);
+        append_line(&path, "earlier").unwrap();
+        append_line(&path, "ERROR could not start pairing_code=123456").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "earlier\nERROR could not start pairing_code=[REDACTED]\n"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn worker_writes_after_rotation_do_not_overwrite_a_fatal_line() {
+        let directory = std::env::temp_dir().join(format!(
+            "eternal-append-rotated-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(SESSION_LOG_FILE_NAME);
+        let mut output = RollingLogFile {
+            file: None,
+            path: path.clone(),
+            bytes: 0,
+            limit: 16,
+        };
+        output.write_all(b"aaaaaaaaaa\n").unwrap();
+        output.write_all(b"bbbbbbbbbb\n").unwrap();
+        append_line(&path, "fatal").unwrap();
+        output.write_all(b"cccc\n").unwrap();
+        drop(output);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "bbbbbbbbbb\nfatal\ncccc\n"
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 }
