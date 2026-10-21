@@ -22,6 +22,17 @@ Windows changes.
   quality limit moved under **Advanced** in Settings.
 - Drawing mode is explained in one sentence, and **Reconnect now to apply**
   appears when it changes mid-session.
+- The Windows Stream page says why the picture stopped while Windows keeps
+  the screen from EternalMonitor: the lock screen or a permission prompt, a
+  display change, another app recording the screen, a disconnected Remote
+  Desktop session, or a laptop graphics setting, with the Windows setting to
+  change. A second screen that fails because the display driver stopped
+  responding asks for a Windows restart; one whose driver is missing links to
+  the installer. Each message goes away when the problem ends.
+- The iPad says when the typed address is the pairing code, and when nothing
+  answers at an address ending in .1, which usually belongs to the router.
+- With VoiceOver running, the iPad's stream controls stay on screen until you
+  hide them.
 - The Windows window no longer closes without a word on PCs whose graphics
   driver crashes while it starts, such as Intel UHD 620 with a 2018 driver.
   The host prefers a fully supported graphics backend on the same GPU, usually
