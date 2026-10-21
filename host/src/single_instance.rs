@@ -117,6 +117,17 @@ pub fn acquire_named(_name: &str) -> Option<Guard> {
     Some(Guard::none())
 }
 
+/// Whether `image` (a running process's path) is the executable whose final
+/// path, lowercased, is `exe`.
+#[cfg(windows)]
+fn same_file(image: &str, exe: &str) -> bool {
+    canonical(Path::new(image))
+        .display()
+        .to_string()
+        .to_lowercase()
+        == exe
+}
+
 /// Restores and focuses the running host's window: one titled
 /// "EternalMonitor" whose process runs this same executable.
 #[cfg(windows)]
@@ -156,7 +167,7 @@ pub fn show_existing() {
             &mut size,
         )
         .is_ok()
-            && String::from_utf16_lossy(&path[..size as usize]).to_lowercase() == *exe;
+            && same_file(&String::from_utf16_lossy(&path[..size as usize]), exe);
         let _ = CloseHandle(process);
         if !same {
             return true.into();
@@ -176,7 +187,9 @@ pub fn show_existing() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let exe = exe.display().to_string().to_lowercase();
+    // Compared by final path: a second launch through a junction or short
+    // name must still find the first window.
+    let exe = canonical(&exe).display().to_string().to_lowercase();
     unsafe {
         let _ = EnumWindows(Some(visit), LPARAM(&exe as *const String as isize));
     }
