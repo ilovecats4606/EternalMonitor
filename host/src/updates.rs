@@ -1300,15 +1300,18 @@ impl Worker {
         changing(&self.state, self.path.as_deref(), change)
     }
 
-    /// Hands over to the helper without cutting a stream. Under the session
-    /// lock: either a client is already streaming (go back to waiting), or new
-    /// clients are refused until the host closes or the handoff fails.
+    /// Hands over to the helper. Under the session lock: either a client is
+    /// already streaming (go back to waiting, unless the user chose Stop and
+    /// update, which ends that stream), or new clients are refused until the
+    /// host closes or the handoff fails.
     fn install(&self, path: &Path, release: &Release) {
         let (before, after) = handoff_pause();
         std::thread::sleep(before);
+        // Read on its own: the update state is never locked inside the session.
+        let stop_stream = self.state.lock().force;
         let started = {
             let mut session = self.session.lock();
-            session.begin_update()
+            session.begin_update(stop_stream)
         };
         std::thread::sleep(if started { after } else { Duration::ZERO });
         if !started {

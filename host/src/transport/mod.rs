@@ -242,6 +242,12 @@ pub async fn start_sender(
             _ = liveness_tick.tick() => {
                 links.update_stats();
                 if !shared.running.load(Ordering::SeqCst) {
+                    // An update may have just stopped the stream and be
+                    // closing the host: tell the iPad before leaving.
+                    let goodbye = shared.session.lock().take_goodbye();
+                    if let Some((peer, datagram)) = goodbye {
+                        let _ = links.send_to(&datagram, peer).await;
+                    }
                     info!("Transport loop stopping on running=false");
                     break;
                 }

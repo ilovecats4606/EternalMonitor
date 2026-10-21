@@ -764,6 +764,133 @@ fn a_stream_that_starts_during_the_handoff_sends_the_update_back_to_waiting() {
     assert!(matches!(s.phase, Phase::Ready(_)));
 }
 
+struct StreamSource;
+
+impl crate::transport::session::ConfigSource for StreamSource {
+    fn stream_config(&self) -> eternal_wire::v2::control::StreamConfig {
+        eternal_wire::v2::control::StreamConfig {
+            stream_epoch: 1,
+            width: 1280,
+            height: 720,
+            fps: 60,
+            codec: 0,
+            flags: 0,
+            bitrate_bps: 10_000_000,
+        }
+    }
+
+    fn host_name(&self) -> String {
+        "TEST-HOST".into()
+    }
+}
+
+/// A session with one iPad streaming from `peer`.
+fn streaming_session(peer: crate::transport::link::PeerId) -> SharedSession {
+    use eternal_wire::v2::control::{ControlMessage, Hello2, CAP_DECODE_H264};
+    let mut session = crate::transport::session::Session::new(1);
+    let hello = ControlMessage::Hello2(Hello2 {
+        proto_min: 2,
+        proto_max: 2,
+        client_nonce: 1,
+        listen_port: 50000,
+        decoder_caps: CAP_DECODE_H264,
+        feature_caps: 0,
+        screen_px_w: 2420,
+        screen_px_h: 1668,
+        screen_pt_w: 1210,
+        screen_pt_h: 834,
+        refresh_hz: 120,
+        device_name: "Test iPad".into(),
+        device_id: 0,
+        preferred_fps: 0,
+        auth_token: [0; 16],
+        pairing_code: 0,
+    });
+    let admitted = session.handle_control(peer, 0, hello, &StreamSource, Instant::now());
+    assert_eq!(admitted.new_target, Some(peer));
+    Arc::new(Mutex::new(session))
+}
+
+fn worker(state: State, session: SharedSession) -> Worker {
+    Worker {
+        state: Arc::new(Mutex::new(state)),
+        path: None,
+        endpoints: Endpoints::production(),
+        session,
+        wake: Arc::new(|_| {}),
+    }
+}
+
+/// Through the worker, as the GUI hands it over: without Stop and update a
+/// streaming iPad keeps its stream and the update waits; with it, the stream
+/// ends with a goodbye the iPad shows, and the handoff goes ahead.
+#[test]
+fn stop_and_update_ends_the_stream_and_hands_over() {
+    use eternal_wire::v2::control::{parse_control, ByeReason, ControlMessage};
+    let peer = crate::transport::link::PeerId::udp(([10, 0, 0, 5], 50000).into());
+    let setup = PathBuf::from("setup.exe");
+    let ready = |force: bool| {
+        let mut s = state(Saved::default());
+        s.finish_check(1000, false, Ok(release("0.3.2")));
+        s.update_now(true);
+        if force {
+            s.force_now();
+        }
+        s.download_finished(Ok(setup.clone()));
+        if !force {
+            // The stream stopped for a moment, then an iPad connected again
+            // just before the handoff.
+            s.phase = Phase::Ready(setup.clone());
+        }
+        let (path, release) = s.take_ready(false).unwrap();
+        (s, path, release)
+    };
+
+    let (s, path, release) = ready(false);
+    let waiting = worker(s, streaming_session(peer));
+    waiting.install(&path, &release);
+    assert_eq!(
+        waiting.state.lock().phase,
+        Phase::Queued(Some(setup.clone()))
+    );
+    assert!(waiting.session.lock().is_active(), "the stream goes on");
+
+    let (s, path, release) = ready(true);
+    let forced = worker(s, streaming_session(peer));
+    forced.install(&path, &release);
+    let state = forced.state.lock();
+    assert!(
+        !matches!(state.phase, Phase::Queued(_)),
+        "Stop and update was sent back to waiting: {:?}",
+        state.phase
+    );
+    // There is no helper next to the test binary, so the handoff itself fails
+    // after the stream has ended; the app shows that and stays open.
+    assert_eq!(
+        state.phase,
+        Phase::Failed("The update could not start.".into())
+    );
+    let mut session = forced.session.lock();
+    assert!(!session.is_active(), "the stream ended");
+    let sent = session.tick(&StreamSource, false, Instant::now());
+    assert!(sent.client_lost);
+    let [(to, datagram)] = sent.replies.as_slice() else {
+        panic!("one goodbye, got {:?}", sent.replies);
+    };
+    assert_eq!(*to, peer);
+    assert!(matches!(
+        parse_control(datagram),
+        Ok((header, ControlMessage::Bye(ByeReason::HostShuttingDown))) if header.session_id != 0
+    ));
+    assert!(
+        session
+            .tick(&StreamSource, false, Instant::now())
+            .replies
+            .is_empty(),
+        "said once"
+    );
+}
+
 #[test]
 fn a_failed_helper_keeps_the_app_open_with_a_message() {
     let mut s = state(Saved::default());

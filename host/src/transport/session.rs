@@ -95,6 +95,8 @@ pub struct Session {
     /// either closes the host or gives up. Changed only under the session lock,
     /// together with the check that nobody is streaming.
     updating: bool,
+    /// The goodbye for a stream an update stopped, sent by the next tick.
+    goodbye: Option<(PeerId, Vec<u8>)>,
     /// Injected so tests control randomness; production passes a seeded value
     /// derived from process entropy.
     next_session_id: u32,
@@ -106,6 +108,7 @@ impl Session {
         Self {
             active: None,
             updating: false,
+            goodbye: None,
             next_session_id: session_id_seed.max(1),
             legacy_client_warned: false,
         }
@@ -115,15 +118,33 @@ impl Session {
         self.active.is_some()
     }
 
-    /// Starts an update handoff if nobody is streaming. Atomic with admission:
-    /// call with the session lock held; a client either got in before (and
-    /// this returns `false`) or is refused until [`Self::end_update`].
-    pub fn begin_update(&mut self) -> bool {
-        if self.active.is_some() {
-            return false;
+    /// Starts an update handoff. Atomic with admission: call with the session
+    /// lock held; a client either got in before (and this returns `false`) or
+    /// is refused until [`Self::end_update`]. With `stop_stream` (the user
+    /// chose Stop and update) a client that got in loses its session here and
+    /// is told the host is shutting down.
+    pub fn begin_update(&mut self, stop_stream: bool) -> bool {
+        if let Some(session) = self.active.as_ref() {
+            if !stop_stream {
+                return false;
+            }
+            let (peer, session_id) = (session.peer, session.session_id);
+            info!(%peer, "Stopping the stream for an update");
+            let msg_seq = self.next_msg_seq();
+            let bye = ControlMessage::Bye(ByeReason::HostShuttingDown);
+            self.goodbye = Some((
+                peer,
+                eternal_wire::v2::control::encode_control(session_id, msg_seq, &bye),
+            ));
+            self.active = None;
         }
         self.updating = true;
         true
+    }
+
+    /// The goodbye [`Self::begin_update`] left for a stopped stream, if any.
+    pub fn take_goodbye(&mut self) -> Option<(PeerId, Vec<u8>)> {
+        self.goodbye.take()
     }
 
     /// The update handoff failed; clients may connect again.
@@ -555,6 +576,10 @@ impl Session {
         now: Instant,
     ) -> Actions {
         let mut actions = Actions::default();
+        if let Some(goodbye) = self.take_goodbye() {
+            actions.replies.push(goodbye);
+            actions.client_lost = self.active.is_none();
+        }
         let Some(session) = self.active.as_ref() else {
             return actions;
         };
@@ -1064,7 +1089,7 @@ mod tests {
 
         // Nobody streaming: the handoff starts and new clients are turned away.
         let mut session = Session::new(1);
-        assert!(session.begin_update());
+        assert!(session.begin_update(false));
         let refused = session.handle_control(peer, 0, hello(1, 50000), &TestConfig, now);
         assert_eq!(parse_ack(&refused.replies[0].1).status, HelloStatus::Busy);
         assert!(refused.new_target.is_none());
@@ -1076,9 +1101,28 @@ mod tests {
         assert_eq!(admitted.new_target, Some(peer));
 
         // A client that got in first wins: the handoff does not start.
-        assert!(!session.begin_update());
+        assert!(!session.begin_update(false));
         let still = session.handle_control(peer, 0, hello(2, 50000), &TestConfig, now);
         assert_eq!(parse_ack(&still.replies[0].1).status, HelloStatus::Ok);
+        assert!(session.tick(&TestConfig, false, now).replies.is_empty());
+
+        // Unless the user chose Stop and update: that stream ends in the same
+        // step, and the next client is turned away.
+        let id = session.session_id().unwrap();
+        assert!(session.begin_update(true));
+        assert!(!session.is_active());
+        let other = addr([10, 0, 0, 6], 50000);
+        let refused = session.handle_control(other, 0, hello(3, 50000), &TestConfig, now);
+        assert_eq!(parse_ack(&refused.replies[0].1).status, HelloStatus::Busy);
+        // The next tick tells the iPad, once.
+        let ticked = session.tick(&TestConfig, false, now);
+        assert!(ticked.client_lost);
+        assert_eq!(ticked.replies.len(), 1);
+        assert_eq!(ticked.replies[0].0, peer);
+        let (header, bye) = eternal_wire::v2::control::parse_control(&ticked.replies[0].1).unwrap();
+        assert_eq!(header.session_id, id);
+        assert_eq!(bye, ControlMessage::Bye(ByeReason::HostShuttingDown));
+        assert!(session.take_goodbye().is_none());
     }
 
     #[test]
