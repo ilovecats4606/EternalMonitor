@@ -13,6 +13,8 @@ use std::{
 
 const MAX_FILES: usize = 512;
 const BATCH_SIZE: usize = 4;
+/// Sent by the shutdown to the upload thread; never an event.
+const WAKE: &str = "";
 /// Longest a normal quit waits for uploads. Unsent batches stay in the outbox.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 static SENDER: OnceLock<mpsc::SyncSender<String>> = OnceLock::new();
@@ -157,6 +159,9 @@ pub struct UploadGuard {
 /// is still in flight, the queued lines are written to the outbox from here.
 struct Uploader {
     stop: std::sync::Arc<AtomicBool>,
+    /// Wakes a thread waiting for lines, so an idle quit does not wait out
+    /// its receive timeout.
+    wake: mpsc::SyncSender<String>,
     receiver: std::sync::Arc<Mutex<mpsc::Receiver<String>>>,
     directory: PathBuf,
     done: mpsc::Receiver<()>,
@@ -179,6 +184,7 @@ impl Uploader {
         };
         let uploader = Self {
             stop,
+            wake: sender.clone(),
             receiver,
             directory,
             done,
@@ -190,6 +196,7 @@ impl Uploader {
 impl Drop for Uploader {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        let _ = self.wake.try_send(WAKE.into());
         if self.done.recv_timeout(SHUTDOWN_WAIT).is_ok() {
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
@@ -203,6 +210,7 @@ impl Drop for Uploader {
         };
         let events: Vec<Event> = receiver
             .try_iter()
+            .filter(|line| line != WAKE)
             .map(|line| event(&line, level(&line)))
             .collect();
         for chunk in events.chunks(BATCH_SIZE) {
@@ -406,15 +414,21 @@ fn run(
     let mut last_persist = std::time::Instant::now();
     set_status("Automatic upload enabled; waiting for events");
     loop {
-        let stopping = stop.load(Ordering::SeqCst);
+        if stop.load(Ordering::SeqCst) {
+            return finish(&directory, &receiver, pending);
+        }
         let received = match receiver.lock() {
             Ok(receiver) => receiver.recv_timeout(Duration::from_millis(100)),
             Err(_) => break,
         };
         match received {
+            Ok(line) if line == WAKE => {}
             Ok(line) => pending.push(event(&line, level(&line))),
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if stop.load(Ordering::SeqCst) {
+            return finish(&directory, &receiver, pending);
         }
         if !enabled() {
             pending.clear();
@@ -424,19 +438,15 @@ fn run(
             if let Ok(receiver) = receiver.lock() {
                 while receiver.try_recv().is_ok() {}
             }
-            if stopping {
-                return Ok(());
-            }
             continue;
         }
         if pending.len() >= BATCH_SIZE
-            || ((!pending.is_empty())
-                && (last_persist.elapsed() >= Duration::from_secs(1) || stopping))
+            || (!pending.is_empty() && last_persist.elapsed() >= Duration::from_secs(1))
         {
             persist(&directory, &batch(std::mem::take(&mut pending))?)?;
             last_persist = std::time::Instant::now();
         }
-        if !stopping && std::time::Instant::now() >= next {
+        if std::time::Instant::now() >= next {
             // Nothing stays only in memory while a request is in flight.
             if !pending.is_empty() {
                 persist(&directory, &batch(std::mem::take(&mut pending))?)?;
@@ -467,23 +477,37 @@ fn run(
             }
             next = std::time::Instant::now() + Duration::from_secs(backoff);
         }
-        if stopping {
-            // Drain already accepted events to disk before returning.
-            let lines: Vec<String> = match receiver.lock() {
-                Ok(receiver) => receiver.try_iter().collect(),
-                Err(_) => Vec::new(),
-            };
-            for line in lines {
-                pending.push(event(&line, level(&line)));
-                if pending.len() >= BATCH_SIZE {
-                    persist(&directory, &batch(std::mem::take(&mut pending))?)?;
-                }
-            }
-            if !pending.is_empty() {
-                persist(&directory, &batch(pending)?)?;
-            }
-            return Ok(());
+    }
+    Ok(())
+}
+/// Writes the events this thread holds and those still queued, all under the
+/// receiver lock. The shutdown fallback takes that lock, so it cannot find the
+/// queue empty and let the process exit while drained events are unwritten.
+fn finish(
+    directory: &Path,
+    receiver: &Mutex<mpsc::Receiver<String>>,
+    mut pending: Vec<Event>,
+) -> std::io::Result<()> {
+    let Ok(receiver) = receiver.lock() else {
+        return Ok(());
+    };
+    if !enabled() {
+        for path in files(directory)? {
+            fs::remove_file(path)?;
         }
+        while receiver.try_recv().is_ok() {}
+        return Ok(());
+    }
+    pending.extend(
+        receiver
+            .try_iter()
+            .filter(|line| line != WAKE)
+            .map(|line| event(&line, level(&line))),
+    );
+    #[cfg(test)]
+    tests::pause_before_final_write(directory);
+    for chunk in pending.chunks(BATCH_SIZE) {
+        persist(directory, &batch(chunk.to_vec())?)?;
     }
     Ok(())
 }
@@ -606,6 +630,74 @@ mod tests {
             .any(|m| m.ends_with("EternalMonitor shutting down")));
         // At most the request in flight was sent; the rest wait for next launch.
         assert!(messages.iter().filter(|m| *m == "queued").count() >= 7);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Outbox whose final write pauses, to hold a drained queue past the
+    /// shutdown deadline.
+    static PAUSED_OUTBOX: Mutex<Option<(PathBuf, Duration)>> = Mutex::new(None);
+    pub(super) fn pause_before_final_write(directory: &Path) {
+        let pause = PAUSED_OUTBOX.lock().unwrap().clone();
+        if let Some((paused, pause)) = pause {
+            if paused == directory {
+                std::thread::sleep(pause);
+            }
+        }
+    }
+
+    #[test]
+    fn quitting_near_the_deadline_keeps_every_drained_event() {
+        let directory = outbox_with_batches(1);
+        let config = Config {
+            endpoint: slow_server(Duration::from_millis(1700)),
+            ingest_key: "write-only".into(),
+            enabled: true,
+            allow_http: true,
+        };
+        // The acknowledgement arrives just before the deadline, and the
+        // worker is still writing the drained queue when the wait runs out.
+        *PAUSED_OUTBOX.lock().unwrap() = Some((directory.clone(), Duration::from_millis(1500)));
+        let (sender, uploader) = Uploader::spawn(config, directory.clone());
+        std::thread::sleep(Duration::from_millis(300));
+        for index in 0..10 {
+            sender
+                .send(format!("2026-10-21T17:11:31Z  INFO last line {index}"))
+                .unwrap();
+        }
+        drop(uploader);
+        let messages = outbox_messages(&directory);
+        let kept = (0..10)
+            .filter(|index| {
+                let line = format!("last line {index}");
+                messages.iter().any(|m| m.ends_with(&line))
+            })
+            .count();
+        assert_eq!(kept, 10, "{messages:?}");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn an_idle_uploader_quits_without_waiting_for_its_receive_timeout() {
+        let directory = std::env::temp_dir().join(id().unwrap());
+        fs::create_dir_all(&directory).unwrap();
+        let mut waits = Vec::new();
+        for attempt in 0..10 {
+            let config = Config {
+                endpoint: "http://127.0.0.1:9/v1/events".into(),
+                ingest_key: "write-only".into(),
+                enabled: true,
+                allow_http: true,
+            };
+            let (_sender, uploader) = Uploader::spawn(config, directory.clone());
+            // Quit at different points of the thread's 100 ms receive.
+            std::thread::sleep(Duration::from_millis(150 + attempt * 7));
+            let started = std::time::Instant::now();
+            drop(uploader);
+            waits.push(started.elapsed());
+        }
+        waits.sort();
+        assert!(waits[5] < Duration::from_millis(20), "{waits:?}");
+        assert!(outbox_messages(&directory).is_empty());
         fs::remove_dir_all(directory).unwrap();
     }
 
