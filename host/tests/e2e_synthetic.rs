@@ -1999,3 +1999,132 @@ fn preferred_fps_caps_the_host() {
         std::panic::resume_unwind(error);
     }
 }
+
+/// A live client that decodes nothing must keep its session for as long as it
+/// sends reports, or (while typing) only keyboard events, and must expire
+/// about LIVENESS_TIMEOUT after it really goes silent. CI's keyboard scenario
+/// for PR #66 logged "Client liveness expired" during the test; this checks
+/// the host side of that with the real supervisor and transport.
+#[test]
+fn quiet_clients_keep_their_session_until_they_go_silent() {
+    use eternal_host::transport::session::LIVENESS_TIMEOUT;
+
+    let _guard = ENV_LOCK.lock().unwrap();
+    init_test_tracing();
+    let _ = ffmpeg_next::init();
+    std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    for name in ["ETERNAL_DROP", "ETERNAL_REORDER", "ETERNAL_JITTER_MS"] {
+        std::env::remove_var(name);
+    }
+    let listen_port = free_udp_port();
+    let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
+    *shared.encoder_override.lock() = Some("libx264".to_string());
+    let (supervisor_tx, supervisor_rx) = mpsc::channel();
+    let supervisor = {
+        let (shared, tx) = (shared.clone(), supervisor_tx.clone());
+        std::thread::spawn(move || {
+            eternal_host::supervisor::run(
+                listen_port,
+                shared,
+                GpuInfo::software_fallback(),
+                tx,
+                supervisor_rx,
+            )
+        })
+    };
+
+    #[cfg(not(windows))]
+    let mut receiver = FakeReceiver::connect_with_caps(
+        listen_port,
+        eternal_wire::v2::control::FEATURE_WANTS_INPUT,
+    );
+    #[cfg(windows)]
+    let mut receiver = FakeReceiver::connect(listen_port);
+    let session = receiver.session_id;
+    let mut datagram = [0u8; 2048];
+    // Read (and ignore) video until `until`, without decoding anything.
+    let mut drain_until = |receiver: &FakeReceiver, until: Instant| {
+        while Instant::now() < until {
+            let _ = receiver.socket.recv_from(&mut datagram);
+        }
+    };
+    let still_connected = |phase: &str| {
+        assert!(
+            shared.client_connected(),
+            "{phase}: host dropped a live client"
+        );
+        assert_eq!(shared.session.lock().session_id(), Some(session), "{phase}");
+    };
+
+    // Reports only, as the iPad sends while its decoder is stalled.
+    let phase_end = Instant::now() + LIVENESS_TIMEOUT * 3;
+    let mut sent = 0;
+    let mut last_message;
+    loop {
+        receiver.last_report = Instant::now() - Duration::from_secs(1);
+        receiver.maybe_report(0, 0);
+        last_message = Instant::now();
+        sent += 1;
+        drain_until(&receiver, Instant::now() + Duration::from_millis(500));
+        still_connected("reports only");
+        if Instant::now() >= phase_end {
+            break;
+        }
+    }
+    assert!(sent >= 12, "{sent} reports");
+
+    // Keyboard events only, no reports.
+    #[cfg(not(windows))]
+    {
+        use eternal_host::input::KIND_KEY;
+        use eternal_wire::v2::control::InputEvent;
+        let phase_end = Instant::now() + LIVENESS_TIMEOUT * 3;
+        let mut event_id = 100;
+        while Instant::now() < phase_end {
+            for phase in [0, 2] {
+                event_id += 1;
+                receiver.send(&ControlMessage::InputEvent(InputEvent {
+                    input_ver: 1,
+                    kind: KIND_KEY,
+                    phase,
+                    buttons: 0,
+                    event_id,
+                    x_norm: 0,
+                    y_norm: 0,
+                    pressure_x1000: 0,
+                    scroll_dx: 0,
+                    scroll_dy: 0,
+                    keycode: 0x04,
+                    modifiers: 0,
+                    client_time_us: 0,
+                    tilt_x: 0,
+                    tilt_y: 0,
+                }));
+            }
+            last_message = Instant::now();
+            drain_until(&receiver, Instant::now() + Duration::from_secs(1));
+            still_connected("keyboard only");
+        }
+    }
+
+    // Silence: the session ends one liveness window later, as in 0.3.1.
+    while shared.client_connected() && last_message.elapsed() < LIVENESS_TIMEOUT * 2 {
+        drain_until(&receiver, Instant::now() + Duration::from_millis(20));
+    }
+    let expired_after = last_message.elapsed();
+    assert!(!shared.client_connected(), "a silent client must expire");
+    assert!(
+        expired_after >= LIVENESS_TIMEOUT - Duration::from_millis(300),
+        "expired early: {expired_after:?}"
+    );
+    eprintln!(
+        "QUIET_CLIENT reports_sent={sent} expired_after_ms={}",
+        expired_after.as_millis()
+    );
+
+    shared.stop();
+    let _ = supervisor_tx.send(SupervisorCommand::Shutdown);
+    let _ = supervisor.join();
+}
