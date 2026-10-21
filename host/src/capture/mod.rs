@@ -20,6 +20,7 @@ use crate::control::{CaptureTarget, VddStatus};
 
 #[cfg(windows)]
 pub mod dxgi;
+pub mod recovery;
 pub mod synthetic;
 pub(crate) mod timing;
 
@@ -421,11 +422,38 @@ pub fn run_capture_stage(
         }
     }
     let guard = CloseOnExit(slot.handle());
-    let result = run_platform_loop(&guard.0, shared, adapter_index, generation);
+    let result = recovery::run_until_unblocked(
+        &shared,
+        || run_platform_loop(&guard.0, shared.clone(), adapter_index, generation),
+        |delay| wait_while_blocked(&shared, generation, delay),
+    );
     if let Err(ref e) = result {
         error!(error = %e, "Capture loop exited with error");
     }
     result
+}
+
+/// Sleeps between blocked-capture retries. The watchdog has nothing to fix
+/// while Windows withholds the desktop, so the stage keeps its heartbeats.
+fn wait_while_blocked(shared: &SharedControl, generation: u64, delay: Duration) -> bool {
+    use std::sync::atomic::Ordering;
+    let deadline = Instant::now() + delay;
+    loop {
+        if !shared.running.load(Ordering::SeqCst)
+            || !crate::supervisor::generation_is_current(generation)
+        {
+            return false;
+        }
+        let now_ms = crate::clock::host_now_us() / 1000;
+        shared.hb_capture_loop_ms.store(now_ms, Ordering::Relaxed);
+        shared.hb_capture_frame_ms.store(now_ms, Ordering::Relaxed);
+        shared.hb_encode_frame_ms.store(now_ms, Ordering::Relaxed);
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(50)));
+    }
 }
 
 /// A producer/consumer pair for the capture→encoder handoff.
