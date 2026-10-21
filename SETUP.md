@@ -192,6 +192,7 @@ or in the controls while streaming.
 | The iPad can't find the PC at all | Open the iPad's **Settings** app, then **Privacy & Security**, then **Local Network**, and turn on **EternalMonitor**. |
 | The picture stutters or freezes on Wi-Fi | Move closer to the router, or use a 5 GHz network. Connect the PC to the router with a network cable, or use USB. |
 | **Hardware encoder unavailable** on the PC | In **Settings**, select **Auto** for the encoder and **YUV420** for encoder input, then restart the stream. Update the driver from your GPU manufacturer. If this persists, use **Performance** → **Copy logs** and include the iPad report from **Settings → Support → Diagnostics**. Some GPUs have no supported hardware encoder. |
+| **EternalMonitor could not start** or **EternalMonitor stopped unexpectedly** on the PC | Open EternalMonitor again. It picks another graphics backend after a failed start. Update the graphics driver from your GPU manufacturer. If the message returns, send the log file it names, from `%APPDATA%\EternalMonitor\logs`, through the feedback form. |
 | **Extended display unavailable** on the PC | Run EternalMonitor-Setup.exe again to repair the install, then restart the stream. |
 
 **Using a VPN such as Tailscale?** In the PC window, open **Settings** and set

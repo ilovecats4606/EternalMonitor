@@ -18,6 +18,9 @@ static ENABLED: AtomicBool = AtomicBool::new(true);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static STATUS: Mutex<String> = Mutex::new(String::new());
 static IDENTITY: OnceLock<(String, String)> = OnceLock::new();
+static OUTBOX: OnceLock<PathBuf> = OnceLock::new();
+// Shared by the upload thread and fatal reports, so events never reuse a number.
+static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Deserialize)]
 pub struct Config {
@@ -168,10 +171,20 @@ impl UploadGuard {
         let directory = crate::settings::app_data_dir()
             .unwrap()
             .join("diagnostics-outbox");
+        // Ready before any thread runs, so a fatal report can queue at once.
+        let identity = match identity(&directory) {
+            Ok(identity) => identity,
+            Err(_) => {
+                set_status("Automatic upload stopped: local outbox unavailable");
+                return Self(None, None);
+            }
+        };
         let (sender, receiver) = mpsc::sync_channel(256);
         if SENDER.set(sender).is_err() {
             return Self(None, None);
         }
+        let _ = IDENTITY.set(identity);
+        let _ = OUTBOX.set(directory.clone());
         let (stop, stopped) = mpsc::channel();
         let thread = std::thread::spawn(move || {
             let result = run(config, directory, receiver, stopped);
@@ -204,6 +217,68 @@ pub fn record(line: &str) {
             }
         }
     }
+}
+/// Queue one error event on disk now. The upload thread sends it, or the next
+/// launch does if this process ends first.
+pub fn queue_now(message: &str) {
+    if !enabled() {
+        return;
+    }
+    if let Some(directory) = OUTBOX.get() {
+        if queue_into(directory, message).is_err() {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+fn queue_into(directory: &Path, message: &str) -> std::io::Result<()> {
+    persist(directory, &batch(vec![event(message, "error")])?)
+}
+fn identity(directory: &Path) -> std::io::Result<(String, String)> {
+    fs::create_dir_all(directory)?;
+    let identity_path = directory.join("installation-id");
+    let installation_id = match fs::read_to_string(&identity_path) {
+        Ok(id) if id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit()) => id,
+        _ => {
+            let id = id()?;
+            fs::write(identity_path, &id)?;
+            id
+        }
+    };
+    Ok((installation_id, id()?))
+}
+fn level(line: &str) -> &'static str {
+    if line.contains(" ERROR ") {
+        "error"
+    } else if line.contains(" WARN ") {
+        "warning"
+    } else {
+        "info"
+    }
+}
+fn event(line: &str, level: &str) -> Event {
+    Event {
+        sequence: SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1,
+        at_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        level: level.into(),
+        category: "host".into(),
+        message: crate::logging::redact_support_text(line),
+    }
+}
+fn batch(events: Vec<Event>) -> std::io::Result<Batch> {
+    let (installation_id, launch_id) = IDENTITY.get().cloned().unwrap_or_default();
+    Ok(Batch {
+        schema: 1,
+        batch_id: id()?,
+        installation_id,
+        launch_id,
+        platform: std::env::consts::OS.into(),
+        app_version: env!("CARGO_PKG_VERSION").into(),
+        build: env!("ETERNAL_BUILD_REVISION").into(),
+        events,
+    })
 }
 fn files(directory: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut paths: Vec<_> = fs::read_dir(directory)?
@@ -278,25 +353,12 @@ fn run(
     receiver: mpsc::Receiver<String>,
     stop: mpsc::Receiver<()>,
 ) -> std::io::Result<()> {
-    fs::create_dir_all(&directory)?;
-    let identity_path = directory.join("installation-id");
-    let installation_id = match fs::read_to_string(&identity_path) {
-        Ok(id) if id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit()) => id,
-        _ => {
-            let id = id()?;
-            fs::write(identity_path, &id)?;
-            id
-        }
-    };
-    let launch_id = id()?;
-    let _ = IDENTITY.set((installation_id.clone(), launch_id.clone()));
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(5)))
         .max_redirects(0)
         .build()
         .into();
     let mut pending = Vec::new();
-    let mut sequence = 0;
     let mut next = std::time::Instant::now();
     let mut backoff = 5;
     let mut last_persist = std::time::Instant::now();
@@ -304,26 +366,7 @@ fn run(
     loop {
         let stopping = stop.try_recv().is_ok();
         match receiver.recv_timeout(Duration::from_millis(100)) {
-            Ok(line) => {
-                sequence += 1;
-                let level = if line.contains(" ERROR ") {
-                    "error"
-                } else if line.contains(" WARN ") {
-                    "warning"
-                } else {
-                    "info"
-                };
-                pending.push(Event {
-                    sequence,
-                    at_ms: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                    level: level.into(),
-                    category: "host".into(),
-                    message: crate::logging::redact_support_text(&line),
-                });
-            }
+            Ok(line) => pending.push(event(&line, level(&line))),
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
@@ -342,17 +385,7 @@ fn run(
             || ((!pending.is_empty())
                 && (last_persist.elapsed() >= Duration::from_secs(1) || stopping))
         {
-            let batch = Batch {
-                schema: 1,
-                batch_id: id()?,
-                installation_id: installation_id.clone(),
-                launch_id: launch_id.clone(),
-                platform: std::env::consts::OS.into(),
-                app_version: env!("CARGO_PKG_VERSION").into(),
-                build: env!("ETERNAL_BUILD_REVISION").into(),
-                events: std::mem::take(&mut pending),
-            };
-            persist(&directory, &batch)?;
+            persist(&directory, &batch(std::mem::take(&mut pending))?)?;
             last_persist = std::time::Instant::now();
         }
         if !stopping && std::time::Instant::now() >= next {
@@ -381,47 +414,13 @@ fn run(
         if stopping {
             // Drain already accepted events to disk before returning.
             while let Ok(line) = receiver.try_recv() {
-                sequence += 1;
-                pending.push(Event {
-                    sequence,
-                    at_ms: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                    level: "info".into(),
-                    category: "host".into(),
-                    message: crate::logging::redact_support_text(&line),
-                });
+                pending.push(event(&line, level(&line)));
                 if pending.len() >= BATCH_SIZE {
-                    persist(
-                        &directory,
-                        &Batch {
-                            schema: 1,
-                            batch_id: id()?,
-                            installation_id: installation_id.clone(),
-                            launch_id: launch_id.clone(),
-                            platform: std::env::consts::OS.into(),
-                            app_version: env!("CARGO_PKG_VERSION").into(),
-                            build: env!("ETERNAL_BUILD_REVISION").into(),
-                            events: std::mem::take(&mut pending),
-                        },
-                    )?;
+                    persist(&directory, &batch(std::mem::take(&mut pending))?)?;
                 }
             }
             if !pending.is_empty() {
-                persist(
-                    &directory,
-                    &Batch {
-                        schema: 1,
-                        batch_id: id()?,
-                        installation_id,
-                        launch_id,
-                        platform: std::env::consts::OS.into(),
-                        app_version: env!("CARGO_PKG_VERSION").into(),
-                        build: env!("ETERNAL_BUILD_REVISION").into(),
-                        events: pending,
-                    },
-                )?;
+                persist(&directory, &batch(pending)?)?;
             }
             return Ok(());
         }
@@ -501,6 +500,41 @@ mod tests {
             assert_eq!(path.exists(), !accepted);
         }
         fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn fatal_reports_queue_as_errors_with_their_own_sequence_numbers() {
+        let directory = std::env::temp_dir().join(id().unwrap());
+        fs::create_dir_all(&directory).unwrap();
+        queue_into(&directory, "EternalMonitor could not start: token=abc").unwrap();
+        queue_into(&directory, "EternalMonitor could not start: again").unwrap();
+        let saved: Vec<Batch> = files(&directory)
+            .unwrap()
+            .iter()
+            .map(|path| serde_json::from_slice(&fs::read(path).unwrap()).unwrap())
+            .collect();
+        assert_eq!(saved.len(), 2);
+        for batch in &saved {
+            assert_eq!(batch.events.len(), 1);
+            assert_eq!(batch.events[0].level, "error");
+            assert_eq!(batch.events[0].category, "host");
+        }
+        assert!(saved
+            .iter()
+            .any(|b| b.events[0].message == "EternalMonitor could not start: token=[REDACTED]"));
+        assert_ne!(saved[0].events[0].sequence, saved[1].events[0].sequence);
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn drained_events_keep_their_level() {
+        assert_eq!(level("2026-10-20T20:47:20Z ERROR Host panic"), "error");
+        assert_eq!(
+            level("2026-10-20T20:47:20Z  WARN Missing downlevel flags"),
+            "warning"
+        );
+        assert_eq!(
+            level("2026-10-20T20:47:20Z  INFO EternalMonitor shutting down"),
+            "info"
+        );
     }
     #[test]
     fn rejects_plaintext_and_credentials_in_urls() {

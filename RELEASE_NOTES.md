@@ -1,3 +1,25 @@
+## EternalMonitor (unreleased)
+
+### What changed
+
+- The Windows window no longer closes without a word on PCs whose graphics
+  driver crashes while it starts, such as Intel UHD 620 with a 2018 driver.
+  The host prefers a fully supported graphics backend on the same GPU, usually
+  DirectX 12 where the Vulkan driver is incomplete. If a launch still closes
+  before its window appears, the next launch uses another backend.
+- When the Windows host cannot start, or stops unexpectedly, it shows a message
+  with the error and the path of the log file. The error is written to the log
+  and queued for automatic support diagnostics before the process ends.
+- The host log and support diagnostics keep their final lines when the app
+  quits normally, so a normal quit can be told apart from a crash.
+
+### What to test
+
+On a PC where EternalMonitor 0.3.1 opened a console window that closed after a
+few seconds, install this build and open EternalMonitor. The window should
+appear. If it does not, a message names the error and the log file; send that
+file with the time you opened the app.
+
 ## EternalMonitor v0.3.1
 
 Install the Windows and iPad 0.3.1 updates together. This release includes Intel

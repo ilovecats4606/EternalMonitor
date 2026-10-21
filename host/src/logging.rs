@@ -316,6 +316,20 @@ pub fn session_log_path() -> PathBuf {
     SESSION_LOG_PATH.clone()
 }
 
+/// Write one line straight to the session log. A fatal failure can end the
+/// process before the output worker writes what is queued.
+pub fn append_now(line: &str) -> io::Result<()> {
+    append_line(&session_log_path(), line)
+}
+
+fn append_line(path: &Path, line: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(format!("{}\n", redact_support_text(line)).as_bytes())
+}
+
 fn resolve_session_log_path() -> PathBuf {
     // Prefer %APPDATA%/EternalMonitor/logs so the log is writable even when the app is installed
     // read-only under Program Files; fall back to the exe directory only if APPDATA is unavailable.
@@ -770,5 +784,25 @@ mod tests {
             "2"
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fatal_lines_append_redacted_without_the_output_worker() {
+        let directory = std::env::temp_dir().join(format!(
+            "eternal-append-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = directory.join("logs").join(SESSION_LOG_FILE_NAME);
+        append_line(&path, "earlier").unwrap();
+        append_line(&path, "ERROR could not start pairing_code=123456").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "earlier\nERROR could not start pairing_code=[REDACTED]\n"
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 }

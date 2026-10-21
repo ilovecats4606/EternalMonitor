@@ -47,15 +47,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Belt-and-suspenders: a panic anywhere (GUI, supervisor, pipeline threads) must still tear
     // the virtual display down before the process unwinds, so a crash can't strand a phantom
-    // monitor. The default panic hook still runs afterwards for logging/backtrace.
-    {
-        let default_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            error!(panic = %info, backtrace = %std::backtrace::Backtrace::force_capture(), "Host panic");
-            vdd::disable();
-            default_hook(info);
-        }));
-    }
+    // monitor. A panic or native crash that ends the process is also shown to the user and
+    // queued for support instead of closing the console window without a word.
+    eternal_host::startup::install_failure_hooks();
 
     let listen_port: u16 = std::env::args()
         .nth(1)
@@ -65,7 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize FFmpeg early so encoder probing works during GPU detection
     if let Err(e) = ffmpeg_next::init() {
         error!(error = %e, "FFmpeg init failed");
-        return Err(e.into());
+        return Err(eternal_host::startup::fatal(e).into());
     }
     eternal_host::diagnostics::install_ffmpeg_logging();
     eternal_host::diagnostics::log_system_report();
@@ -100,7 +94,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // runs never did.) The GUI re-applies the same values at startup, which
     // is idempotent.
     let mut persisted = eternal_host::settings::SettingsFile::load();
-    let auth_token = persisted.ensure_auth_token()?;
+    let auth_token = persisted
+        .ensure_auth_token()
+        .map_err(eternal_host::startup::fatal)?;
     let initial_bitrate = if persisted.bitrate_mbps > 0.0 {
         (persisted.bitrate_mbps * 1_000_000.0).round() as u32
     } else {
@@ -132,7 +128,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     *shared.encoder_input.lock() = match std::env::var("ETERNAL_INPUT") {
         Ok(value) => eternal_host::encoder::input::EncoderInput::from_env(&value)
-            .ok_or_else(|| format!("Invalid ETERNAL_INPUT {value:?}; use auto, bgra or yuv420"))?,
+            .ok_or_else(|| format!("Invalid ETERNAL_INPUT {value:?}; use auto, bgra or yuv420"))
+            .map_err(eternal_host::startup::fatal)?,
         Err(_) => persisted.encoder_input,
     };
     *shared.capture_target.lock() =
@@ -262,6 +259,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Termination signal received — shutting down cleanly");
     } else if let Err(e) = gui::run_gui(gui_control.clone()) {
         error!(error = %e, "GUI exited with error");
+        eternal_host::startup::report(&format!("Window error: {e}"));
     }
 
     gui_control.shared.stop();
@@ -298,5 +296,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     info!("EternalMonitor shutting down");
+    // process::exit skips destructors. Flush the upload outbox and the log
+    // writers first, so a normal quit is told apart from a crash.
+    drop(_uploads);
+    drop(_session_guard);
+    drop(_stdout_guard);
     std::process::exit(0);
 }

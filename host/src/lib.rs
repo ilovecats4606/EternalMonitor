@@ -15,6 +15,7 @@ pub mod logging;
 pub mod pairing;
 pub mod pipeline;
 pub mod settings;
+pub mod startup;
 pub mod stats;
 pub mod supervisor;
 pub mod transport;

@@ -13,6 +13,7 @@ mod icons;
 mod page_performance;
 mod page_settings;
 mod page_stream;
+mod renderer;
 mod theme;
 mod widgets;
 
@@ -637,6 +638,7 @@ impl eframe::App for AnalyzerApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        renderer::frame_painted();
         let ctx = ui.ctx().clone();
         if let Some(dirty_at) = self.settings_dirty_at {
             if dirty_at.elapsed() >= Duration::from_millis(800) {
@@ -1128,7 +1130,7 @@ pub fn run_gui(control: GuiControl) -> eframe::Result<()> {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon_256.png"))
         .expect("embedded icon PNG is valid");
 
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("EternalMonitor")
             .with_inner_size([1000.0, 640.0])
@@ -1136,6 +1138,7 @@ pub fn run_gui(control: GuiControl) -> eframe::Result<()> {
             .with_icon(std::sync::Arc::new(icon)),
         ..Default::default()
     };
+    renderer::configure(&mut options.wgpu_options);
 
     eframe::run_native(
         "EternalMonitor",
