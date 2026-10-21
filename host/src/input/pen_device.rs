@@ -124,9 +124,8 @@ impl<A: PenApi> PenDevice<A> {
         self.slot.handle.is_some()
     }
 
-    /// Where no stroke is in progress (a pen down, a hover or a new
-    /// session), ask again for a device Windows refused, at most once per
-    /// `RETRY_INTERVAL`.
+    /// Where no stroke is in progress (a pen down or a hover), ask again for
+    /// a device Windows refused, at most once per `RETRY_INTERVAL`.
     pub fn revive(&mut self, now: Instant) {
         let waiting = self
             .slot
@@ -479,5 +478,98 @@ mod tests {
         ));
         assert_eq!(device.slot.api.created, 2);
         assert_eq!(device.slot.api.frames, [(2, PenPhase::Down)]);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_session_started_without_the_device_draws_with_the_mouse_then_recovers() {
+        use super::super::{recorder, InputRelay, KIND_PENCIL, PHASE_BEGAN, PHASE_ENDED};
+        use eternal_wire::v2::control::InputEvent;
+        let output = CaptureGeometry {
+            left: 0,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        };
+        // A v2 Drawing mode stroke from `session`, as the relay resolves it.
+        let mut relay = InputRelay::default();
+        let mut stroke = |session, first_id| {
+            for (id, phase) in [(first_id, PHASE_BEGAN), (first_id + 1, PHASE_ENDED)] {
+                let event = InputEvent {
+                    input_ver: 2,
+                    kind: KIND_PENCIL,
+                    phase,
+                    buttons: 1,
+                    event_id: id,
+                    x_norm: 6_000,
+                    y_norm: 6_000,
+                    pressure_x1000: 500,
+                    scroll_dx: 0,
+                    scroll_dy: 0,
+                    keycode: 0,
+                    modifiers: 0,
+                    client_time_us: 0,
+                    tilt_x: 10,
+                    tilt_y: 0,
+                };
+                relay.relay(session, &event, output);
+            }
+            recorder::take()
+        };
+        // Route and inject as `InputRelay::inject` does on Windows.
+        let deliver = |device: &mut PenDevice<FakeApi>, batch: &[Injection], now| {
+            let mut mouse = Vec::new();
+            for injection in device.route(batch, SCREEN, now) {
+                match injection {
+                    Injection::Pen(sample) => device.inject(sample, SCREEN, Some(output)),
+                    other => mouse.push(other),
+                }
+            }
+            mouse
+        };
+        let mut device = PenDevice::new(FakeApi::new(&[true, false]));
+        lose_device(&mut device);
+        let lost = Instant::now();
+        // A new session starts while the device is missing; its reset does
+        // not ask Windows. Its first stroke, within a second of the refusal,
+        // is injected as mouse input.
+        device.reset();
+        let first = stroke(2, 1);
+        assert!(matches!(
+            first.as_slice(),
+            [
+                Injection::Pen(PenSample {
+                    phase: PenPhase::Down,
+                    ..
+                }),
+                Injection::Pen(PenSample {
+                    phase: PenPhase::Up,
+                    ..
+                })
+            ]
+        ));
+        let Injection::Pen(down) = first[0] else {
+            unreachable!()
+        };
+        let (x, y) = super::super::desktop_pixel_to_abs(down.x, down.y, SCREEN);
+        assert_eq!(
+            deliver(&mut device, &first, lost + Duration::from_millis(200)),
+            [
+                Injection::MoveAbs { x, y },
+                Injection::LeftDown { x, y },
+                Injection::MoveAbs { x, y },
+                Injection::LeftUp { x, y },
+            ]
+        );
+        assert_eq!(device.slot.api.created, 2);
+        // Its next stroke asks again, gets a device and draws natively.
+        device.slot.api.frames.clear();
+        let second = stroke(2, 3);
+        assert!(deliver(&mut device, &second, lost + RETRY_INTERVAL * 2).is_empty());
+        assert_eq!(device.slot.api.created, 3);
+        assert_eq!(
+            device.slot.api.frames,
+            [(3, PenPhase::Down), (3, PenPhase::Up)]
+        );
     }
 }

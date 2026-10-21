@@ -540,13 +540,6 @@ impl InputRelay {
         }
     }
 
-    /// A session is starting: ask again for a pen device Windows refused, so
-    /// the session can be offered native pen input if it is back.
-    pub fn revive_pen(&mut self) {
-        #[cfg(windows)]
-        self.pen_device.revive(std::time::Instant::now());
-    }
-
     /// Release keys/buttons when a session ends, expires, or is superseded.
     pub fn reset(&mut self) {
         let releases = self.held.release();
