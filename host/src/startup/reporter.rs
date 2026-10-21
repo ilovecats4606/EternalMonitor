@@ -5,7 +5,8 @@
 //! the virtual display off and shows the message. A host that ends past the
 //! exception filter, as fail-fast exceptions and some heap corruption do, is
 //! reported by its exit code. Panics and startup errors hand it just the
-//! message, so a dialog never holds up cleanup or exit.
+//! message. A message never holds up the cleanup or the host's exit; the
+//! reporter itself stays until its messages are closed.
 //!
 //! Each launch's files in the crash folder are named by the host's process:
 //! `.rec` the crash record, `.box` a message to show, `.ready` the reporter's
@@ -30,10 +31,12 @@ pub(super) const SHOWN: &str = "shown";
 pub(super) const DONE: &str = "done";
 /// How long a host that fails at once waits for its reporter to start.
 const READY_WAIT: Duration = Duration::from_secs(3);
-/// How long the message waits for the virtual display to turn off.
+/// How long the crash message waits for the virtual display to turn off.
 #[cfg(windows)]
 const CLEANUP_WAIT: Duration = Duration::from_secs(5);
-/// The reporter exits by then even if the turn-off is still running.
+/// How long the reporter waits for the turn-off at most. With no message on
+/// screen it exits by then; a message keeps it until the user closes it, but
+/// nothing else waits for the message.
 #[cfg(windows)]
 const CLEANUP_CAP: Duration = Duration::from_secs(30);
 
@@ -188,10 +191,11 @@ fn save(outcome: &super::Outcome, launch_id: &str) -> std::io::Result<()> {
 }
 
 /// The launch is handled. Its crash record stays when the report could not be
-/// saved, so the next launch saves and shows it.
+/// saved, so the next launch saves and shows it. The ready file stays while
+/// this reporter waits for its messages, so it is not taken for a host.
 #[cfg(any(windows, test))]
 fn remove_files(directory: &Path, owner: ProcessId, saved: bool) {
-    for kind in [REQUEST, "tmp", DONE, SHOWN, READY] {
+    for kind in [REQUEST, "tmp", DONE, SHOWN] {
         let _ = fs::remove_file(owner_file(directory, owner, kind));
     }
     if saved {
@@ -255,12 +259,18 @@ fn run(args: &[String]) -> i32 {
     };
     let _ = fs::write(file(READY), ProcessId::current().to_string());
 
+    // Each message on its own thread: an open message never holds the
+    // watching, the report or the cleanup.
+    let mut messages = Vec::new();
+    let mut show_soon = |title: String, body: String| {
+        messages.push(std::thread::spawn(move || show(&title, &body)));
+    };
     let mut report = None;
     if let Some(process) = process {
         loop {
             let exited = unsafe { WaitForSingleObject(process, 100) } == WAIT_OBJECT_0;
             if let Some((title, body)) = take_request(&file(REQUEST)) {
-                show(&title, &body);
+                show_soon(title, body);
             }
             if let Some((record, false)) = read_record(&file(RECORD)) {
                 let module = module_at(process, record.address);
@@ -290,7 +300,7 @@ fn run(args: &[String]) -> i32 {
     }
     // Also when the host ended before this process could watch it.
     if let Some((title, body)) = take_request(&file(REQUEST)) {
-        show(&title, &body);
+        show_soon(title, body);
     }
     let exit_code = process.and_then(|process| {
         let mut code = 0u32;
@@ -305,8 +315,8 @@ fn run(args: &[String]) -> i32 {
     }
 
     // After any abnormal end, whatever the report says, turn the virtual
-    // display off while the report is saved. The message waits for it at
-    // most CLEANUP_WAIT and this process at most CLEANUP_CAP.
+    // display off while the report is saved. The crash message waits for it
+    // at most CLEANUP_WAIT; it then runs on its own, for at most CLEANUP_CAP.
     let cleanup_started = Instant::now();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     if exit_code != Some(0) {
@@ -358,15 +368,20 @@ fn run(args: &[String]) -> i32 {
     if let Some((outcome, _)) = &report {
         if outcome.crash && super::dialogs_wanted() {
             let log_path = crate::logging::session_log_path();
-            show(
-                &outcome.summary,
-                &super::message_body(&outcome.detail, &log_path.display().to_string(), false),
+            show_soon(
+                outcome.summary.clone(),
+                super::message_body(&outcome.detail, &log_path.display().to_string(), false),
             );
         }
     }
     let _ = done_rx.recv_timeout(CLEANUP_CAP.saturating_sub(cleanup_started.elapsed()));
     let saved = report.as_ref().is_none_or(|(_, saved)| saved.is_ok());
     remove_files(&directory, owner, saved);
+    // Everything is saved and cleaned up; stay only for open messages.
+    for message in messages {
+        let _ = message.join();
+    }
+    let _ = fs::remove_file(file(READY));
     0
 }
 
@@ -554,11 +569,27 @@ mod tests {
             fs::write(owner_file(&directory, host, kind), b"x").unwrap();
         }
         remove_files(&directory, host, false);
-        let left: Vec<_> = fs::read_dir(&directory).unwrap().flatten().collect();
-        assert_eq!(left.len(), 1);
-        assert_eq!(left[0].path(), owner_file(&directory, host, RECORD));
+        let mut left: Vec<_> = fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        left.sort();
+        let mut kept = [
+            owner_file(&directory, host, RECORD),
+            owner_file(&directory, host, READY),
+        ];
+        kept.sort();
+        assert_eq!(left, kept);
         remove_files(&directory, host, true);
-        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_dir(&directory)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .collect::<Vec<_>>(),
+            [owner_file(&directory, host, READY)]
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 }
