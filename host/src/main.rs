@@ -9,13 +9,16 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Keep this first. A copy started as the failure reporter outlives the
+    // host it watches: it must not take the single-instance lock, open the
+    // session log or touch the virtual display the way a host does.
+    eternal_host::startup::run_reporter_if_requested();
+
     // Anchor the process-wide media clock before anything else runs.
     clock::init();
 
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,mdns_sd=warn"));
-    // A copy started as the failure reporter never opens the session log.
-    eternal_host::startup::run_reporter_if_requested();
     let (stdout_writer, _stdout_guard) = logging::non_blocking_output(std::io::stdout());
     let (memory_writer, _session_guard) = logging::MemoryLogWriter::start();
     let stdout_layer = tracing_subscriber::fmt::layer()
