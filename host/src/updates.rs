@@ -1102,6 +1102,22 @@ fn changing<T>(
     result
 }
 
+/// Debug builds only: `ETERNAL_UPDATE_HANDOFF_PAUSE_MS=before,after` widens
+/// the handoff so end-to-end tests can connect an iPad just before or just
+/// after it starts. Release builds never pause.
+fn handoff_pause() -> (Duration, Duration) {
+    if !cfg!(debug_assertions) {
+        return (Duration::ZERO, Duration::ZERO);
+    }
+    let value = std::env::var("ETERNAL_UPDATE_HANDOFF_PAUSE_MS").unwrap_or_default();
+    let mut parts = value
+        .split(',')
+        .map(|part| part.trim().parse::<u64>().unwrap_or(0));
+    let before = parts.next().unwrap_or(0).min(60_000);
+    let after = parts.next().unwrap_or(0).min(60_000);
+    (Duration::from_millis(before), Duration::from_millis(after))
+}
+
 /// Called when something changed; `Some(version)` asks for a notification.
 pub type Wake = Arc<dyn Fn(Option<&str>) + Send + Sync>;
 
@@ -1288,10 +1304,13 @@ impl Worker {
     /// lock: either a client is already streaming (go back to waiting), or new
     /// clients are refused until the host closes or the handoff fails.
     fn install(&self, path: &Path, release: &Release) {
+        let (before, after) = handoff_pause();
+        std::thread::sleep(before);
         let started = {
             let mut session = self.session.lock();
             session.begin_update()
         };
+        std::thread::sleep(if started { after } else { Duration::ZERO });
         if !started {
             tracing::info!(
                 "An iPad connected before the update started; waiting for the stream to stop"
