@@ -20,7 +20,8 @@ fn owner_path() -> Option<PathBuf> {
 }
 
 /// Make a driver change for this host: turning the display on records this
-/// process as its owner first, and a completed turn-off removes the record.
+/// process as its owner first, and a completed turn-off removes the record if
+/// it names this process. Another host's record stays, for its reporter.
 pub(crate) fn change(enabled: bool, run: impl FnOnce() -> bool) -> bool {
     match owner_path() {
         Some(path) => change_at(&path, enabled, run),
@@ -36,12 +37,7 @@ fn change_at(path: &Path, enabled: bool, run: impl FnOnce() -> bool) -> bool {
     }
     let done = run();
     if done && !enabled {
-        match fs::remove_file(path) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                tracing::warn!(%error, "Could not clear the virtual display's owner")
-            }
-            _ => {}
-        }
+        delete_if_owned(path, ProcessId::current(), || true, true);
     }
     done
 }
@@ -398,6 +394,17 @@ mod tests {
         // A record that cannot be written does not stop the driver change.
         let unwritable = owner_file("missing").join("folder").join(OWNER_FILE);
         assert!(change_at(&unwritable, true, || true));
+    }
+
+    #[test]
+    fn a_hosts_own_turn_off_leaves_another_hosts_record() {
+        let path = owner_file("startup");
+        // Host A turned the display on; host B starts and turns it off.
+        let host_a = ProcessId { pid: 7, start: 1 };
+        record(&path, host_a).unwrap();
+        assert!(change_at(&path, false, || true));
+        assert_eq!(owner_at(&path), Some(host_a));
+        fs::remove_file(path).unwrap();
     }
 
     #[cfg(windows)]
