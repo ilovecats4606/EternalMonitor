@@ -9,7 +9,9 @@
   before its window appears, the next launch uses another backend.
 - When the Windows host cannot start, or stops unexpectedly, it shows a message
   with the error and the path of the log file. The error is written to the log
-  and queued for automatic support diagnostics before the process ends.
+  and queued for automatic support diagnostics before the process ends. A
+  small second EternalMonitor process reports crashes and turns the virtual
+  display off if the app itself cannot.
 - The host log and support diagnostics keep their final lines when the app
   quits normally, so a normal quit can be told apart from a crash. Quitting
   waits at most two seconds for uploads; the rest are sent on the next launch.

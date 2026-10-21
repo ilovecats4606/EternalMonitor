@@ -14,6 +14,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,mdns_sd=warn"));
+    // A copy started as the failure reporter never opens the session log.
+    eternal_host::startup::run_reporter_if_requested();
     let (stdout_writer, _stdout_guard) = logging::non_blocking_output(std::io::stdout());
     let (memory_writer, _session_guard) = logging::MemoryLogWriter::start();
     let stdout_layer = tracing_subscriber::fmt::layer()
@@ -50,6 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // monitor. A panic or native crash that ends the process is also shown to the user and
     // queued for support instead of closing the console window without a word.
     eternal_host::startup::install_failure_hooks();
+    eternal_host::startup::take_previous_crashes();
 
     let listen_port: u16 = std::env::args()
         .nth(1)
@@ -299,5 +302,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // process::exit skips destructors. Flush the log writers and the upload
     // outbox first, so a normal quit is told apart from a crash.
     logging::flush_before_exit(_session_guard, _uploads, _stdout_guard);
+    eternal_host::startup::finish();
     std::process::exit(0);
 }
