@@ -117,7 +117,7 @@ mod tests {
         let config = super::super::SharedConfigSource {
             shared: &shared,
             stream_epoch: 7,
-            pen_available: false,
+            pen_available: std::sync::atomic::AtomicBool::new(false),
         };
         let peer = PeerId::udp("127.0.0.1:19891".parse().unwrap());
         shared.session.lock().handle_control(
