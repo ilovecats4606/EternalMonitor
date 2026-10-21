@@ -276,50 +276,105 @@ mod tests {
         }
     }
 
-    /// Windows as documented: legal transitions are applied, anything else is
-    /// rejected and cancels the contact. Tests can script NOT_READY results
-    /// and cancel the contact behind the injector's back (a display change).
-    #[derive(Default)]
+    /// A virtual screen with room for negative desktop coordinates.
+    const SCREEN: VirtualScreen = VirtualScreen {
+        left: -8192,
+        top: -8192,
+        width: 32_768,
+        height: 32_768,
+    };
+
+    /// Microsoft's documented transitions for one injected pointer
+    /// (`InjectTouchInput`'s table, which synthetic pen injection shares),
+    /// keyed on the flags of the frame Windows receives. Written from the
+    /// documentation rather than from `PenContact`, so it checks the planner.
+    /// Button and primary flags do not affect the transition.
+    const TRANSITIONS: &[(PointerKind, u32, PointerKind)] = {
+        use pointer_flag::*;
+        use PointerKind::{Contact, Hover, Out};
+        &[
+            (Out, DOWN | INRANGE | INCONTACT, Contact),
+            (Out, UPDATE | INRANGE, Hover),
+            (Hover, UPDATE | INRANGE, Hover),
+            (Hover, DOWN | INRANGE | INCONTACT, Contact),
+            (Hover, UPDATE, Out),
+            (Contact, UPDATE | INRANGE | INCONTACT, Contact),
+            // An up must be at the last updated location; see `inject`.
+            (Contact, UP, Out),
+            (Contact, UP | INRANGE, Hover),
+            (Contact, UP | CANCELED, Out),
+        ]
+    };
+
+    /// Windows as documented: a frame in the table is applied, anything else
+    /// is rejected and cancels the contact. Tests can script NOT_READY
+    /// results and cancel the contact behind the injector's back (a display
+    /// change). Positions are where Windows resolves each frame's location
+    /// on the virtual screen current at injection.
     struct FakeWindows {
-        state: PointerState,
+        state: PointerKind,
+        /// Desktop pixel of the last applied frame.
+        at: (i32, i32),
+        screen: VirtualScreen,
         not_ready: usize,
         frames: Vec<(PenPhase, i32, i32, Outcome)>,
         illegal: Vec<(PenPhase, PointerKind)>,
     }
 
+    impl Default for FakeWindows {
+        fn default() -> Self {
+            Self {
+                state: PointerKind::Out,
+                at: (0, 0),
+                screen: SCREEN,
+                not_ready: 0,
+                frames: Vec::new(),
+                illegal: Vec::new(),
+            }
+        }
+    }
+
     impl FakeWindows {
         fn inject(&mut self, frame: PenSample, from: PointerKind) -> Outcome {
             assert_eq!(from, self.belief_of(from), "injector state diverged");
+            let pointer = PointerFrame::new(frame, self.screen);
+            let at = (
+                pointer.location.0 + self.screen.left,
+                pointer.location.1 + self.screen.top,
+            );
+            let flags = pointer.flags & !(pointer_flag::PRIMARY | pointer_flag::FIRSTBUTTON);
+            let next = TRANSITIONS
+                .iter()
+                .find(|&&(state, f, _)| state == self.state && f == flags)
+                .map(|&(_, _, next)| next)
+                .filter(|_| flags & pointer_flag::UP == 0 || at == self.at);
             let outcome = if self.not_ready > 0 {
                 self.not_ready -= 1;
                 Outcome::NotReady
-            } else if (PenContact {
-                state: self.state,
-                pending: None,
-            })
-            .valid(frame)
-            {
-                self.state = match frame.phase {
-                    PenPhase::Down | PenPhase::Move => PointerState::Contact(frame),
-                    PenPhase::Hover => PointerState::Hover(frame),
-                    _ => PointerState::Out,
-                };
+            } else if let Some(next) = next {
+                self.state = next;
+                self.at = at;
                 Outcome::Injected
             } else {
-                self.illegal.push((frame.phase, self.state.kind()));
-                self.state = PointerState::Out;
+                self.illegal.push((frame.phase, self.state));
+                self.state = PointerKind::Out;
                 Outcome::Rejected
             };
-            self.frames.push((frame.phase, frame.x, frame.y, outcome));
+            self.frames.push((frame.phase, at.0, at.1, outcome));
             outcome
+        }
+
+        /// Windows ends the contact without telling the injector.
+        fn cancel(&mut self) {
+            self.state = PointerKind::Out;
         }
 
         /// The injector may only lag Windows after a silent cancellation.
         fn belief_of(&self, injector: PointerKind) -> PointerKind {
-            if self.state == PointerState::Out {
+            if self.state == PointerKind::Out {
                 injector
             } else {
-                self.state.kind()
+                self.state
             }
         }
 
@@ -368,7 +423,7 @@ mod tests {
         let (mut contact, mut windows) = (PenContact::default(), FakeWindows::default());
         deliver(&mut contact, &mut windows, pen(Down, 10, 10));
         // A display change cancels the contact without telling us.
-        windows.state = PointerState::Out;
+        windows.cancel();
         windows.take();
         deliver(&mut contact, &mut windows, pen(Move, 20, 10));
         assert_eq!(
@@ -387,7 +442,7 @@ mod tests {
     fn a_rejected_resume_waits_for_the_next_sample_without_looping() {
         let (mut contact, mut windows) = (PenContact::default(), FakeWindows::default());
         deliver(&mut contact, &mut windows, pen(Down, 10, 10));
-        windows.state = PointerState::Out;
+        windows.cancel();
         windows.take();
         let mut refuse = |frame: PenSample, _| {
             windows
@@ -409,7 +464,7 @@ mod tests {
     fn not_ready_during_resume_keeps_the_replacement_down_pending() {
         let (mut contact, mut windows) = (PenContact::default(), FakeWindows::default());
         deliver(&mut contact, &mut windows, pen(Down, 10, 10));
-        windows.state = PointerState::Out;
+        windows.cancel();
         // The move is rejected, then the replacement DOWN is not ready.
         windows.take();
         let mut first = true;
@@ -483,7 +538,7 @@ mod tests {
             deliver(&mut contact, &mut windows, sample);
         }
         deliver(&mut contact, &mut windows, pen(Down, 5, 5));
-        windows.state = PointerState::Out;
+        windows.cancel();
         windows.take();
         let mut refuse = |_: PenSample, _| Rejected;
         contact.deliver(pen(Move, 6, 5), &mut refuse);
@@ -501,7 +556,7 @@ mod tests {
         let (mut contact, mut windows) = (PenContact::default(), FakeWindows::default());
         deliver(&mut contact, &mut windows, pen(Down, 3739, 819));
         deliver(&mut contact, &mut windows, pen(Move, 3739, 819));
-        windows.state = PointerState::Out;
+        windows.cancel();
         windows.take();
         deliver(&mut contact, &mut windows, pen(Move, -1181, 819));
         assert_eq!(
