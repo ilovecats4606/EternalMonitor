@@ -7,6 +7,8 @@ import Foundation
 final class FakeUDPHost: @unchecked Sendable {
     let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
     private(set) var port: UInt16 = 0
+    /// The iPad whose HELLO2 was accepted.
+    private var client: (address: sockaddr_storage, length: socklen_t)?
 
     init() {
         var address = sockaddr_in()
@@ -49,17 +51,34 @@ final class FakeUDPHost: @unchecked Sendable {
                 status: .ok, acceptedVersion: 2, clientNonce: hello.clientNonce, sessionId: 41,
                 heartbeatIntervalMs: 1000, reportIntervalMs: 500, livenessTimeoutMs: 3000,
                 streamConfig: StreamConfig(), hostName: "Test PC", authToken: Data(17...32), hostCaps: 0)))
-            var to = from
-            _ = ack.withUnsafeBytes { bytes in
-                withUnsafePointer(to: &to) { pointer in
-                    pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                        sendto(fd, bytes.baseAddress, bytes.count, 0, $0, length)
-                    }
-                }
-            }
+            client = (from, length)
+            send(ack)
             return true
         }
         return false
+    }
+
+    private func send(_ datagram: Data) {
+        guard var (to, length) = client else { return }
+        _ = datagram.withUnsafeBytes { bytes in
+            withUnsafePointer(to: &to) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    sendto(fd, bytes.baseAddress, bytes.count, 0, $0, length)
+                }
+            }
+        }
+    }
+
+    /// Streams `frame` to the accepted iPad as the session's first keyframe.
+    func sendKeyframe(_ frame: Data) {
+        let size = MediaHeader.maxPayload
+        let count = (frame.count + size - 1) / size
+        for index in 0..<count {
+            let payload = Data(frame[(frame.startIndex + index * size)..<min(frame.endIndex, frame.startIndex + (index + 1) * size)])
+            send(MediaHeader(sessionId: 41, streamEpoch: 1, frameSeq: 1, fragIndex: UInt16(index),
+                fragCount: UInt16(count), isKeyframe: true, captureTimestampUs: 16_667,
+                payloadLen: UInt16(payload.count)).encode(payload: payload))
+        }
     }
 
     /// The BYE reasons received until the iPad has been quiet for 300 ms.

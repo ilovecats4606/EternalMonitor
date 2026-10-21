@@ -11,7 +11,9 @@ final class USBLinkFailureTests: XCTestCase {
     private var previousAuto: Any?
     private var previousHost: Any?
     private var previousPort: Any?
-    private var server: Int32 = -1
+    /// Every socket a test opened, closed at teardown.
+    private var sockets: [Int32] = []
+    /// The far end of the newest cable.
     private var peer: Int32 = -1
 
     override func setUp() async throws {
@@ -25,14 +27,24 @@ final class USBLinkFailureTests: XCTestCase {
         UserDefaults.standard.set(previousAuto, forKey: "autoReconnect")
         UserDefaults.standard.set(previousHost, forKey: "lastHost")
         UserDefaults.standard.set(previousPort, forKey: "lastPort")
-        if peer >= 0 { Darwin.close(peer) }
-        if server >= 0 { Darwin.close(server) }
+        sockets.forEach { Darwin.close($0) }
     }
 
     /// A ConnectionManager connecting over a FramedLink whose far end is
     /// `peer`, past the preamble.
     private func connectOverCable(timing: ConnectionManager.Timing = .init()) async throws -> (ConnectionManager, FramedLink) {
-        server = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+        let link = try await openCable()
+        let manager = ConnectionManager(timing: timing)
+        manager.connect(target: .usb(link))
+        XCTAssertEqual(manager.state, .connecting)
+        return (manager, link)
+    }
+
+    /// A FramedLink past the preamble, as the USB listener accepts it, whose
+    /// far end becomes `peer`.
+    private func openCable() async throws -> FramedLink {
+        let server = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+        sockets.append(server)
         XCTAssertGreaterThanOrEqual(server, 0)
         var address = sockaddr_in()
         address.sin_family = sa_family_t(AF_INET)
@@ -58,12 +70,10 @@ final class USBLinkFailureTests: XCTestCase {
         link.validatePreamble()
         peer = accept(server, nil, nil)
         XCTAssertGreaterThanOrEqual(peer, 0)
+        sockets.append(peer)
         _ = EMLinkFramer.preamble.withUnsafeBytes { Darwin.send(peer, $0.baseAddress, $0.count, 0) }
         await fulfillment(of: [ready], timeout: 3)
-        let manager = ConnectionManager(timing: timing)
-        manager.connect(target: .usb(link))
-        XCTAssertEqual(manager.state, .connecting)
-        return (manager, link)
+        return link
     }
 
     private func waitUntilDisconnected(_ manager: ConnectionManager) async throws {
@@ -187,5 +197,163 @@ final class USBLinkFailureTests: XCTestCase {
         try await waitForFallbackToGiveUp(manager)
         XCTAssertEqual(manager.reconnectAttempt, 0)
         XCTAssertEqual(manager.problem, .badAddress("eternalmonitor-test.invalid"))
+    }
+
+    // MARK: Who owns the reconnect cycle. A connection the user or a cable
+    // starts replaces the automatic cycle, and a replaced cycle writes nothing.
+
+    /// Waits between attempts long enough to tap Try again on a timed-out one.
+    private let slowCycle = ConnectionManager.Timing(connectTimeoutSeconds: 0.4, reconnectGraceSeconds: 0.6,
+        reconnectBackoffSeconds: { _ in 0.3 })
+
+    private func until(_ description: String, seconds: Double = 10, _ condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(seconds)
+        while !condition(), Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertTrue(condition(), description)
+    }
+
+    private func injectFramingFailure() {
+        let invalid = Data([0, 0])
+        XCTAssertEqual(invalid.withUnsafeBytes { Darwin.send(peer, $0.baseAddress, $0.count, 0) }, 2)
+    }
+
+    private func keyframe() throws -> Data {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "single_idr_64x64", withExtension: "h264",
+            subdirectory: "Fixtures"))
+        return try Data(contentsOf: url)
+    }
+
+    /// A cable failure starts the fallback to `wifi`, which never answers.
+    /// Returns once its first attempt has timed out and offers Try again.
+    private func failCableIntoFallback(to wifi: FakeUDPHost, timing: ConnectionManager.Timing) async throws
+        -> (ConnectionManager, FramedLink) {
+        enableWiFiFallback(to: wifi)
+        let (manager, link) = try await connectOverCable(timing: timing)
+        injectFramingFailure()
+        try await until("the first Wi-Fi attempt times out") {
+            manager.transportMode == "WiFi" && manager.state == .disconnected && manager.problem == .noReply(usb: false)
+        }
+        XCTAssertEqual(manager.reconnectAttempt, 1)
+        return (manager, link)
+    }
+
+    func testTryAgainDuringTheFallbackEndsIt() async throws {
+        let wifi = FakeUDPHost()
+        let attempts = Task.detached { wifi.helloAttempts(within: 5) }
+        let (manager, link) = try await failCableIntoFallback(to: wifi, timing: slowCycle)
+        defer { link.stop(); manager.cancel() }
+        XCTAssertEqual(manager.problem?.actions, [.retry])
+        manager.retry()
+        XCTAssertEqual(manager.state, .connecting)
+        XCTAssertNil(manager.problem)
+        XCTAssertEqual(manager.reconnectAttempt, 0, "Try again ends the automatic cycle")
+        try await until("Try again times out") { manager.state == .disconnected }
+        try await Task.sleep(for: .seconds(2))
+        XCTAssertEqual(manager.problem, .noReply(usb: false),
+            "the old cycle must not replace Try again's result with the cable advice")
+        XCTAssertEqual(manager.reconnectAttempt, 0)
+        let attempted = await attempts.value
+        XCTAssertEqual(attempted, 2, "the fallback's first attempt and Try again, nothing after")
+    }
+
+    func testConnectingToAnotherPCDuringTheFallbackEndsIt() async throws {
+        let wifi = FakeUDPHost()
+        let other = FakeUDPHost()  // never answers either
+        let attempts = Task.detached { wifi.helloAttempts(within: 5) }
+        let (manager, link) = try await failCableIntoFallback(to: wifi, timing: slowCycle)
+        defer { link.stop(); manager.cancel() }
+        manager.connect(host: "127.0.0.1", port: other.port)
+        XCTAssertEqual(manager.state, .connecting)
+        XCTAssertNil(manager.problem)
+        XCTAssertEqual(manager.reconnectAttempt, 0, "another PC ends the automatic cycle")
+        try await until("the other PC times out") { manager.state == .disconnected }
+        try await Task.sleep(for: .seconds(2))
+        XCTAssertEqual(manager.problem, .noReply(usb: false))
+        XCTAssertEqual(manager.reconnectAttempt, 0)
+        let attempted = await attempts.value
+        XCTAssertEqual(attempted, 1, "the fallback stops after its first attempt")
+    }
+
+    /// The PC the user picks answers only after the replaced cycle would have
+    /// finished waiting for its own attempt. That cycle must not write its
+    /// progress over the session that then streams.
+    func testAReplacedCycleLeavesASuccessfulConnectionAlone() async throws {
+        let wifi = FakeUDPHost()
+        let other = FakeUDPHost()
+        let timing = ConnectionManager.Timing(connectTimeoutSeconds: 1.5, reconnectGraceSeconds: 0.5,
+            reconnectBackoffSeconds: { _ in 0.05 })
+        let (manager, link) = try await failCableIntoFallback(to: wifi, timing: timing)
+        defer { link.stop(); manager.cancel() }
+        manager.connect(host: "127.0.0.1", port: other.port)
+        // The replaced cycle would wake about 0.5 s from now.
+        let accepted = await Task.detached { Thread.sleep(forTimeInterval: 1); return other.acceptSession() }.value
+        XCTAssertTrue(accepted, "the iPad never sent HELLO2 to the other PC")
+        try await until("handshake") { manager.hostInfo != nil }
+        other.sendKeyframe(try keyframe())
+        try await until("streaming") { manager.state == .connected }
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(manager.state, .connected)
+        XCTAssertNil(manager.problem, "a replaced cycle must not show its progress over a working session")
+        XCTAssertEqual(manager.reconnectAttempt, 0)
+    }
+
+    /// Backgrounding during the fallback ends it where running out would;
+    /// foregrounding resumes with one attempt the old cycle can't touch.
+    func testBackgroundingDuringTheFallbackEndsItAndForegroundingResumes() async throws {
+        let defaults = UserDefaults.standard
+        let previous = ["allowUSB", "autoResumeOnForeground"].map { ($0, defaults.object(forKey: $0)) }
+        defer { previous.forEach { defaults.set($0.1, forKey: $0.0) } }
+        // Foregrounding must not open the app's real USB listener port.
+        defaults.set(false, forKey: "allowUSB")
+        defaults.set(true, forKey: "autoResumeOnForeground")
+        let wifi = FakeUDPHost()
+        enableWiFiFallback(to: wifi)
+        let (manager, link) = try await connectOverCable(timing: fast)
+        defer { link.stop(); manager.cancel() }
+        injectFramingFailure()
+        try await until("a Wi-Fi attempt is under way") { manager.transportMode == "WiFi" && manager.state == .connecting }
+        manager.handleAppBackgrounded()
+        XCTAssertEqual(manager.state, .disconnected)
+        XCTAssertEqual(manager.reconnectAttempt, 0, "backgrounding ends the automatic cycle")
+        XCTAssertEqual(manager.problem, .usbFailed, "the user comes back to the cable advice")
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertEqual(manager.state, .disconnected, "no reconnecting in the background")
+        XCTAssertEqual(manager.problem, .usbFailed)
+        manager.handleAppForegrounded()
+        XCTAssertEqual(manager.state, .connecting, "foregrounding resumes")
+        XCTAssertNil(manager.problem)
+        try await until("the resumed attempt times out") { manager.state == .disconnected }
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertEqual(manager.problem, .noReply(usb: false))
+        XCTAssertEqual(manager.reconnectAttempt, 0)
+    }
+
+    /// A cable plugged in again ends the fallback, whether it is waiting
+    /// between attempts or has a Wi-Fi attempt under way.
+    func testReplugDuringTheFallbackEndsIt() async throws {
+        let wifi = FakeUDPHost()
+        enableWiFiFallback(to: wifi)
+        for underWay in [false, true] {
+            let (manager, link) = try await connectOverCable(timing: slowCycle)
+            defer { link.stop(); manager.cancel() }
+            injectFramingFailure()
+            try await until("the fallback started") { manager.reconnectAttempt == 1 }
+            if underWay {
+                try await until("a Wi-Fi attempt is under way") {
+                    manager.transportMode == "WiFi" && manager.state == .connecting
+                }
+            }
+            let cable = try await openCable()
+            defer { cable.stop() }
+            manager.acceptUSBLink(cable)
+            XCTAssertEqual(manager.transportMode, "USB", "under way: \(underWay)")
+            XCTAssertEqual(manager.state, .connecting, "under way: \(underWay)")
+            XCTAssertEqual(manager.reconnectAttempt, 0, "the cable ends the automatic cycle")
+            try await until("the cable attempt times out") { manager.state == .disconnected }
+            try await Task.sleep(for: .seconds(1.5))
+            XCTAssertEqual(manager.transportMode, "USB", "no Wi-Fi attempt after the cable came back")
+            XCTAssertEqual(manager.problem, .noReply(usb: true), "under way: \(underWay)")
+            XCTAssertEqual(manager.reconnectAttempt, 0)
+        }
     }
 }
