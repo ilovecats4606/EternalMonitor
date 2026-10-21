@@ -29,8 +29,8 @@ import json,pathlib,shutil,sys
 out,shots=map(pathlib.Path,sys.argv[1:3]); errors=[]
 if sys.argv[3]!='0': errors.append('Streaming UI tests failed; see ui-run.log')
 summary=json.loads((out/'tests.json').read_text()) if (out/'tests.json').exists() else {}
-if summary.get('passedTests',0)!=5 or summary.get('failedTests',0)!=0:
-    errors.append('Expected five passing streaming UI tests')
+if summary.get('passedTests',0)!=6 or summary.get('failedTests',0)!=0:
+    errors.append('Expected six passing streaming UI tests')
 retained=out/'screenshots'/shots.name
 if shots.exists(): shutil.copytree(shots,retained)
 images=sorted(retained.glob('*.png'))
@@ -39,6 +39,6 @@ report=dict(scenario='stream-ui',status='FAIL' if errors else 'PASS',elapsed=int
     tests_passed=summary.get('passedTests',0),screenshot=str(images[0]) if images else '',errors=errors)
 (out/'result.json').write_text(json.dumps(report,indent=2)+'\n')
 if errors: sys.exit('; '.join(errors))
-print('PASS: live audio, repair diagnostics, USB connect/disconnect, cable fallback and HUD hiding')
+print('PASS: live audio, repair diagnostics, USB connect/disconnect, cable fallback, HUD hiding and VoiceOver')
 print('Evidence: '+str(out))
 PY

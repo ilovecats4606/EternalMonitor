@@ -13,6 +13,7 @@ struct DisplayView: View {
     // The picture fades in once the view is on screen.
     @State private var appeared = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
 
     var body: some View {
         ZStack {
@@ -130,6 +131,7 @@ struct DisplayView: View {
             if presented { showKeyboard = false; hudDismissTask?.cancel() }
             else { scheduleHUDDismiss() }
         }
+        .onChange(of: voiceOverEnabled) { _, _ in scheduleHUDDismiss() }
         .onChange(of: connectionManager.signalLost) { _, lost in
             if lost { hudDismissTask?.cancel(); showHUD = true }
             else { scheduleHUDDismiss() }
@@ -403,10 +405,20 @@ struct DisplayView: View {
         return 0.3
     }
 
+    /// VoiceOver reads the HUD at its own pace, so the HUD stays up while
+    /// VoiceOver runs; a tap still hides it. UI tests launch with
+    /// `-assumeVoiceOver YES`.
+    private var voiceOverRunning: Bool {
+        #if DEBUG
+        if UserDefaults.standard.bool(forKey: "assumeVoiceOver") { return true }
+        #endif
+        return voiceOverEnabled
+    }
+
     private func scheduleHUDDismiss() {
         hudDismissTask?.cancel()
         withAnimation(Motion.gentle) { showHUD = true }
-        guard !showKeyboard && !showSettings && !connectionManager.signalLost else { return }
+        guard !showKeyboard && !showSettings && !connectionManager.signalLost && !voiceOverRunning else { return }
         hudDismissTask = Task {
             try? await Task.sleep(for: .seconds(5))
             if !Task.isCancelled {

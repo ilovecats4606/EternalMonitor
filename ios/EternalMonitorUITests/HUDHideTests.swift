@@ -47,6 +47,25 @@ final class HUDHideTests: XCTestCase {
         XCTAssertTrue(app.buttons["display.disconnect"].exists)
     }
 
+    /// A VoiceOver user reads the HUD at their own pace: it must not hide
+    /// while VoiceOver runs.
+    func testHUDStaysWhileVoiceOverRuns() {
+        continueAfterFailure = false
+        let environment = ProcessInfo.processInfo.environment
+        let app = XCUIApplication()
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "YES",
+                               "-playPCaudio", "NO", "-assumeVoiceOver", "YES"]
+        app.launchEnvironment["EM_AUTOCONNECT"] = environment["EM_INPUT_HOST"] ?? "127.0.0.1:19875"
+        app.launch()
+        defer { app.terminate() }
+        let keyboard = app.buttons["display.keyboard"]
+        XCTAssertTrue(keyboard.waitForExistence(timeout: 15))
+        // Past the five-second timer and the slide out.
+        let gone = expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: keyboard)
+        XCTAssertEqual(XCTWaiter().wait(for: [gone], timeout: 8), .timedOut, "The HUD hid while VoiceOver ran")
+        XCTAssertTrue(app.buttons["display.disconnect"].exists)
+    }
+
     private func center(_ frame: CGRect) -> CGPoint {
         CGPoint(x: frame.midX, y: frame.midY)
     }
