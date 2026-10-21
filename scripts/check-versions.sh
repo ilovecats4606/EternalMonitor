@@ -28,4 +28,51 @@ version = matches[0]
 if not re.fullmatch(r"\d+\.\d+\.\d+", version):
     sys.exit(f"FAIL: invalid release version {version!r}")
 print(f"Release version: {version}")
+
+# docs/latest.json tells both apps about updates. It must name exactly what
+# docs/download.html offers, so the publish-after-TestFlight PR updates both.
+import json
+
+def fail(message):
+    sys.exit(f"FAIL: docs/latest.json: {message}")
+
+def element(html, element_id, attribute=None):
+    tag = re.search(rf'<[^>]*\bid="{element_id}"[^>]*>(?:([^<]*)<)?', html)
+    if not tag:
+        fail(f"docs/download.html has no #{element_id}")
+    if attribute is None:
+        return tag[1].strip()
+    value = re.search(rf'\b{attribute}="([^"]*)"', tag[0])
+    return value[1] if value else None
+
+html = (root / "docs/download.html").read_text()
+try:
+    latest = json.loads((root / "docs/latest.json").read_text())
+except (OSError, ValueError) as error:
+    fail(str(error))
+windows, ipad = latest.get("windows") or {}, latest.get("ipad") or {}
+if latest.get("schema") != 1:
+    fail("schema must be 1")
+published = windows.get("version", "")
+if not re.fullmatch(r"\d+\.\d+\.\d+", published):
+    fail(f"invalid Windows version {published!r}")
+if tuple(map(int, published.split("."))) > tuple(map(int, version.split("."))):
+    fail(f"publishes {published}, newer than this tree ({version})")
+installer = f"https://github.com/sidebandstudio/EternalMonitor/releases/download/v{published}/EternalMonitor-Setup.exe"
+checks = {
+    "Windows version": (f"v{published}", element(html, "release-version")),
+    "installer URL": (windows.get("installer"), installer),
+    "download button": (windows.get("installer"), element(html, "download-btn", "href")),
+    "SHA-256": (windows.get("sha256"), element(html, "sha256-value")),
+    "iPad version": (ipad.get("version"), published),
+    "TestFlight link": (ipad.get("testflight"), element(html, "testflight-link", "href")),
+}
+build = re.search(r'data-release="[^"]*\bbuild (\d+)', html)
+checks["TestFlight build"] = (ipad.get("build"), int(build[1]) if build else None)
+for name, (have, want) in checks.items():
+    if have != want:
+        fail(f"{name} is {have!r}; docs/download.html says {want!r}")
+if not re.fullmatch(r"[0-9a-f]{64}", windows["sha256"]):
+    fail("SHA-256 must be 64 lowercase hex digits")
+print(f"Published update: Windows {published}, iPad {published} build {ipad['build']}")
 PY

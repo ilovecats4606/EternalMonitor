@@ -124,6 +124,8 @@ jobs:
           # /releases/latest — which the website reads — keeps pointing at the
           # newest stable build instead of advertising an RC to everyone.
           $isPrerelease = $tag -match "-"
+          # The in-app updater (host/src/updates.rs) reads the hash after the
+          # "SHA-256" label below and refuses an installer that differs.
           $lines = @(
               "EternalMonitor $tag — see [RELEASE_NOTES.md](https://github.com/sidebandstudio/EternalMonitor/blob/main/RELEASE_NOTES.md) for what's new.",
               "",
