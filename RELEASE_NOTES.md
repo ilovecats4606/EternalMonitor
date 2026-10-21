@@ -1,3 +1,24 @@
+## Unreleased
+
+### Plain-language setup and problems
+
+- The Windows Stream page asks **Use the iPad as** with **Mirror my screen**
+  and **Second screen** at the top, above the fold. A change applies straight
+  away: a running stream restarts and the iPad reconnects by itself. The iPad
+  app uses the same names and explains that the choice is made on the PC.
+- The iPad looks for PCs as soon as it opens, and tapping a found or recent PC
+  connects. Connection problems say what happened and what to do, with
+  **Try again** or **Open Settings**: the PC didn't answer (including the
+  firewall case), the PC answered but sent no picture, the connection was lost,
+  the cable was unplugged, and Local Network access is off. Technical detail
+  stays in Connection details and the support log.
+- Windows notices for the CPU encoder fallback and a second screen that
+  couldn't start use plain words and offer **Use recommended settings**,
+  **Try again** or **Download installer**. Encoder, packet size, HEVC and the
+  quality limit moved under **Advanced** in Settings.
+- Drawing mode is explained in one sentence, and **Reconnect now to apply**
+  appears when it changes mid-session.
+
 ## EternalMonitor v0.3.1
 
 Install the Windows and iPad 0.3.1 updates together. This release includes Intel

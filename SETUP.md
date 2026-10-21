@@ -67,8 +67,9 @@ invite link.
    EternalMonitor can **find and connect to devices on your local network**.
    Tap **Allow**. Without this, the iPad cannot see your PC.
 3. Choose one of these ways to connect:
-   - **Find your PC.** Tap **Find PCs**, then tap your PC under
-     **Found on this network**.
+   - **Tap your PC.** The iPad looks for PCs by itself. Tap your PC under
+     **Found on this network** and it connects. Tap **Find PCs** to look
+     again.
    - **Scan the QR code.** On the PC, click **QR code**. On the iPad, tap
      **Scan QR code**, allow the camera, and point it at the code on the PC.
    - **Type the address.** Type the **Address** shown in the PC window into
@@ -103,9 +104,9 @@ Apple Devices open on the PC.
 5. Open EternalMonitor on the iPad. It connects over the cable on its own.
    USB needs no pairing code.
 
-When it works, the iPad's **USB cable** card says **USB: connected to** your
-PC's name, and the PC's **USB connection** row says **An iPad is streaming
-over the cable.**
+When it works, the iPad's **USB cable** card says **Connected to** your PC's
+name **over the cable**, and the PC's **USB connection** row says **An iPad is
+streaming over the cable.**
 
 **If the PC says Apple Devices is missing or closed.** EternalMonitor checks
 for this whenever an iPad is plugged in:
@@ -127,19 +128,23 @@ switches **Allow USB connections** back on in the app's settings on the iPad.
 At first the iPad mirrors your main screen. To use it as an extra screen
 instead:
 
-1. Connect the iPad first.
-2. In the PC window, open **Stream** and find **Display**. Choose
-   **Extended display (iPad)**.
-3. Click **Restart now** in the message that appears. The iPad reconnects by
-   itself after a moment.
-4. Drag a window past the edge of your main screen and it moves onto the iPad.
+1. At the top of the **Stream** page in the PC window, next to
+   **Use the iPad as**, click **Second screen**. This works over Wi-Fi and USB.
+2. If the iPad is connected, the stream restarts and the iPad reconnects by
+   itself after a moment. If it isn't, the second screen appears as soon as it
+   connects.
+3. Drag a window past the edge of your main screen and it moves onto the iPad.
 
-To choose which side of your main screen the iPad is on, open Windows
-**Settings**, then **System** and **Display**, and drag the screens into place.
-The extra screen exists only while the iPad is connected. It goes away when
-you disconnect.
+To choose which side of your main screen the iPad is on, click
+**Arrange screens** next to the choice. Windows opens **Display** settings;
+drag the screens into place. The extra screen exists only while the iPad is
+connected. It goes away when you disconnect.
 
-To mirror again, choose **Main display (mirror)** and click **Restart now**.
+To mirror again, click **Mirror my screen**. To mirror one particular monitor,
+open **Settings** and choose it under **How the iPad shows your PC**.
+
+The iPad app's settings explain this under **Second screen or mirror**. The
+choice is always made on the PC.
 
 ## Draw with Apple Pencil (optional)
 
@@ -147,8 +152,9 @@ Apple Pencil works as a pen in Windows drawing apps, with pressure and tilt.
 
 1. In the app's settings on the iPad, turn on **Drawing mode**. This also turns
    on **Allow USB connections**.
-2. Connect again. Drawing mode applies from the next connection, and a USB
-   cable gives the smoothest strokes.
+2. Connect again. Drawing mode applies from the next connection. If you are
+   already connected, tap **Reconnect now to apply**. A USB cable gives the
+   smoothest strokes.
 3. In your drawing app, pick the Windows pen setting. In Clip Studio Paint,
    choose **Preferences**, then **Tablet**, then **Tablet PC**, and set up pen
    pressure there.
@@ -156,7 +162,7 @@ Apple Pencil works as a pen in Windows drawing apps, with pressure and tilt.
 In Drawing mode, fingers on the canvas are ignored and PC audio is muted. Tap
 the round sliders button in the top right corner to show the controls. Apple
 Pencil (USB-C) has no pressure sensor, so its strokes don't change width with
-pressure. If the iPad says **Native Pencil input is unavailable**, the PC has
+pressure. If the iPad says **Apple Pencil can't draw on this PC**, the PC has
 an older EternalMonitor or a Windows 10 version before 1809. Update both.
 
 ## Using EternalMonitor
@@ -183,7 +189,10 @@ or in the controls while streaming.
 | What you see | What to do |
 | --- | --- |
 | **No PCs found** on the iPad | Check that both are on the same Wi-Fi and not on a guest network. Type the **Address** from the PC window instead. |
-| **Couldn't reach your PC after 6 tries** | Make sure EternalMonitor is open on the PC and the PC is awake. Check that both are on the same network. |
+| **Your PC didn't answer** | Check that EternalMonitor is open on the PC and says **Ready for your iPad**, that the PC is awake, and that both are on the same Wi-Fi, not a guest network. If all of that is right, Windows Firewall or security software is probably blocking EternalMonitor: run EternalMonitor-Setup.exe again, or use a USB cable. Then tap **Try again**. |
+| **Your PC answered, but no picture arrived** | Look at EternalMonitor on the PC and follow any message it shows, click **Restart**, then tap **Try again** on the iPad. |
+| **Lost the connection to your PC** or **Couldn't reconnect to your PC** | The PC may have gone to sleep or closed EternalMonitor. Wake it, check EternalMonitor is open, then tap **Try again**. |
+| **EternalMonitor isn't allowed on your local network** | Tap **Open Settings** and turn on **Local Network**. |
 | **That code didn't match** | Type the six digits currently shown on the PC. The code changes when you click **New code**. |
 | **Too many attempts** | Wait a minute, then enter the code again. |
 | **This app and EternalMonitor on your PC are different versions** | Install matching versions on both, then connect again. |
@@ -191,11 +200,11 @@ or in the controls while streaming.
 | The iPad never connects over USB | Open Apple Devices on the PC and leave it open. Unlock the iPad, accept **Trust**, and try another cable. Then unplug and plug in again. |
 | The iPad can't find the PC at all | Open the iPad's **Settings** app, then **Privacy & Security**, then **Local Network**, and turn on **EternalMonitor**. |
 | The picture stutters or freezes on Wi-Fi | Move closer to the router, or use a 5 GHz network. Connect the PC to the router with a network cable, or use USB. |
-| **Hardware encoder unavailable** on the PC | In **Settings**, select **Auto** for the encoder and **YUV420** for encoder input, then restart the stream. Update the driver from your GPU manufacturer. If this persists, use **Performance** → **Copy logs** and include the iPad report from **Settings → Support → Diagnostics**. Some GPUs have no supported hardware encoder. |
-| **Extended display unavailable** on the PC | Run EternalMonitor-Setup.exe again to repair the install, then restart the stream. |
+| **Video is using the processor instead of the graphics card** on the PC | If the message has **Use recommended settings**, click it. Otherwise update the driver from NVIDIA, AMD or Intel, then click **Restart**. If this persists, use **Performance** → **Copy logs** and include the iPad report from **Settings → Support → Diagnostics**. Some graphics cards have no supported video encoder. |
+| **The second screen couldn't start, so your main screen is mirrored** on the PC | Click **Try again**. If the message says part of the install is missing, click **Download installer**, run EternalMonitor-Setup.exe again to repair it, then click **Try again**. |
 
-**Using a VPN such as Tailscale?** In the PC window, open **Settings** and set
-**Packet size** to **1200**.
+**Using a VPN such as Tailscale?** In the PC window, open **Settings** and,
+under **Advanced**, set **Packet size** to **1200**.
 
 **Start over with pairing.** On the iPad, tap **Forget paired PCs** in the
 app's settings. On the PC, **Forget all iPads** in **Settings** makes every

@@ -152,15 +152,15 @@ Use the matching release pair. v0.1 and v2 builds cannot stream together.
 v0.3 keeps the v2 prefix and negotiates new features, but mixing older builds
 is not a supported beta-test configuration.
 
-## Extended display vs mirror
+## Second screen vs mirror
 
 By default the iPad mirrors the primary screen. To test the iPad as a real extended desktop:
-**connect the iPad first**, then on the host's Stream page set **Display** to **"Extended display
-(iPad)"** (also under Settings → Display to stream) and click **Restart now**. Dragging a window past the edge of the main screen should
+at the top of the host's Stream page, next to **Use the iPad as**, click **Second screen** (also under
+Settings → How the iPad shows your PC). A running stream restarts by itself. Dragging a window past the edge of the main screen should
 land it on the iPad. The virtual monitor is created **on demand and only while the iPad is
 connected** — there is intentionally no second display when idle, so don't expect to see it in
 Windows Display settings before connecting. If the extended display can't start, the host shows an
-amber "Extended display unavailable" banner and mirrors the primary screen — re-run the installer
+amber "The second screen couldn't start" banner and mirrors the primary screen — re-run the installer
 so its display task is registered.
 
 ## Build parity and release status
