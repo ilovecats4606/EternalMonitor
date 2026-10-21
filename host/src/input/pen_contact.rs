@@ -59,6 +59,7 @@ pub struct PenContact {
 }
 
 impl PenContact {
+    #[cfg(test)]
     pub fn state(&self) -> PointerState {
         self.state
     }
