@@ -10,7 +10,7 @@
 //! installer open until Setup has finished and starts Setup suspended, letting
 //! it run only if Windows mapped that very file. After [`READY`] the host
 //! closes; from then on every path, failures included, ends with the
-//! installed app running again.
+//! installed app running again once that host has exited.
 //!
 //! Threat model (SECURITY.md): network attackers are fully covered by HTTPS,
 //! the host allowlist and pinned hashes. Against malware already running as
@@ -147,6 +147,11 @@ pub enum HostExit {
 
 /// Runs the helper. Returns its exit code; `out` is the pipe to the host.
 pub fn run(args: HelperArgs, out: &mut dyn Write) -> i32 {
+    run_with(args, out, HOST_EXIT_WAIT)
+}
+
+/// [`run`], with how long Setup waits for the host to close.
+fn run_with(args: HelperArgs, out: &mut dyn Write, host_exit_wait: Duration) -> i32 {
     let mut log = Log::open(&args.log);
     let prepared = prepare(&args);
     let (installer, host) = match prepared {
@@ -164,12 +169,12 @@ pub fn run(args: HelperArgs, out: &mut dyn Write) -> i32 {
         return 4;
     }
     let installed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        match host.wait(HOST_EXIT_WAIT) {
+        match host.wait(Some(host_exit_wait)) {
             HostExit::Closed => log.note("EternalMonitor closed"),
             HostExit::StillRunning => {
                 // Setup would close it mid-use or fail on its files. Leave
-                // the running app alone; its next start reports the update
-                // did not finish.
+                // the running app alone; the start after it closes reports
+                // the update did not finish.
                 return Err("EternalMonitor did not close; not installing".to_string());
             }
         }
@@ -181,8 +186,14 @@ pub fn run(args: HelperArgs, out: &mut dyn Write) -> i32 {
         Err(_) => log.note("the helper failed while installing"),
     }
     drop(installer);
-    // Whatever happened, the user gets EternalMonitor back. If the old host
-    // is somehow still running, the new start just shows its window.
+    // Whatever happened, the user gets EternalMonitor back, but only once the
+    // old host has exited. A start while it still runs would find it, show
+    // its window and quit, and then nothing would be running when it closes.
+    // While it runs the user has that app, so there is no deadline here.
+    if host.wait(None) == HostExit::StillRunning {
+        log.note("cannot wait for EternalMonitor to close; not starting it again");
+        return 6;
+    }
     match relaunch(&args.app) {
         Ok(()) => {
             log.note("EternalMonitor started");
@@ -249,18 +260,19 @@ impl Host {
         Ok(Self { pid })
     }
 
+    /// `None` waits for as long as it takes.
     #[cfg(windows)]
-    fn wait(&self, timeout: Duration) -> HostExit {
-        match win::wait(&self.process, Some(timeout)) {
+    fn wait(&self, timeout: Option<Duration>) -> HostExit {
+        match win::wait(&self.process, timeout) {
             Some(_) => HostExit::Closed,
             None => HostExit::StillRunning,
         }
     }
 
     #[cfg(not(windows))]
-    fn wait(&self, timeout: Duration) -> HostExit {
+    fn wait(&self, timeout: Option<Duration>) -> HostExit {
         let start = std::time::Instant::now();
-        while start.elapsed() < timeout {
+        while timeout.is_none_or(|timeout| start.elapsed() < timeout) {
             // A zombie child of ours also counts as closed.
             let gone = unsafe { libc::kill(self.pid as libc::pid_t, 0) } != 0
                 || unsafe {
@@ -400,16 +412,96 @@ mod tests {
         let mut stuck = Command::new("sleep").arg("30").spawn().unwrap();
         let host = Host::open(stuck.id()).unwrap();
         assert_eq!(
-            host.wait(Duration::from_millis(300)),
+            host.wait(Some(Duration::from_millis(300))),
             HostExit::StillRunning
         );
         stuck.kill().unwrap();
         stuck.wait().unwrap();
-        assert_eq!(host.wait(Duration::from_millis(300)), HostExit::Closed);
+        assert_eq!(
+            host.wait(Some(Duration::from_millis(300))),
+            HostExit::Closed
+        );
         assert!(
             Host::open(999_999).is_err(),
             "a missing host is an error, not 'closed'"
         );
+    }
+
+    /// A stand-in host with the single-instance rule: a second start while
+    /// one runs only "shows its window" and quits. Each start that gets the
+    /// lock appends its PID to `hosts`, each turned-away one to `duplicates`.
+    #[cfg(unix)]
+    fn instance_script(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("host.sh");
+        let d = dir.display();
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif mkdir '{d}/instance' 2>/dev/null; then\n  echo $$ >> '{d}/hosts'\n  sleep ${{1:-30}}\n  rmdir '{d}/instance'\nelse\n  echo $$ >> '{d}/duplicates'\nfi\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// The old host is still closing when Setup's wait ends. Starting the app
+    /// then would find it, hand over and quit, leaving nothing running once it
+    /// finishes closing. The helper must start the app only after that.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_that_closes_after_the_wait_leaves_exactly_one_running() {
+        let dir = temp("late-host");
+        let app = instance_script(&dir);
+        let installer = dir.join("setup.sh");
+        std::fs::write(
+            &installer,
+            "#!/bin/sh\ntouch \"$(dirname \"$0\")/setup-ran\"\n",
+        )
+        .unwrap();
+        let sha256 = sha256_hex(&mut File::open(&installer).unwrap()).unwrap();
+        let mut old = Command::new(&app).arg("2").spawn().unwrap();
+        let hosts = dir.join("hosts");
+        let start = std::time::Instant::now();
+        while !hosts.exists() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let args = HelperArgs {
+            installer,
+            sha256,
+            app,
+            host_pid: old.id(),
+            log: dir.join("update.log"),
+        };
+        let mut out = Vec::new();
+        run_with(args.clone(), &mut out, Duration::from_millis(300));
+        assert_eq!(String::from_utf8_lossy(&out).trim(), READY);
+        let _ = old.wait();
+        // Give a relaunch time to run its script either way.
+        std::thread::sleep(Duration::from_millis(500));
+        let started = std::fs::read_to_string(&hosts).unwrap_or_default();
+        let pids: Vec<i32> = started.lines().map(|l| l.parse().unwrap()).collect();
+        let running: Vec<i32> = pids
+            .iter()
+            .copied()
+            .filter(|&pid| unsafe { libc::kill(pid, 0) } == 0)
+            .collect();
+        for &pid in &running {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        let log = std::fs::read_to_string(&args.log).unwrap();
+        assert!(
+            !dir.join("duplicates").exists(),
+            "the app started while the old host still ran: {log}"
+        );
+        assert_eq!(
+            running.len(),
+            1,
+            "hosts {pids:?}, running {running:?}: {log}"
+        );
+        assert!(!dir.join("setup-ran").exists(), "Setup never runs late");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
