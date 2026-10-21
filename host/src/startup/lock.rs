@@ -37,6 +37,21 @@ pub(crate) fn lock(path: &Path, wait: Duration, mut waiting: impl FnMut()) -> io
     }
 }
 
+/// Lock `path`, creating it. `WouldBlock` when another holder has it.
+pub(crate) fn try_lock(path: &Path) -> io::Result<Locked> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Locked(file)),
+        Err(TryLockError::WouldBlock) => Err(io::ErrorKind::WouldBlock.into()),
+        Err(TryLockError::Error(error)) => Err(error),
+    }
+}
+
 impl Locked {
     pub(crate) fn read(&mut self) -> io::Result<String> {
         let mut text = String::new();

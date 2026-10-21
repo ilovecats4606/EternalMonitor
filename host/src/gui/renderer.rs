@@ -94,26 +94,52 @@ pub(super) fn configure(config: &mut WgpuConfiguration) {
 pub(super) fn frame_started(ctx: &egui::Context) {
     crate::startup::simulate_surface_error(&FAILED_ACQUIRES);
     let visible = ctx.input(|input| input.viewport().minimized != Some(true));
-    let confirmed = PRESENT.lock().is_ok_and(|mut tracker| {
-        tracker.observe(
-            ctx.cumulative_frame_nr(),
-            FAILED_ACQUIRES.load(Ordering::SeqCst),
-            visible,
-            Instant::now(),
-        )
-    });
-    if !confirmed {
+    let Ok(mut tracker) = PRESENT.lock() else {
         return;
+    };
+    let now_drawing = tracker.observe(
+        ctx.cumulative_frame_nr(),
+        FAILED_ACQUIRES.load(Ordering::SeqCst),
+        visible,
+        Instant::now(),
+    );
+    let drawing = tracker.confirmed;
+    drop(tracker);
+    if now_drawing {
+        crate::startup::mark_window_shown();
+        info!("Window renderer is drawing");
     }
-    crate::startup::mark_window_shown();
-    info!("Window renderer is drawing");
+    if drawing {
+        clear_marker(true);
+    }
+}
+
+/// The window closed normally. A launch that quits before its window is
+/// confirmed did not fail, so its marker goes without counting either way.
+pub(super) fn window_closed() {
+    clear_marker(false);
+}
+
+/// Clear this launch's marker, after recording that its backend drew when
+/// `drew`. The history may be busy with another instance; the next frame
+/// tries again, so the GUI never waits for it.
+fn clear_marker(drew: bool) {
     let (Some(directory), Ok(mut started)) = (STATE_DIR.get(), STARTED.lock()) else {
         return;
     };
-    if let Some(marker) = started.take() {
-        update_history(directory, |history| record_success(history, &marker));
-        let _ = fs::remove_file(marker_path(directory, ProcessId::current()));
+    if let Some(marker) = started.as_ref() {
+        if finish_launch(directory, marker, ProcessId::current(), drew) {
+            started.take();
+        }
     }
+}
+
+fn finish_launch(directory: &Path, marker: &Marker, owner: ProcessId, drew: bool) -> bool {
+    if drew && update_history(directory, |history| record_success(history, marker)).is_none() {
+        return false;
+    }
+    let _ = fs::remove_file(marker_path(directory, owner));
+    true
 }
 
 /// Confirms a working window from the frame counter, the time and surface
@@ -339,21 +365,27 @@ fn read_history(directory: &Path) -> Vec<Failure> {
 
 /// Read, change and save the history as one step, so instances starting
 /// together do not lose each other's updates. Returns the changed history, or
-/// what is on disk when the lock cannot be had.
-fn update_history(directory: &Path, change: impl FnOnce(&mut Vec<Failure>)) -> Vec<Failure> {
-    let lock =
-        crate::startup::lock::lock(&directory.join(HISTORY_LOCK), Duration::from_secs(2), || {});
-    if let Err(error) = &lock {
-        warn!(%error, "Could not lock the renderer history");
-        return read_history(directory);
-    }
+/// `None` without waiting when another instance is updating it.
+fn update_history(
+    directory: &Path,
+    change: impl FnOnce(&mut Vec<Failure>),
+) -> Option<Vec<Failure>> {
+    let _lock = match crate::startup::lock::try_lock(&directory.join(HISTORY_LOCK)) {
+        Ok(lock) => lock,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::WouldBlock {
+                warn!(%error, "Could not lock the renderer history");
+            }
+            return None;
+        }
+    };
     let mut history = read_history(directory);
     let before = history.clone();
     change(&mut history);
     if history != before {
         write_history(directory, &history);
     }
-    history
+    Some(history)
 }
 
 fn write_history(directory: &Path, history: &[Failure]) {
@@ -369,7 +401,8 @@ fn write_history(directory: &Path, history: &[Failure]) {
 }
 
 /// Count markers left by exited launches as failures and remove them. Markers
-/// of running instances, including this one, are theirs to clear.
+/// of running instances, including this one, are theirs to clear. When another
+/// instance is updating the history, it sweeps them; use the history as saved.
 fn sweep(directory: &Path, current: ProcessId) -> Vec<Failure> {
     update_history(directory, |history| {
         for entry in fs::read_dir(directory).into_iter().flatten().flatten() {
@@ -394,6 +427,7 @@ fn sweep(directory: &Path, current: ProcessId) -> Vec<Failure> {
             let _ = fs::remove_file(entry.path());
         }
     })
+    .unwrap_or_else(|| read_history(directory))
 }
 
 #[cfg(test)]
@@ -576,10 +610,16 @@ mod tests {
             .map(|_| {
                 let directory = directory.clone();
                 std::thread::spawn(move || {
-                    for _ in 0..20 {
-                        update_history(&directory, |history| {
+                    let mut done = 0;
+                    while done < 20 {
+                        // Never waits: an instance that finds it busy retries later.
+                        if update_history(&directory, |history| {
                             record_failure(history, &marker(gpu, "vulkan"))
-                        });
+                        })
+                        .is_some()
+                        {
+                            done += 1;
+                        }
                     }
                 })
             })
@@ -588,6 +628,41 @@ mod tests {
             thread.join().unwrap();
         }
         assert_eq!(read_history(&directory)[0].failures, 8 * 20);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_busy_history_never_holds_the_window() {
+        let directory = temp_dir("renderer-busy");
+        let busy = crate::startup::lock::try_lock(&directory.join(HISTORY_LOCK)).unwrap();
+        let started = Instant::now();
+        assert_eq!(update_history(&directory, |_| {}), None);
+        let launch = ProcessId::current();
+        let drew = marker("10de:2c02 32.0.15.9186", "vulkan");
+        fs::write(marker_path(&directory, launch), b"{}").unwrap();
+        // Not finished: the next frame tries again.
+        assert!(!finish_launch(&directory, &drew, launch, true));
+        assert!(marker_path(&directory, launch).exists());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        drop(busy);
+        assert!(finish_launch(&directory, &drew, launch, true));
+        assert!(!marker_path(&directory, launch).exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_normal_quit_before_the_window_is_confirmed_is_not_a_failure() {
+        let directory = temp_dir("renderer-quit");
+        let quit = exited_process();
+        let backend = marker("8086:5917 23.20.16.5038", "vulkan");
+        fs::write(
+            marker_path(&directory, quit),
+            serde_json::to_vec(&backend).unwrap(),
+        )
+        .unwrap();
+        assert!(finish_launch(&directory, &backend, quit, false));
+        // The next launch finds nothing to count.
+        assert!(sweep(&directory, ProcessId::current()).is_empty());
         fs::remove_dir_all(directory).unwrap();
     }
 

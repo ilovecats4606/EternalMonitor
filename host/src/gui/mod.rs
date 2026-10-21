@@ -1141,11 +1141,15 @@ pub fn run_gui(control: GuiControl) -> eframe::Result<()> {
     };
     renderer::configure(&mut options.wgpu_options);
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "EternalMonitor",
         options,
         Box::new(|cc| Ok(Box::new(AnalyzerApp::new(cc, control)))),
-    )
+    );
+    if result.is_ok() {
+        renderer::window_closed();
+    }
+    result
 }
 
 #[cfg(test)]
