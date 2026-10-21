@@ -29,6 +29,8 @@ with these changes.
   line with the repeat count and the first and last times. The count appears
   about 30 seconds after the burst starts, or when the app quits, so logs and
   support reports keep the lines that explain a problem.
+- Quitting waits at most two seconds for support uploads; the rest are sent
+  on the next launch.
 
 ## EternalMonitor v0.3.1
 

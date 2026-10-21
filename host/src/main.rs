@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,mdns_sd=warn"));
     let (stdout_writer, _stdout_guard) = logging::non_blocking_output(std::io::stdout());
-    let (memory_writer, session_log) = logging::MemoryLogWriter::start();
+    let (memory_writer, _session_guard) = logging::MemoryLogWriter::start();
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_writer(stdout_writer.with_max_level(tracing::Level::INFO))
@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(memory_layer)
         .init();
 
-    let uploads = eternal_host::telemetry::UploadGuard::start();
+    let _uploads = eternal_host::telemetry::UploadGuard::start();
 
     info!(
         path = %logging::session_log_path().display(),
@@ -298,11 +298,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     info!("EternalMonitor shutting down");
-    // process::exit skips destructors, so drop these by hand: the session
-    // log first (it writes pending repeat counts), then uploads, so the last
-    // upload includes those counts. A shared logging::flush_before_exit with
-    // this order can replace these two lines.
-    drop(session_log);
-    drop(uploads);
+    // process::exit skips destructors. Flush the log writers and the upload
+    // outbox first, so a normal quit is told apart from a crash.
+    logging::flush_before_exit(_session_guard, _uploads, _stdout_guard);
     std::process::exit(0);
 }

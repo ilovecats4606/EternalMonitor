@@ -381,6 +381,17 @@ pub fn session_log_path() -> PathBuf {
     SESSION_LOG_PATH.clone()
 }
 
+/// Release the log and upload guards in the order a normal quit needs. A
+/// session-log guard may emit final lines, such as repeat summaries, while it
+/// drops; those reach support only while the upload guard still queues lines.
+/// The upload guard then writes what is queued to the outbox, within its
+/// bound, and console output goes last.
+pub fn flush_before_exit<S, U, C>(session_log: S, uploads: U, console: C) {
+    drop(session_log);
+    drop(uploads);
+    drop(console);
+}
+
 fn resolve_session_log_path() -> PathBuf {
     // Prefer %APPDATA%/EternalMonitor/logs so the log is writable even when the app is installed
     // read-only under Program Files; fall back to the exe directory only if APPDATA is unavailable.
@@ -585,6 +596,23 @@ mod tests {
             assert!(!redacted.contains(secret), "leaked {secret}: {redacted}");
         }
         assert!(redacted.contains("status=-12909 session_id=123456"));
+    }
+
+    #[test]
+    fn quit_drops_session_log_guards_while_uploads_still_queue() {
+        struct Guard(&'static str, Arc<Mutex<Vec<&'static str>>>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.1.lock().push(self.0);
+            }
+        }
+        let order = Arc::new(Mutex::new(Vec::new()));
+        flush_before_exit(
+            Guard("session log", order.clone()),
+            Guard("uploads", order.clone()),
+            Guard("console", order.clone()),
+        );
+        assert_eq!(*order.lock(), ["session log", "uploads", "console"]);
     }
 
     #[test]

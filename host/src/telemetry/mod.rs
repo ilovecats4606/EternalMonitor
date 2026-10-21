@@ -13,11 +13,14 @@ use std::{
 
 const MAX_FILES: usize = 512;
 const BATCH_SIZE: usize = 4;
+/// Longest a normal quit waits for uploads. Unsent batches stay in the outbox.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 static SENDER: OnceLock<mpsc::SyncSender<String>> = OnceLock::new();
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static STATUS: Mutex<String> = Mutex::new(String::new());
 static IDENTITY: OnceLock<(String, String)> = OnceLock::new();
+static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Deserialize)]
 pub struct Config {
@@ -146,10 +149,69 @@ pub fn set_enabled(value: bool) {
     });
 }
 
-pub struct UploadGuard(
-    Option<mpsc::Sender<()>>,
-    Option<std::thread::JoinHandle<()>>,
-);
+pub struct UploadGuard {
+    _uploader: Option<Uploader>,
+}
+
+/// The upload thread. Dropping it waits at most [`SHUTDOWN_WAIT`]; if a request
+/// is still in flight, the queued lines are written to the outbox from here.
+struct Uploader {
+    stop: std::sync::Arc<AtomicBool>,
+    receiver: std::sync::Arc<Mutex<mpsc::Receiver<String>>>,
+    directory: PathBuf,
+    done: mpsc::Receiver<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl Uploader {
+    fn spawn(config: Config, directory: PathBuf) -> (mpsc::SyncSender<String>, Self) {
+        let (sender, receiver) = mpsc::sync_channel(256);
+        let receiver = std::sync::Arc::new(Mutex::new(receiver));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (done_tx, done) = mpsc::channel();
+        let thread = {
+            let (receiver, stop, directory) = (receiver.clone(), stop.clone(), directory.clone());
+            std::thread::spawn(move || {
+                if run(config, directory, receiver, stop).is_err() {
+                    set_status("Automatic upload stopped: local outbox unavailable");
+                }
+                let _ = done_tx.send(());
+            })
+        };
+        let uploader = Self {
+            stop,
+            receiver,
+            directory,
+            done,
+            thread: Some(thread),
+        };
+        (sender, uploader)
+    }
+}
+impl Drop for Uploader {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if self.done.recv_timeout(SHUTDOWN_WAIT).is_ok() {
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+            return;
+        }
+        // The thread is inside a request and holds no lock; keep what it has
+        // not written yet and let the process exit without it.
+        let Ok(receiver) = self.receiver.lock() else {
+            return;
+        };
+        let events: Vec<Event> = receiver
+            .try_iter()
+            .map(|line| event(&line, level(&line)))
+            .collect();
+        for chunk in events.chunks(BATCH_SIZE) {
+            if let Ok(batch) = batch(chunk.to_vec()) {
+                let _ = persist(&self.directory, &batch);
+            }
+        }
+    }
+}
 impl UploadGuard {
     pub fn start() -> Self {
         ENABLED.store(
@@ -159,39 +221,38 @@ impl UploadGuard {
         );
         let Some(config) = Config::load() else {
             set_status("Automatic upload is not configured");
-            return Self(None, None);
+            return Self { _uploader: None };
         };
         if !config.enabled {
             set_status("Automatic upload is disabled");
-            return Self(None, None);
+            return Self { _uploader: None };
         }
         let directory = crate::settings::app_data_dir()
             .unwrap()
             .join("diagnostics-outbox");
-        let (sender, receiver) = mpsc::sync_channel(256);
-        if SENDER.set(sender).is_err() {
-            return Self(None, None);
-        }
-        let (stop, stopped) = mpsc::channel();
-        let thread = std::thread::spawn(move || {
-            let result = run(config, directory, receiver, stopped);
-            if result.is_err() {
+        let identity = match identity(&directory) {
+            Ok(identity) => identity,
+            Err(_) => {
                 set_status("Automatic upload stopped: local outbox unavailable");
+                return Self { _uploader: None };
             }
-        });
-        Self(Some(stop), Some(thread))
+        };
+        if SENDER.get().is_some() {
+            return Self { _uploader: None };
+        }
+        let _ = IDENTITY.set(identity);
+        let (sender, uploader) = Uploader::spawn(config, directory);
+        let _ = SENDER.set(sender);
+        Self {
+            _uploader: Some(uploader),
+        }
     }
 }
 impl Drop for UploadGuard {
     fn drop(&mut self) {
         // Counts of bursts still being collapsed belong in the last upload.
+        // The uploader drops after this, within its bound.
         crate::logging::flush_repeat_summaries();
-        if let Some(stop) = self.0.take() {
-            let _ = stop.send(());
-        }
-        if let Some(thread) = self.1.take() {
-            let _ = thread.join();
-        }
     }
 }
 pub fn record(line: &str) {
@@ -207,18 +268,33 @@ pub fn record(line: &str) {
         }
     }
 }
+fn identity(directory: &Path) -> std::io::Result<(String, String)> {
+    fs::create_dir_all(directory)?;
+    let identity_path = directory.join("installation-id");
+    let installation_id = match fs::read_to_string(&identity_path) {
+        Ok(id) if id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit()) => id,
+        _ => {
+            let id = id()?;
+            fs::write(identity_path, &id)?;
+            id
+        }
+    };
+    Ok((installation_id, id()?))
+}
 /// Lines drained at shutdown keep their level: an error logged just before
 /// exit is usually the one that explains the exit.
-fn event(sequence: u64, line: &str) -> Event {
-    let level = if line.contains(" ERROR ") {
+fn level(line: &str) -> &'static str {
+    if line.contains(" ERROR ") {
         "error"
     } else if line.contains(" WARN ") {
         "warning"
     } else {
         "info"
-    };
+    }
+}
+fn event(line: &str, level: &str) -> Event {
     Event {
-        sequence,
+        sequence: SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1,
         at_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -227,6 +303,19 @@ fn event(sequence: u64, line: &str) -> Event {
         category: "host".into(),
         message: crate::logging::redact_support_text(line),
     }
+}
+fn batch(events: Vec<Event>) -> std::io::Result<Batch> {
+    let (installation_id, launch_id) = IDENTITY.get().cloned().unwrap_or_default();
+    Ok(Batch {
+        schema: 1,
+        batch_id: id()?,
+        installation_id,
+        launch_id,
+        platform: std::env::consts::OS.into(),
+        app_version: env!("CARGO_PKG_VERSION").into(),
+        build: env!("ETERNAL_BUILD_REVISION").into(),
+        events,
+    })
 }
 fn files(directory: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut paths: Vec<_> = fs::read_dir(directory)?
@@ -238,6 +327,11 @@ fn files(directory: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 fn persist(directory: &Path, batch: &Batch) -> std::io::Result<()> {
+    // The upload thread and a bounded shutdown may both write.
+    static PERSIST: Mutex<()> = Mutex::new(());
+    let _guard = PERSIST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let bytes = serde_json::to_vec(batch)?;
     let path = directory.join(format!("{}-{}.json", batch.events[0].at_ms, batch.batch_id));
     let temp = path.with_extension("tmp");
@@ -298,39 +392,27 @@ fn upload(
 fn run(
     config: Config,
     directory: PathBuf,
-    receiver: mpsc::Receiver<String>,
-    stop: mpsc::Receiver<()>,
+    receiver: std::sync::Arc<Mutex<mpsc::Receiver<String>>>,
+    stop: std::sync::Arc<AtomicBool>,
 ) -> std::io::Result<()> {
-    fs::create_dir_all(&directory)?;
-    let identity_path = directory.join("installation-id");
-    let installation_id = match fs::read_to_string(&identity_path) {
-        Ok(id) if id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit()) => id,
-        _ => {
-            let id = id()?;
-            fs::write(identity_path, &id)?;
-            id
-        }
-    };
-    let launch_id = id()?;
-    let _ = IDENTITY.set((installation_id.clone(), launch_id.clone()));
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(5)))
         .max_redirects(0)
         .build()
         .into();
     let mut pending = Vec::new();
-    let mut sequence = 0;
     let mut next = std::time::Instant::now();
     let mut backoff = 5;
     let mut last_persist = std::time::Instant::now();
     set_status("Automatic upload enabled; waiting for events");
     loop {
-        let stopping = stop.try_recv().is_ok();
-        match receiver.recv_timeout(Duration::from_millis(100)) {
-            Ok(line) => {
-                sequence += 1;
-                pending.push(event(sequence, &line));
-            }
+        let stopping = stop.load(Ordering::SeqCst);
+        let received = match receiver.lock() {
+            Ok(receiver) => receiver.recv_timeout(Duration::from_millis(100)),
+            Err(_) => break,
+        };
+        match received {
+            Ok(line) => pending.push(event(&line, level(&line))),
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
@@ -339,7 +421,9 @@ fn run(
             for path in files(&directory)? {
                 fs::remove_file(path)?;
             }
-            while receiver.try_recv().is_ok() {}
+            if let Ok(receiver) = receiver.lock() {
+                while receiver.try_recv().is_ok() {}
+            }
             if stopping {
                 return Ok(());
             }
@@ -349,22 +433,20 @@ fn run(
             || ((!pending.is_empty())
                 && (last_persist.elapsed() >= Duration::from_secs(1) || stopping))
         {
-            let batch = Batch {
-                schema: 1,
-                batch_id: id()?,
-                installation_id: installation_id.clone(),
-                launch_id: launch_id.clone(),
-                platform: std::env::consts::OS.into(),
-                app_version: env!("CARGO_PKG_VERSION").into(),
-                build: env!("ETERNAL_BUILD_REVISION").into(),
-                events: std::mem::take(&mut pending),
-            };
-            persist(&directory, &batch)?;
+            persist(&directory, &batch(std::mem::take(&mut pending))?)?;
             last_persist = std::time::Instant::now();
         }
         if !stopping && std::time::Instant::now() >= next {
+            // Nothing stays only in memory while a request is in flight.
+            if !pending.is_empty() {
+                persist(&directory, &batch(std::mem::take(&mut pending))?)?;
+                last_persist = std::time::Instant::now();
+            }
             let mut failed = false;
             for path in files(&directory)?.into_iter().take(8) {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
                 if upload(&agent, &config, &path).is_err() {
                     failed = true;
                     break;
@@ -387,39 +469,18 @@ fn run(
         }
         if stopping {
             // Drain already accepted events to disk before returning.
-            while let Ok(line) = receiver.try_recv() {
-                sequence += 1;
-                pending.push(event(sequence, &line));
+            let lines: Vec<String> = match receiver.lock() {
+                Ok(receiver) => receiver.try_iter().collect(),
+                Err(_) => Vec::new(),
+            };
+            for line in lines {
+                pending.push(event(&line, level(&line)));
                 if pending.len() >= BATCH_SIZE {
-                    persist(
-                        &directory,
-                        &Batch {
-                            schema: 1,
-                            batch_id: id()?,
-                            installation_id: installation_id.clone(),
-                            launch_id: launch_id.clone(),
-                            platform: std::env::consts::OS.into(),
-                            app_version: env!("CARGO_PKG_VERSION").into(),
-                            build: env!("ETERNAL_BUILD_REVISION").into(),
-                            events: std::mem::take(&mut pending),
-                        },
-                    )?;
+                    persist(&directory, &batch(std::mem::take(&mut pending))?)?;
                 }
             }
             if !pending.is_empty() {
-                persist(
-                    &directory,
-                    &Batch {
-                        schema: 1,
-                        batch_id: id()?,
-                        installation_id,
-                        launch_id,
-                        platform: std::env::consts::OS.into(),
-                        app_version: env!("CARGO_PKG_VERSION").into(),
-                        build: env!("ETERNAL_BUILD_REVISION").into(),
-                        events: pending,
-                    },
-                )?;
+                persist(&directory, &batch(pending)?)?;
             }
             return Ok(());
         }
@@ -432,23 +493,137 @@ mod tests {
     use super::*;
     #[test]
     fn events_keep_their_level_on_every_path() {
-        let warn = event(
-            1,
+        let [warn, error, info] = [
             "2026-10-21T03:10:19.347613Z  WARN Desktop duplication access lost",
-        );
-        let error = event(
-            2,
             "2026-10-21T03:04:31.464409Z ERROR Capture loop exited with error",
-        );
-        let info = event(
-            3,
             "2026-10-21T03:04:31.478265Z  INFO Pipeline ended generation=7",
-        );
+        ]
+        .map(|line| event(line, level(line)));
         assert_eq!(
             [warn.level, error.level, info.level],
             ["warning", "error", "info"]
         );
     }
+    /// Serves each upload after `delay`, acknowledging its batch.
+    fn slow_server(delay: Duration) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                std::thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0; 4096];
+                    let body = loop {
+                        let Ok(count) = stream.read(&mut buffer) else {
+                            return;
+                        };
+                        if count == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&buffer[..count]);
+                        let Some(end) = bytes.windows(4).position(|x| x == b"\r\n\r\n") else {
+                            continue;
+                        };
+                        let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                        let size: usize = headers
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        if bytes.len() >= end + 4 + size {
+                            break bytes[end + 4..end + 4 + size].to_vec();
+                        }
+                    };
+                    std::thread::sleep(delay);
+                    let batch: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let reply =
+                        serde_json::json!({"accepted_batch": batch["batch_id"]}).to_string();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                });
+            }
+        });
+        format!("http://{address}/v1/events")
+    }
+
+    fn outbox_with_batches(count: usize) -> PathBuf {
+        let directory = std::env::temp_dir().join(id().unwrap());
+        fs::create_dir_all(&directory).unwrap();
+        for _ in 0..count {
+            persist(&directory, &batch(vec![event("queued", "info")]).unwrap()).unwrap();
+        }
+        directory
+    }
+
+    fn quit_waits(delay: Duration) -> (Duration, PathBuf) {
+        let directory = outbox_with_batches(8);
+        let config = Config {
+            endpoint: slow_server(delay),
+            ingest_key: "write-only".into(),
+            enabled: true,
+            allow_http: true,
+        };
+        let (sender, uploader) = Uploader::spawn(config, directory.clone());
+        // Let the first request start, then quit as main does.
+        std::thread::sleep(Duration::from_millis(300));
+        sender
+            .send("2026-10-21T17:11:31Z  INFO EternalMonitor shutting down".into())
+            .unwrap();
+        let started = std::time::Instant::now();
+        drop(uploader);
+        (started.elapsed(), directory)
+    }
+
+    fn outbox_messages(directory: &Path) -> Vec<String> {
+        files(directory)
+            .unwrap()
+            .iter()
+            .flat_map(|path| {
+                serde_json::from_slice::<Batch>(&fs::read(path).unwrap())
+                    .unwrap()
+                    .events
+                    .into_iter()
+                    .map(|e| e.message)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn quitting_stops_between_slow_uploads_and_keeps_the_rest() {
+        let (waited, directory) = quit_waits(Duration::from_millis(1500));
+        assert!(
+            waited < Duration::from_millis(2500),
+            "quit waited {waited:?}"
+        );
+        let messages = outbox_messages(&directory);
+        assert!(messages
+            .iter()
+            .any(|m| m.ends_with("EternalMonitor shutting down")));
+        // At most the request in flight was sent; the rest wait for next launch.
+        assert!(messages.iter().filter(|m| *m == "queued").count() >= 7);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn quitting_during_a_stalled_upload_is_bounded_and_keeps_the_last_lines() {
+        let (waited, directory) = quit_waits(Duration::from_secs(30));
+        assert!(
+            waited < SHUTDOWN_WAIT + Duration::from_millis(600),
+            "quit waited {waited:?}"
+        );
+        let messages = outbox_messages(&directory);
+        assert!(messages
+            .iter()
+            .any(|m| m.ends_with("EternalMonitor shutting down")));
+        assert_eq!(messages.iter().filter(|m| *m == "queued").count(), 8);
+        let _ = fs::remove_dir_all(directory);
+    }
+
     #[test]
     fn retains_batch_until_http_200_and_matching_acknowledgement() {
         use std::io::{Read, Write};
