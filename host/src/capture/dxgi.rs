@@ -16,8 +16,8 @@ use super::recovery::{
 };
 use super::{
     client_connected, frame_budget_for, frame_has_image, heartbeat, idle_heartbeat,
-    reconcile_virtual_display, resolve_target, FrameSlot, FrameUse, IdleGate, OutputInfo, RawFrame,
-    ACQUIRE_TIMEOUT_MS, FPS_WINDOW, IDLE_KEEPALIVE,
+    reconcile_virtual_display, recovery_poll, resolve_target, FrameSlot, FrameUse, IdleGate,
+    OutputInfo, RawFrame, ACQUIRE_TIMEOUT_MS, FPS_WINDOW, IDLE_KEEPALIVE,
 };
 use crate::control::SharedControl;
 use crate::stats::PIPELINE_STATS;
@@ -589,8 +589,8 @@ pub fn run_capture_loop(
                         {
                             return Ok(());
                         }
-                        heartbeat(&shared.hb_capture_loop_ms);
-                        if client_connected(&shared) && last_send.elapsed() >= IDLE_KEEPALIVE {
+                        let now_ms = crate::clock::host_now_us() / 1000;
+                        if recovery_poll(&shared, now_ms, last_send.elapsed()) {
                             resend_last_frame(
                                 slot,
                                 &shared,

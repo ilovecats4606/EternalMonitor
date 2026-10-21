@@ -33,7 +33,7 @@ pub(crate) const FPS_WINDOW: usize = 60;
 /// DXGI delivers no new frames. If a client is connected and we haven't sent anything for this
 /// long, resend the last frame so the encoder emits the pending IDR and the iPad gets a sync
 /// sample instead of timing out on a black screen.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 pub(crate) const IDLE_KEEPALIVE: Duration = Duration::from_millis(750);
 
 /// With nobody connected the cached picture is refreshed this often, so a new
@@ -313,6 +313,23 @@ fn startup_heartbeat(shared: &SharedControl, now_ms: u64) {
 #[cfg(any(windows, test))]
 pub(crate) fn idle_heartbeat(shared: &SharedControl, now_ms: u64) {
     startup_heartbeat(shared, now_ms);
+}
+
+/// One poll while waiting to re-create a lost duplication. Returns whether
+/// the viewer's last picture is due to be resent. With nobody watching the
+/// idle heartbeats continue: recovery can take seconds, and a viewer that
+/// arrived between polls was otherwise taken for a wedge ("no captured frame
+/// for 6000ms with a client connected").
+#[cfg(any(windows, test))]
+pub(crate) fn recovery_poll(shared: &SharedControl, now_ms: u64, since_send: Duration) -> bool {
+    if !shared.client_connected() {
+        idle_heartbeat(shared, now_ms);
+        return false;
+    }
+    shared
+        .hb_capture_loop_ms
+        .store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    since_send >= IDLE_KEEPALIVE
 }
 
 #[cfg(windows)]
@@ -691,6 +708,26 @@ mod tests {
         idle.hb_capture_frame_ms
             .store(arrival_ms + 10, Ordering::Relaxed);
         assert_eq!(wedge_reason_at(&idle, &machine, arrival_ms + 10), None);
+    }
+
+    #[test]
+    fn a_viewer_arriving_during_access_lost_recovery_is_not_taken_for_a_wedge() {
+        use crate::supervisor::{wedge_reason_at, Machine};
+        let machine = Machine::new(1);
+        let shared = SharedControl::new(0, 1);
+        let start_ms = 1_000_000;
+        startup_heartbeat(&shared, start_ms);
+        // Six seconds of 50 ms polls between DuplicateOutput retries.
+        let mut now = start_ms;
+        while now < start_ms + 6_000 {
+            now += 50;
+            assert!(!recovery_poll(&shared, now, Duration::from_secs(6)));
+        }
+        // A viewer registers 30 ms after a poll, before the next one.
+        connect_viewer(&shared);
+        assert_eq!(wedge_reason_at(&shared, &machine, now + 30), None);
+        // The next poll resends the last picture to it.
+        assert!(recovery_poll(&shared, now + 50, Duration::from_secs(6)));
     }
 
     #[test]
