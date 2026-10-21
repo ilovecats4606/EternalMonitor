@@ -13,7 +13,8 @@ static WINDOW_SHOWN: AtomicBool = AtomicBool::new(false);
 
 /// Test hook for the failure paths. Set `ETERNAL_SIMULATE_STARTUP_FAILURE` to
 /// `error`, `panic` or `crash` (a native access violation, Windows only) to fail
-/// while the window renderer starts.
+/// while the window renderer starts. A `-quiet` suffix skips the message box,
+/// which automation cannot dismiss.
 pub const SIMULATE_ENV: &str = "ETERNAL_SIMULATE_STARTUP_FAILURE";
 
 /// Called once the window has painted, so later failures read as a stop, not a
@@ -64,7 +65,9 @@ pub fn report(detail: &str) {
     crate::telemetry::queue_now(&format!("{summary}: {detail}"));
     eprintln!("{summary}: {detail}");
     // Automation runs without a desktop to dismiss a dialog.
-    if std::env::var("ETERNAL_HEADLESS").is_ok_and(|v| v.trim() == "1") {
+    if std::env::var("ETERNAL_HEADLESS").is_ok_and(|v| v.trim() == "1")
+        || std::env::var(SIMULATE_ENV).is_ok_and(|v| v.trim().ends_with("-quiet"))
+    {
         return;
     }
     show_message(
@@ -120,11 +123,12 @@ fn panic_detail(info: &std::panic::PanicHookInfo<'_>) -> String {
 
 /// Fail on purpose where the window renderer starts, when [`SIMULATE_ENV`] asks.
 pub(crate) fn simulate_renderer_failure() -> Result<(), String> {
-    match std::env::var(SIMULATE_ENV).as_deref().map(str::trim) {
-        Ok("error") => Err(format!("Simulated renderer failure from {SIMULATE_ENV}")),
-        Ok("panic") => panic!("Simulated renderer panic from {SIMULATE_ENV}"),
+    let requested = std::env::var(SIMULATE_ENV).unwrap_or_default();
+    match requested.trim().trim_end_matches("-quiet") {
+        "error" => Err(format!("Simulated renderer failure from {SIMULATE_ENV}")),
+        "panic" => panic!("Simulated renderer panic from {SIMULATE_ENV}"),
         #[cfg(windows)]
-        Ok("crash") => {
+        "crash" => {
             // An access violation, as a faulting graphics driver raises.
             unsafe {
                 windows::Win32::System::Diagnostics::Debug::RaiseException(0xC000_0005, 0, None)
@@ -139,20 +143,19 @@ pub(crate) fn simulate_renderer_failure() -> Result<(), String> {
 fn show_message(title: &str, body: &str) {
     use windows::core::HSTRING;
     use windows::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+        MessageBoxW, MB_ICONERROR, MB_OK, MB_SERVICE_NOTIFICATION,
     };
-    let (title, body) = (HSTRING::from(title), HSTRING::from(body));
-    // A thread of its own keeps the dialog's message loop away from a window
-    // procedure that is panicking or has crashed.
-    let _ = std::thread::spawn(move || unsafe {
+    // Windows draws a service-notification box itself, as it does its own
+    // error popups. A box owned by this process stopped responding while
+    // the GUI thread was blocked or crashing, so OK did nothing.
+    unsafe {
         MessageBoxW(
             None,
-            &body,
-            &title,
-            MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
+            &HSTRING::from(body),
+            &HSTRING::from(title),
+            MB_OK | MB_ICONERROR | MB_SERVICE_NOTIFICATION,
         );
-    })
-    .join();
+    }
 }
 
 #[cfg(not(windows))]
