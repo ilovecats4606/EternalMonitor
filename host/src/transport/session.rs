@@ -91,6 +91,10 @@ pub trait ConfigSource {
 
 pub struct Session {
     active: Option<ActiveSession>,
+    /// An update is taking over: new clients are turned away (`Busy`) until it
+    /// either closes the host or gives up. Changed only under the session lock,
+    /// together with the check that nobody is streaming.
+    updating: bool,
     /// Injected so tests control randomness; production passes a seeded value
     /// derived from process entropy.
     next_session_id: u32,
@@ -101,6 +105,7 @@ impl Session {
     pub fn new(session_id_seed: u32) -> Self {
         Self {
             active: None,
+            updating: false,
             next_session_id: session_id_seed.max(1),
             legacy_client_warned: false,
         }
@@ -108,6 +113,22 @@ impl Session {
 
     pub fn is_active(&self) -> bool {
         self.active.is_some()
+    }
+
+    /// Starts an update handoff if nobody is streaming. Atomic with admission:
+    /// call with the session lock held; a client either got in before (and
+    /// this returns `false`) or is refused until [`Self::end_update`].
+    pub fn begin_update(&mut self) -> bool {
+        if self.active.is_some() {
+            return false;
+        }
+        self.updating = true;
+        true
+    }
+
+    /// The update handoff failed; clients may connect again.
+    pub fn end_update(&mut self) {
+        self.updating = false;
     }
 
     pub fn session_id(&self) -> Option<u32> {
@@ -287,6 +308,15 @@ impl Session {
                 0,
                 config,
             );
+            actions.replies.push((source, ack));
+            return actions;
+        }
+
+        // An update is about to close the host: don't start a stream it would cut.
+        // The iPad shows Busy ("already streaming"); a retry after the restart works.
+        if self.updating {
+            info!(peer = %source, "Client turned away while an update starts");
+            let ack = self.make_ack(HelloStatus::Busy, hello.client_nonce, 0, config);
             actions.replies.push((source, ack));
             return actions;
         }
@@ -1025,6 +1055,30 @@ mod tests {
         assert_eq!(ack.session_id, 0);
         assert!(actions.new_target.is_none());
         assert_eq!(session.peer(), Some(addr([10, 0, 0, 5], 50000)));
+    }
+
+    #[test]
+    fn an_update_handoff_is_atomic_with_admitting_clients() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+
+        // Nobody streaming: the handoff starts and new clients are turned away.
+        let mut session = Session::new(1);
+        assert!(session.begin_update());
+        let refused = session.handle_control(peer, 0, hello(1, 50000), &TestConfig, now);
+        assert_eq!(parse_ack(&refused.replies[0].1).status, HelloStatus::Busy);
+        assert!(refused.new_target.is_none());
+        assert!(!session.is_active(), "no stream for the update to cut");
+
+        // The handoff failed: the same client is admitted again.
+        session.end_update();
+        let admitted = session.handle_control(peer, 0, hello(2, 50000), &TestConfig, now);
+        assert_eq!(admitted.new_target, Some(peer));
+
+        // A client that got in first wins: the handoff does not start.
+        assert!(!session.begin_update());
+        let still = session.handle_control(peer, 0, hello(2, 50000), &TestConfig, now);
+        assert_eq!(parse_ack(&still.replies[0].1).status, HelloStatus::Ok);
     }
 
     #[test]
