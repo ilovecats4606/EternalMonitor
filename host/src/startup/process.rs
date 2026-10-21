@@ -41,21 +41,31 @@ impl fmt::Display for ProcessId {
 /// The start time of a running process, or `None` once it has exited.
 #[cfg(windows)]
 pub(crate) fn start_time(pid: u32) -> Option<u64> {
-    use windows::Win32::Foundation::{CloseHandle, FILETIME, STILL_ACTIVE};
-    use windows::Win32::System::Threading::{
-        GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let mut code = 0u32;
-        let mut times = [FILETIME::default(); 4];
-        let [created, exited, kernel, user] = &mut times;
-        let alive = GetExitCodeProcess(process, &mut code).is_ok()
-            && code == STILL_ACTIVE.0 as u32
-            && GetProcessTimes(process, created, exited, kernel, user).is_ok();
+        let start = start_time_of(process);
         let _ = CloseHandle(process);
-        alive.then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+        start
     }
+}
+
+/// [`start_time`] of a process handle opened with at least
+/// `PROCESS_QUERY_LIMITED_INFORMATION`.
+#[cfg(windows)]
+pub(crate) fn start_time_of(process: windows::Win32::Foundation::HANDLE) -> Option<u64> {
+    use windows::Win32::Foundation::{FILETIME, STILL_ACTIVE};
+    use windows::Win32::System::Threading::{GetExitCodeProcess, GetProcessTimes};
+    let mut code = 0u32;
+    let mut times = [FILETIME::default(); 4];
+    let [created, exited, kernel, user] = &mut times;
+    let alive = unsafe {
+        GetExitCodeProcess(process, &mut code).is_ok()
+            && code == STILL_ACTIVE.0 as u32
+            && GetProcessTimes(process, created, exited, kernel, user).is_ok()
+    };
+    alive.then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
 }
 
 #[cfg(unix)]

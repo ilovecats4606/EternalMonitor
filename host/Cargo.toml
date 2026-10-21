@@ -62,6 +62,7 @@ features = [
     "Win32_System_Threading",
     "Win32_System_Performance",
     "Win32_System_ProcessStatus",
+    "Win32_Storage_FileSystem",
     "Win32_Devices_FunctionDiscovery",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_Graphics_Dxgi",
