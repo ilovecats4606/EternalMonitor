@@ -21,7 +21,7 @@ enum UIPreview {
         case "connecting":
             manager.state = .connecting
         case "error":
-            manager.connectionError = "No response from 192.168.1.20:9876. Check that EternalMonitor is running on the PC and that both devices are on the same network."
+            manager.problem = .noReply(usb: false)
         case "pairing":
             manager.pairingPrompt = PairingSheetModel()
         case "recent":

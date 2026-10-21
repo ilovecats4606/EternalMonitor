@@ -72,6 +72,9 @@ final class ConnectionManager: ObservableObject {
     @Published var fps: Double = 0
     @Published var transportMode: String = "WiFi"
     @Published var connectionError: String?
+    /// A connection problem in plain words, with its next action. Shown in
+    /// place of `connectionError` when set.
+    @Published var problem: ConnectionProblem?
     @Published var pairingPrompt: PairingSheetModel?
     private var awaitingPairing = false
     private var explicitPairingToken: Data?
@@ -144,7 +147,7 @@ final class ConnectionManager: ObservableObject {
             usbListener?.stop()
             usbListener = nil
             usbStatus = allowed ? "USB: disconnected" : "USB: off"
-            if !allowed, mediaLink?.isUSB == true { beginReconnect(reason: "USB connections turned off") }
+            if !allowed, mediaLink?.isUSB == true { beginReconnect(.usbTurnedOff) }
             return
         }
         guard usbListener == nil else { return }
@@ -265,6 +268,7 @@ final class ConnectionManager: ObservableObject {
 
         state = .connecting
         connectionError = nil
+        problem = nil
         signalLost = false
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
@@ -498,7 +502,7 @@ final class ConnectionManager: ObservableObject {
         channel.onBye = { [weak self] reason in
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
-                self.connectionError = "Your PC ended the session."
+                self.problem = .pcEndedSession
                 self.record(.info, "ctrl", "Host BYE (\(reason))")
                 self.disconnect()
             }
@@ -570,7 +574,7 @@ final class ConnectionManager: ObservableObject {
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 self.record(.error, isUSB ? "usb" : "udp", "state=\(self.state) \(message)")
                 guard self.state == .connecting else { return }
-                self.connectionError = message
+                self.problem = .receiverError(message, host: normalizedHost)
                 if !isUSB { self.disconnect() }
             }
         }
@@ -579,7 +583,7 @@ final class ConnectionManager: ObservableObject {
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 if isUSB { self.usbStatus = "USB: waiting for a cable" }
-                self.beginReconnect(reason: "USB disconnected")
+                self.beginReconnect(.cableUnplugged)
             }
         }
 
@@ -704,7 +708,7 @@ final class ConnectionManager: ObservableObject {
                       ControlChannel.clientNowUs() &- since > 5_000_000 {
                 // 5s of degraded: give up on this session and (optionally)
                 // start the reconnect cycle.
-                beginReconnect(reason: "host stopped responding")
+                beginReconnect(.pcStoppedResponding)
             }
         } else if signalLost {
             signalLost = false
@@ -713,13 +717,20 @@ final class ConnectionManager: ObservableObject {
         }
     }
 
-    private func beginReconnect(reason: String) {
+    private func beginReconnect(_ reason: ConnectionProblem.LostReason) {
         let target = lastTarget
         let auto = UserDefaults.standard.flag(forKey: "autoReconnect")
-        record(.warning, "ctrl", "Connection lost (\(reason))")
+        // Support logs keep the original wording so reports stay comparable.
+        let logged: String
+        switch reason {
+        case .pcStoppedResponding: logged = "host stopped responding"
+        case .cableUnplugged: logged = "USB disconnected"
+        case .usbTurnedOff: logged = "USB connections turned off"
+        }
+        record(.warning, "ctrl", "Connection lost (\(logged))")
         disconnect()
         guard auto, let target else {
-            connectionError = "Connection lost — \(reason)."
+            problem = .lost(reason)
             return
         }
         startReconnectCycle(to: target)
@@ -731,7 +742,7 @@ final class ConnectionManager: ObservableObject {
             for attempt in 1...6 {
                 guard let self, !Task.isCancelled else { return }
                 self.reconnectAttempt = attempt
-                self.connectionError = "Connection lost — reconnecting (attempt \(attempt)/6)…"
+                self.problem = .reconnecting(attempt: attempt, of: 6)
                 let backoff = min(1 << (attempt - 1), 15)
                 try? await Task.sleep(for: .seconds(Double(backoff)))
                 guard !Task.isCancelled, self.state == .disconnected else { return }
@@ -741,13 +752,13 @@ final class ConnectionManager: ObservableObject {
                 guard !Task.isCancelled else { return }
                 if self.state == .connected {
                     self.reconnectAttempt = 0
-                    self.connectionError = nil
+                    self.problem = nil
                     return
                 }
             }
             guard let self, !Task.isCancelled else { return }
             self.reconnectAttempt = 0
-            self.connectionError = "Couldn't reach your PC after 6 tries. Check that EternalMonitor is running on it."
+            self.problem = .reconnectFailed
         }
     }
 
@@ -760,7 +771,11 @@ final class ConnectionManager: ObservableObject {
             if !Task.isCancelled && self.state == .connecting {
                 let summary = self.debugState.timeoutSummary
                 self.record(.error, "timeout", summary)
-                self.connectionError = "No picture arrived from your PC. \(summary)"
+                let debug = self.debugState
+                self.problem = .timeout(
+                    listenerReady: debug.listenerReadyPort != nil, helloAttempts: debug.helloAttempts,
+                    handshakeDone: self.hostInfo != nil, datagramsReceived: debug.datagramsReceived,
+                    isUSB: self.transportMode == "USB")
                 self.disconnect()
             }
         }
@@ -777,6 +792,29 @@ final class ConnectionManager: ObservableObject {
         reconnectTask?.cancel()
         reconnectAttempt = 0
         disconnect()
+    }
+
+    /// Try the last connection again: the cable when that is what failed,
+    /// otherwise the last PC address.
+    func retry() {
+        guard state == .disconnected else { return }
+        problem = nil
+        connectionError = nil
+        if transportMode == "USB" {
+            resumeUSBConnections()
+        } else if let target = lastTarget {
+            connect(host: target.host, port: target.port)
+        }
+    }
+
+    /// Settings negotiated at connect (Drawing mode, Control PC) apply after
+    /// a new handshake. USB's listener accepts the retry on its own.
+    func reconnectToApply() {
+        guard state == .connected else { return }
+        let isUSB = mediaLink?.isUSB == true
+        let target = lastTarget
+        disconnect()
+        if !isUSB, let target { connect(host: target.host, port: target.port) }
     }
 
     func refreshAudioPreference(_ enabled: Bool) {

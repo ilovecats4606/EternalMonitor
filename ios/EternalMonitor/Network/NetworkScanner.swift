@@ -14,6 +14,8 @@ final class NetworkScanner: NSObject, ObservableObject {
     @Published var hosts: [DiscoveredHost] = []
     @Published var isScanning = false
     @Published var statusMessage: String = ""
+    /// Bonjour refused to search, usually because Local Network access is off.
+    @Published var searchBlocked = false
 
     private let browser = NetServiceBrowser()
     private var resolvingServices: [String: NetService] = [:]
@@ -34,9 +36,10 @@ final class NetworkScanner: NSObject, ObservableObject {
 
     private func beginScan() {
         isScanning = true
+        searchBlocked = false
         hosts = []
         resolvingServices.removeAll()
-        statusMessage = "Scanning network..."
+        statusMessage = "Looking for PCs…"
 
         browser.searchForServices(ofType: "_eternaldisplay._udp.", inDomain: "local.")
 
@@ -66,7 +69,7 @@ final class NetworkScanner: NSObject, ObservableObject {
                 // auto-retry once after 2s. Bonjour browse occasionally
                 // misses the first multicast burst.
                 didAutoRetry = true
-                statusMessage = "No hosts found yet — retrying..."
+                statusMessage = "Still looking…"
                 Task { @MainActor in
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
                     if self.hosts.isEmpty && !self.isScanning {
@@ -74,10 +77,10 @@ final class NetworkScanner: NSObject, ObservableObject {
                     }
                 }
             } else {
-                statusMessage = "No hosts found. Make sure the Windows host is running on the same network."
+                statusMessage = "No PCs found."
             }
         } else {
-            statusMessage = "Found \(hosts.count) host\(hosts.count == 1 ? "" : "s")"
+            statusMessage = "Found \(hosts.count) PC\(hosts.count == 1 ? "" : "s")"
         }
     }
 }
@@ -97,7 +100,7 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
             service.resolve(withTimeout: 4)
 
             if !moreComing {
-                statusMessage = "Resolving hosts..."
+                statusMessage = "Found a PC…"
             }
         }
     }
@@ -114,8 +117,8 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
 
             if !moreComing {
                 statusMessage = hosts.isEmpty
-                    ? "No hosts found. Make sure the Windows host is running on the same network."
-                    : "Found \(hosts.count) host\(hosts.count == 1 ? "" : "s")"
+                    ? "No PCs found."
+                    : "Found \(hosts.count) PC\(hosts.count == 1 ? "" : "s")"
             }
         }
     }
@@ -125,8 +128,9 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
         didNotSearch errorDict: [String: NSNumber]
     ) {
         Task { @MainActor in
-            statusMessage = "Scan failed. Local network permission may be blocked."
+            statusMessage = "Can't search: Local Network access is off."
             stopScan()
+            searchBlocked = true
         }
     }
 
@@ -145,7 +149,7 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
             // getifaddrs() for every comparison, a syscall storm on the MainActor.
             let subnet = Self.primaryIPv4Subnet()
             hosts.sort { Self.hostQualityCompare($0, $1, ourSubnet: subnet) }
-            statusMessage = "Found \(hosts.count) host\(hosts.count == 1 ? "" : "s")"
+            statusMessage = "Found \(hosts.count) PC\(hosts.count == 1 ? "" : "s")"
         }
     }
 
@@ -208,7 +212,7 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
         Task { @MainActor in
             resolvingServices.removeValue(forKey: Self.serviceKey(sender))
             if hosts.isEmpty {
-                statusMessage = "Resolving hosts..."
+                statusMessage = "Found a PC…"
             }
         }
     }

@@ -24,7 +24,7 @@ final class USBStreamTests: XCTestCase {
         app.buttons["display.disconnect"].tap()
         XCTAssertTrue(app.textFields["connect.host"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["connect.usb"].exists)
-        XCTAssertTrue(app.staticTexts["connect.usbStatus"].label.contains("disconnected"))
+        XCTAssertTrue(app.staticTexts["connect.usbStatus"].label.contains("Paused"))
         capture("usb-disconnected", app: app)
     }
 
