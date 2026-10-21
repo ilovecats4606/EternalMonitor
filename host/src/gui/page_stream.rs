@@ -101,34 +101,6 @@ impl AnalyzerApp {
             ui.add_space(GAP - 10.0);
         }
         self.restart_notice(ui);
-        if self.settings_check_updates && !self.update_dismissed {
-            let update = self.available_update.lock().clone();
-            if let Some(version) = update {
-                let mut dismiss = false;
-                widgets::banner(
-                    ui,
-                    ACCENT,
-                    Icon::Download,
-                    &format!("EternalMonitor v{version} is available"),
-                    "Update the PC and the iPad app together. Both need the same version.",
-                    210.0,
-                    |ui| {
-                        dismiss = widgets::button(ui, Tone::Ghost, None, "Dismiss").clicked();
-                        widgets::link(
-                            ui,
-                            "View release",
-                            &format!(
-                                "https://github.com/sidebandstudio/EternalMonitor/releases/tag/v{version}"
-                            ),
-                        );
-                    },
-                );
-                if dismiss {
-                    self.update_dismissed = true;
-                }
-                ui.add_space(GAP - 10.0);
-            }
-        }
     }
 
     pub(super) fn restart_notice(&mut self, ui: &mut Ui) {

@@ -14,6 +14,8 @@ mod page_performance;
 mod page_settings;
 mod page_stream;
 mod theme;
+mod update_banner;
+mod update_toast;
 mod widgets;
 
 use std::collections::VecDeque;
@@ -263,8 +265,7 @@ pub struct AnalyzerApp {
     settings_fps_target: u32,
     settings_encoder_input: crate::encoder::input::EncoderInput,
     settings_check_updates: bool,
-    available_update: crate::updates::AvailableUpdate,
-    update_dismissed: bool,
+    updates: crate::updates::Updater,
     settings_packet_size: u32,
     /// Last settings error worth showing (the autostart registry write or a
     /// pairing reset).
@@ -378,16 +379,23 @@ impl AnalyzerApp {
             }
         }
 
-        let available_update = std::sync::Arc::new(parking_lot::Mutex::new(None));
-        if persisted.check_for_updates {
-            crate::updates::start(available_update.clone());
-        }
+        let updates = {
+            let ctx = cc.egui_ctx.clone();
+            crate::updates::Updater::start(
+                persisted.check_for_updates,
+                std::sync::Arc::new(move |version: Option<&str>| {
+                    if let Some(version) = version {
+                        update_toast::show(&ctx, version);
+                    }
+                    ctx.request_repaint();
+                }),
+            )
+        };
         let encoder_input = *control.shared.encoder_input.lock();
         Self {
             settings_encoder_input: encoder_input,
             settings_check_updates: persisted.check_for_updates,
-            available_update,
-            update_dismissed: false,
+            updates,
             settings_packet_size: control.shared.max_dgram.load(Ordering::SeqCst),
             control,
             page: Page::Stream,
@@ -583,9 +591,7 @@ impl AnalyzerApp {
 
     fn set_check_updates(&mut self, enabled: bool) {
         self.settings_check_updates = enabled;
-        if enabled {
-            crate::updates::start(self.available_update.clone());
-        }
+        self.updates.set_auto(enabled);
         self.persist_settings();
     }
 
@@ -627,6 +633,7 @@ impl AnalyzerApp {
 
 impl eframe::App for AnalyzerApp {
     fn on_exit(&mut self) {
+        update_toast::hide();
         if self.settings_dirty_at.take().is_some() {
             self.persist_settings();
         }
@@ -682,6 +689,7 @@ impl eframe::App for AnalyzerApp {
                                 ui.set_opacity(shown);
                                 ui.set_max_width(ui.available_width().min(980.0));
                                 ui.spacing_mut().item_spacing.y = 10.0;
+                                self.update_banner(ui, &snap, &client);
                                 match self.page {
                                     Page::Stream => self.stream_page(ui, &snap, &client),
                                     Page::Performance => self.performance_page(ui, &snap),

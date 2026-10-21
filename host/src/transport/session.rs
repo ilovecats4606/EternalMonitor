@@ -280,6 +280,7 @@ impl Session {
 
         // Version gate first.
         if hello.proto_min > 2 || hello.proto_max < 2 {
+            crate::updates::note_ipad_protocol(hello.proto_min, hello.proto_max);
             let ack = self.make_ack(
                 HelloStatus::VersionUnsupported,
                 hello.client_nonce,
@@ -585,6 +586,7 @@ impl Session {
     /// A legacy (v0.1.x) ETERNALHELLO arrived: no wire reply — the old app
     /// can't parse anything we'd send — but tell the user what happened.
     pub fn note_legacy_hello(&mut self, source: PeerId) {
+        crate::updates::note_legacy_ipad();
         if !self.legacy_client_warned {
             self.legacy_client_warned = true;
             warn!(

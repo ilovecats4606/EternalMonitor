@@ -1185,6 +1185,7 @@ dependencies = [
  "plist",
  "qrcode",
  "regex",
+ "ring",
  "semver",
  "serde",
  "serde_json",
