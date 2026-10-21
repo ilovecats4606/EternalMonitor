@@ -7,7 +7,8 @@
 //! - on Stream, the "Pairing", "USB connection" and "PC audio" rows, and a
 //!   "Connected iPad" card that lists "Decode rate" and "Repaired fragments"
 //!   (or "Waiting for an iPad" when nobody is connected);
-//! - on Settings, the "Encoder input" row.
+//! - on Settings, the "Encoder input" row;
+//! - at the top of Stream, the "Mirror my screen" and "Second screen" choice.
 
 mod icons;
 mod page_performance;
@@ -51,7 +52,6 @@ struct StatsSnapshot {
     capture_frame_count: u64,
     capture_resolution: (u32, u32),
     encode_fps: f64,
-    encode_time_us: u128,
     encode_frame_count: u64,
     nal_bytes_last: usize,
     bitrate_bps: u32,
@@ -89,7 +89,6 @@ impl StatsSnapshot {
             capture_frame_count: s.capture_frame_count,
             capture_resolution: s.capture_resolution,
             encode_fps: s.encode_fps,
-            encode_time_us: s.encode_time_us,
             encode_frame_count: s.encode_frame_count,
             nal_bytes_last: s.nal_bytes_last,
             bitrate_bps: s.bitrate_bps,
@@ -183,8 +182,9 @@ impl StreamState {
     }
 }
 
-const CAPTURE_AUTO_LABEL: &str = "Main display (mirror)";
-const CAPTURE_VIRTUAL_LABEL: &str = "Extended display (iPad)";
+// The same two names appear on the iPad, in SETUP.md and on the website.
+const CAPTURE_AUTO_LABEL: &str = "Mirror my screen";
+const CAPTURE_VIRTUAL_LABEL: &str = "Second screen";
 // The settings sentinel for the managed virtual display lives in control.rs
 // (shared with the startup preload).
 use crate::control::CAPTURE_VIRTUAL_SENTINEL;
@@ -530,6 +530,30 @@ impl AnalyzerApp {
         );
         self.persist_settings();
         self.restart_pending = true;
+    }
+
+    /// The Stream page's mirror / second screen choice. It applies straight
+    /// away: a running stream restarts and the iPad reconnects by itself.
+    fn set_second_screen(&mut self, second: bool, running: bool) {
+        let display = if second {
+            CAPTURE_VIRTUAL_SENTINEL.to_string()
+        } else {
+            String::new()
+        };
+        if self.settings_capture_display == display {
+            return;
+        }
+        self.set_capture_display(display);
+        if running {
+            self.restart_stream();
+        }
+    }
+
+    /// Back to the recommended encoder choices, for the CPU fallback notice.
+    fn reset_video_settings(&mut self) {
+        self.set_encoder_choice(ENCODER_AUTO_LABEL);
+        self.set_encoder_input(crate::encoder::input::EncoderInput::default());
+        self.restart_stream();
     }
 
     fn refresh_outputs(&mut self) {
@@ -982,7 +1006,7 @@ impl AnalyzerApp {
                     );
                     ui.add(
                         egui::Label::new(muted(
-                            "On your iPad, open EternalMonitor, tap Scan QR and point it at this code.",
+                            "On your iPad, open EternalMonitor, tap Scan QR code and point the camera at this code.",
                         ))
                         .wrap(),
                     );
@@ -1091,6 +1115,42 @@ fn friendly_codec(name: &str) -> String {
         return name.to_string();
     };
     format!("{codec} · {engine}")
+}
+
+/// One word for how well the stream is getting through, from the iPad's
+/// last report: lost fragments and round-trip time.
+fn connection_quality(report: Option<&ReceiverReport>) -> &'static str {
+    let Some(r) = report else {
+        return "Measuring";
+    };
+    let total = f64::from(r.frags_received) + f64::from(r.frags_repaired) + f64::from(r.frags_lost);
+    if total == 0.0 {
+        return "Measuring";
+    }
+    let loss = 100.0 * f64::from(r.frags_lost) / total;
+    let rtt_ms = f64::from(r.rtt_ms_x10) / 10.0;
+    if loss < 0.5 && rtt_ms < 20.0 {
+        "Excellent"
+    } else if loss < 2.0 && rtt_ms < 50.0 {
+        "Good"
+    } else if loss < 6.0 && rtt_ms < 120.0 {
+        "Fair"
+    } else {
+        "Poor"
+    }
+}
+
+/// Opens Windows Settings at Display, where the screens are arranged.
+fn open_display_settings() {
+    #[cfg(windows)]
+    {
+        if let Err(error) = std::process::Command::new("explorer.exe")
+            .arg("ms-settings:display")
+            .spawn()
+        {
+            warn!(error = %error, "Could not open Windows display settings");
+        }
+    }
 }
 
 fn value_or_unknown(value: &str) -> &str {

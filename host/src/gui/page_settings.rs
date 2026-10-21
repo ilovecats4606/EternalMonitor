@@ -20,8 +20,8 @@ impl AnalyzerApp {
             let mut refresh = false;
             widgets::setting_row(
                 ui,
-                "Display to stream",
-                "Mirror a monitor, or extend Windows onto the iPad with a virtual display that exists only while streaming.",
+                "How the iPad shows your PC",
+                "Mirror my screen shows your main screen. Second screen adds the iPad as an extra screen while it is connected. You can also mirror one particular monitor.",
                 300.0,
                 |ui| {
                     refresh = widgets::icon_button(ui, super::icons::Icon::Refresh, "Refresh displays").clicked();
@@ -38,70 +38,30 @@ impl AnalyzerApp {
                 ui,
                 "Match the iPad's resolution",
                 if extending {
-                    "Sizes the extended display to the iPad's screen and refresh rate."
+                    "Makes the second screen exactly as sharp and smooth as the iPad's display."
                 } else {
-                    "Used when extending. Sizes the virtual display to the iPad's screen."
+                    "Used by Second screen. Makes it exactly as sharp and smooth as the iPad's display."
                 },
                 64.0,
                 |ui| {
-                    widgets::toggle(ui, &mut vdd_match, "Match extended display to the iPad's resolution");
+                    widgets::toggle(ui, &mut vdd_match, "Match the second screen to the iPad's resolution");
                 },
             );
             if vdd_match != self.settings_vdd_match {
                 self.set_vdd_match(vdd_match);
             }
-        });
-        ui.add_space(GAP - 6.0);
-
-        // ── Video quality ───────────────────────────────────────────────────
-        widgets::section_label(ui, "Video quality");
-        widgets::list_card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
+            widgets::divider(ui);
             let mut fps = self.settings_fps_target;
             widgets::setting_row(
                 ui,
                 "Frame rate",
-                "The iPad can ask for less. Higher rates feel smoother and use more bandwidth.",
+                "Pictures per second. Higher feels smoother but needs a faster network. The iPad can ask for less.",
                 230.0,
                 |ui| {
                     widgets::segmented(ui, &mut fps, &[(30, "30"), (60, "60"), (90, "90"), (120, "120")]);
                 },
             );
             self.set_fps(fps);
-            widgets::divider(ui);
-
-            let mut bitrate = self.settings_bitrate_mbps;
-            widgets::setting_row(
-                ui,
-                "Maximum bitrate",
-                "The stream adapts below this ceiling when the network is busy.",
-                290.0,
-                |ui| {
-                    ui.add_sized(
-                        vec2(64.0, 24.0),
-                        egui::Label::new(mono(format!("{bitrate:.0} Mbps"), 13.0)),
-                    );
-                    widgets::slider(ui, &mut bitrate, 4.0..=50.0, 1.0, 210.0, "Maximum bitrate");
-                },
-            );
-            if bitrate != self.settings_bitrate_mbps {
-                self.set_bitrate_mbps(bitrate);
-            }
-            widgets::divider(ui);
-
-            let mut hevc = self.settings_hevc_enabled;
-            widgets::setting_row(
-                ui,
-                "Prefer HEVC (H.265)",
-                "Experimental. Sharper at the same bitrate when the iPad supports it. Falls back to H.264 on GPUs without an HEVC encoder.",
-                64.0,
-                |ui| {
-                    widgets::toggle(ui, &mut hevc, "Prefer HEVC (H.265) when the iPad supports it");
-                },
-            );
-            if hevc != self.settings_hevc_enabled {
-                self.set_hevc(hevc);
-            }
         });
         ui.add_space(GAP - 6.0);
 
@@ -130,87 +90,6 @@ impl AnalyzerApp {
         });
         ui.add_space(GAP - 6.0);
 
-        // ── Network ─────────────────────────────────────────────────────────
-        widgets::section_label(ui, "Network");
-        widgets::list_card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            let mut packet = self.settings_packet_size;
-            widgets::setting_row(
-                ui,
-                "Packet size",
-                "Use 1200 when connecting over Tailscale or another VPN. 1400 suits most home networks.",
-                150.0,
-                |ui| {
-                    ui.add(
-                        egui::DragValue::new(&mut packet)
-                            .range(576..=1400)
-                            .speed(4.0)
-                            .suffix(" bytes"),
-                    );
-                },
-            );
-            if packet != self.settings_packet_size {
-                self.set_packet_size(packet);
-            }
-        });
-        ui.add_space(GAP - 6.0);
-
-        // ── Encoder ─────────────────────────────────────────────────────────
-        widgets::section_label(ui, "Encoder");
-        widgets::list_card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            let detected = super::friendly_codec(&snap.codec_name);
-            let mut choice = self.settings_encoder_choice.clone();
-            widgets::setting_row(
-                ui,
-                "Encoder",
-                &format!("Auto picks the best hardware encoder. In use now: {detected}."),
-                200.0,
-                |ui| {
-                    widgets::combo("encoder-override", &choice_label(&choice), 190.0).show_ui(
-                        ui,
-                        |ui| {
-                            for (label, _) in ENCODER_CHOICES {
-                                if ui
-                                    .selectable_label(choice == *label, choice_label(label))
-                                    .clicked()
-                                {
-                                    choice = (*label).to_string();
-                                }
-                            }
-                        },
-                    );
-                },
-            );
-            if choice != self.settings_encoder_choice {
-                self.set_encoder_choice(&choice);
-            }
-            widgets::divider(ui);
-
-            let mut input = self.settings_encoder_input;
-            widgets::setting_row(
-                ui,
-                "Encoder input",
-                "Pixel format handed to the encoder. Applies after the stream restarts.",
-                230.0,
-                |ui| {
-                    widgets::segmented(
-                        ui,
-                        &mut input,
-                        &[
-                            (EncoderInput::Auto, "Auto"),
-                            (EncoderInput::Bgra, "BGRA"),
-                            (EncoderInput::Yuv420, "YUV420"),
-                        ],
-                    );
-                },
-            );
-            if input != self.settings_encoder_input {
-                self.set_encoder_input(input);
-            }
-        });
-        ui.add_space(GAP - 6.0);
-
         // ── Security ────────────────────────────────────────────────────────
         widgets::section_label(ui, "Security");
         widgets::list_card().show(ui, |ui| {
@@ -220,7 +99,7 @@ impl AnalyzerApp {
             widgets::setting_row(
                 ui,
                 "Require pairing",
-                "New iPads on Wi-Fi must enter the code shown on the Stream page. USB needs no code.",
+                "New iPads on Wi-Fi type the pairing code shown on the Stream page once. USB needs no code.",
                 64.0,
                 |ui| {
                     widgets::toggle(ui, &mut require, "Require pairing");
@@ -292,6 +171,117 @@ impl AnalyzerApp {
             widgets::setting_row(ui, "Automatically share diagnostics", "Sends device details, errors and stream statistics to EternalMonitor support. Includes PC names and network addresses. Screen content, audio and pairing credentials are excluded.", 64.0, |ui| { widgets::toggle(ui, &mut upload, "Automatically share diagnostics"); });
             if upload != crate::telemetry::enabled() { crate::telemetry::set_enabled(upload); }
             ui.label(muted(crate::telemetry::status()));
+        });
+        ui.add_space(GAP - 6.0);
+
+        // ── Advanced ────────────────────────────────────────────────────────
+        // Troubleshooting options. The defaults suit almost every PC.
+        widgets::section_label(ui, "Advanced");
+        ui.label(muted("Most people never need these. Change them only if the picture looks wrong or a support guide asks you to."));
+        ui.add_space(4.0);
+        widgets::list_card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let mut bitrate = self.settings_bitrate_mbps;
+            widgets::setting_row(
+                ui,
+                "Video quality limit",
+                "Higher is sharper but needs a stronger network. The stream lowers it by itself when the network is busy.",
+                290.0,
+                |ui| {
+                    ui.add_sized(
+                        vec2(64.0, 24.0),
+                        egui::Label::new(mono(format!("{bitrate:.0} Mbps"), 13.0)),
+                    );
+                    widgets::slider(ui, &mut bitrate, 4.0..=50.0, 1.0, 210.0, "Maximum bitrate");
+                },
+            );
+            if bitrate != self.settings_bitrate_mbps {
+                self.set_bitrate_mbps(bitrate);
+            }
+            widgets::divider(ui);
+
+            let mut hevc = self.settings_hevc_enabled;
+            widgets::setting_row(
+                ui,
+                "Sharper video format (HEVC)",
+                "Experimental. Sharper at the same quality limit on iPads and graphics cards that support it; others keep the standard format.",
+                64.0,
+                |ui| {
+                    widgets::toggle(ui, &mut hevc, "Prefer HEVC (H.265) when the iPad supports it");
+                },
+            );
+            if hevc != self.settings_hevc_enabled {
+                self.set_hevc(hevc);
+            }
+            widgets::divider(ui);
+            let mut packet = self.settings_packet_size;
+            widgets::setting_row(
+                ui,
+                "Packet size",
+                "Leave at 1400 on a home network. Use 1200 only when connecting through a VPN such as Tailscale.",
+                150.0,
+                |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut packet)
+                            .range(576..=1400)
+                            .speed(4.0)
+                            .suffix(" bytes"),
+                    );
+                },
+            );
+            if packet != self.settings_packet_size {
+                self.set_packet_size(packet);
+            }
+            widgets::divider(ui);
+            let detected = super::friendly_codec(&snap.codec_name);
+            let mut choice = self.settings_encoder_choice.clone();
+            widgets::setting_row(
+                ui,
+                "Video encoder",
+                &format!("Automatic uses your graphics card when it can. Change this only if the picture is missing or broken. In use now: {detected}."),
+                200.0,
+                |ui| {
+                    widgets::combo("encoder-override", &choice_label(&choice), 190.0).show_ui(
+                        ui,
+                        |ui| {
+                            for (label, _) in ENCODER_CHOICES {
+                                if ui
+                                    .selectable_label(choice == *label, choice_label(label))
+                                    .clicked()
+                                {
+                                    choice = (*label).to_string();
+                                }
+                            }
+                        },
+                    );
+                },
+            );
+            if choice != self.settings_encoder_choice {
+                self.set_encoder_choice(&choice);
+            }
+            widgets::divider(ui);
+
+            let mut input = self.settings_encoder_input;
+            widgets::setting_row(
+                ui,
+                "Encoder input",
+                "YUV420, the default, suits most PCs. Try another option only if the picture has wrong colours or never appears. Applies after a restart.",
+                230.0,
+                |ui| {
+                    widgets::segmented(
+                        ui,
+                        &mut input,
+                        &[
+                            (EncoderInput::Auto, "Auto"),
+                            (EncoderInput::Bgra, "BGRA"),
+                            (EncoderInput::Yuv420, "YUV420"),
+                        ],
+                    );
+                },
+            );
+            if input != self.settings_encoder_input {
+                self.set_encoder_input(input);
+            }
         });
         ui.add_space(GAP - 6.0);
 

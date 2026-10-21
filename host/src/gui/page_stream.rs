@@ -6,8 +6,9 @@ use super::icons::Icon;
 use super::theme::*;
 use super::widgets::{self, Tone, GAP};
 use super::{
-    friendly_codec, value_or_unknown, AnalyzerApp, ClientSnapshot, Copied, StatsSnapshot,
+    connection_quality, value_or_unknown, AnalyzerApp, ClientSnapshot, Copied, StatsSnapshot,
     StreamState, CAPTURE_AUTO_LABEL, CAPTURE_VIRTUAL_LABEL, CAPTURE_VIRTUAL_SENTINEL,
+    ENCODER_AUTO_LABEL,
 };
 use crate::control::VddStatus;
 
@@ -60,39 +61,75 @@ impl AnalyzerApp {
             ui.add_space(GAP - 10.0);
         }
         if snap.using_software_fallback {
+            // Choices made while troubleshooting are the usual reason a
+            // working graphics card is skipped, so offer to undo them first.
+            let customized = self.settings_encoder_choice != ENCODER_AUTO_LABEL
+                || self.settings_encoder_input != crate::encoder::input::EncoderInput::default();
+            let mut reset = false;
+            let mut restart = false;
             widgets::banner(
                 ui,
                 WARNING,
                 Icon::Warning,
-                "Hardware encoder unavailable. Encoding on the CPU (libx264).",
-                "Expect higher latency and heavy CPU load. Update your NVIDIA, AMD or Intel graphics driver, then restart the stream.",
-                0.0,
-                |_| {},
+                SOFTWARE_FALLBACK_TITLE,
+                if customized {
+                    "The graphics card could not encode video with the options chosen in Settings, so the picture may lag and the PC may run hot. Go back to the recommended options first."
+                } else {
+                    "The picture may lag and the PC may run hot. Update your graphics driver from NVIDIA, AMD or Intel, then click Restart."
+                },
+                if customized { 230.0 } else { 110.0 },
+                |ui| {
+                    if customized {
+                        reset =
+                            widgets::button(ui, Tone::Primary, None, "Use recommended settings")
+                                .clicked();
+                    } else {
+                        restart =
+                            widgets::button(ui, Tone::Secondary, Some(Icon::Refresh), "Restart")
+                                .clicked();
+                    }
+                },
             );
+            if reset {
+                self.reset_video_settings();
+            }
+            if restart {
+                self.restart_stream();
+            }
             ui.add_space(GAP - 10.0);
         }
         // The user asked for the extended (virtual) display but it could not be brought up,
         // so capture silently fell back to the primary monitor. Say so.
         let vdd_status = *self.control.shared.vdd_status.lock();
         if matches!(vdd_status, VddStatus::Failed | VddStatus::TaskFailed) {
-            let body = if vdd_status == VddStatus::TaskFailed {
-                "The display task could not run. Reinstall EternalMonitor-Setup.exe to repair its permissions, then restart the stream. Copy the logs to see the Windows error."
+            let task_failed = vdd_status == VddStatus::TaskFailed;
+            let body = if task_failed {
+                "Part of the EternalMonitor install is missing or blocked. Download EternalMonitor-Setup.exe and run it again to repair it, then click Try again."
             } else {
-                "The display task ran, but no display appeared in time. Check Windows display settings and the driver, then restart the stream."
+                "Windows didn't add the second screen in time. Click Try again. If it keeps happening, run EternalMonitor-Setup.exe again to repair the display driver."
             };
             let mut copy_logs = false;
+            let mut retry = false;
             widgets::banner(
                 ui,
                 WARNING,
                 Icon::Warning,
-                "Extended display unavailable. Mirroring the main screen instead.",
+                SECOND_SCREEN_FAILED_TITLE,
                 body,
-                110.0,
+                if task_failed { 330.0 } else { 220.0 },
                 |ui| {
-                    copy_logs = widgets::button(ui, Tone::Secondary, Some(Icon::Logs), "Copy logs")
+                    copy_logs =
+                        widgets::button(ui, Tone::Ghost, Some(Icon::Logs), "Copy logs").clicked();
+                    retry = widgets::button(ui, Tone::Secondary, Some(Icon::Refresh), "Try again")
                         .clicked();
+                    if task_failed {
+                        widgets::link(ui, "Download installer", INSTALLER_URL);
+                    }
                 },
             );
+            if retry {
+                self.restart_stream();
+            }
             if copy_logs {
                 if let Some(text) = crate::logging::session_log_text() {
                     self.copy(ui.ctx(), Copied::Logs, text);
@@ -141,7 +178,7 @@ impl AnalyzerApp {
             ACCENT,
             Icon::Refresh,
             "Restart the stream to apply your changes",
-            "Display and encoder changes take effect when the stream restarts. The iPad reconnects on its own.",
+            "These display and video changes apply when the stream restarts. The iPad reconnects by itself.",
             140.0,
             |ui| {
                 restart = widgets::button(ui, Tone::Primary, None, "Restart now").clicked();
@@ -163,20 +200,27 @@ impl AnalyzerApp {
         let (title, subtitle) = match state {
             StreamState::Off => (
                 "Streaming is off".to_string(),
-                "Start streaming so your iPad can connect.".to_string(),
+                "Click Start streaming so your iPad can connect.".to_string(),
             ),
             StreamState::Ready => (
                 "Ready for your iPad".to_string(),
-                "Open EternalMonitor on your iPad and choose this PC.".to_string(),
+                "Open EternalMonitor on your iPad and tap this PC, or plug in a USB cable."
+                    .to_string(),
             ),
             StreamState::Streaming => {
                 let (w, h) = snap.capture_resolution;
-                let mut parts = vec![client.link_name().to_string()];
+                let mode = if self.settings_capture_display == CAPTURE_VIRTUAL_SENTINEL
+                    && *self.control.shared.vdd_status.lock() == VddStatus::Active
+                {
+                    CAPTURE_VIRTUAL_LABEL
+                } else {
+                    "Mirroring"
+                };
+                let mut parts = vec![client.link_name().to_string(), mode.to_string()];
                 if w > 0 && h > 0 {
                     parts.push(format!("{w} × {h}"));
                 }
                 parts.push(format!("{} fps", self.control.shared.effective_fps()));
-                parts.push(friendly_codec(&snap.codec_name));
                 (format!("Streaming to {device}"), parts.join("  ·  "))
             }
         };
@@ -256,8 +300,13 @@ impl AnalyzerApp {
                 },
             );
 
+            ui.add_space(14.0);
+            widgets::divider(ui);
+            ui.add_space(12.0);
+            self.screen_mode_row(ui, snap.pipeline_running);
+
             if state == StreamState::Streaming {
-                ui.add_space(14.0);
+                ui.add_space(12.0);
                 widgets::divider(ui);
                 ui.add_space(14.0);
                 let latency = client
@@ -266,7 +315,7 @@ impl AnalyzerApp {
                     .filter(|r| r.e2e_latency_ms_x10 > 0)
                     .map(|r| format!("{:.0}", f64::from(r.e2e_latency_ms_x10) / 10.0))
                     .unwrap_or_else(|| format!("{:.0}", snap.latency_ms));
-                ui.columns(4, |cols| {
+                ui.columns(3, |cols| {
                     widgets::metric(
                         &mut cols[0],
                         "Frame rate",
@@ -274,25 +323,19 @@ impl AnalyzerApp {
                         "fps",
                         22.0,
                     )
-                    .on_hover_text("Frames captured per second on this PC.");
-                    widgets::metric(&mut cols[1], "Latency", &latency, "ms", 22.0)
-                        .on_hover_text("Time from capture on this PC to the picture on the iPad.");
+                    .on_hover_text("Pictures per second. 60 looks smooth.");
+                    widgets::metric(&mut cols[1], "Delay", &latency, "ms", 22.0)
+                        .on_hover_text("Time from this PC's screen to the picture on the iPad.");
                     widgets::metric(
                         &mut cols[2],
-                        "Bitrate",
-                        &format!("{:.1}", snap.bandwidth_mbps),
-                        "Mbps",
+                        "Connection",
+                        connection_quality(client.report.as_ref()),
+                        "",
                         22.0,
                     )
-                    .on_hover_text("Video sent to the iPad each second. It adapts to the network.");
-                    widgets::metric(
-                        &mut cols[3],
-                        "Encode time",
-                        &format!("{:.1}", snap.encode_time_us as f64 / 1000.0),
-                        "ms",
-                        22.0,
-                    )
-                    .on_hover_text("Time the encoder takes to compress each frame.");
+                    .on_hover_text(
+                        "How well the picture is getting through. Performance has the details.",
+                    );
                 });
             }
 
@@ -303,6 +346,54 @@ impl AnalyzerApp {
                 None => {}
             }
         });
+    }
+
+    /// Mirror or second screen, named as on the iPad. Always above the fold:
+    /// people who never scroll still find it.
+    fn screen_mode_row(&mut self, ui: &mut Ui, running: bool) {
+        let current = self.settings_capture_display.clone();
+        let mut second = current == CAPTURE_VIRTUAL_SENTINEL;
+        let vdd = *self.control.shared.vdd_status.lock();
+        let output = (!current.is_empty() && !second)
+            .then(|| current.rsplit('\\').next().unwrap_or(&current).to_string());
+        let mut arrange = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            ui.label(
+                RichText::new("Use the iPad as")
+                    .family(medium())
+                    .color(TEXT),
+            );
+            // A particular monitor (chosen in Settings) is still a mirror.
+            widgets::segmented(
+                ui,
+                &mut second,
+                &[(false, CAPTURE_AUTO_LABEL), (true, CAPTURE_VIRTUAL_LABEL)],
+            );
+            if second && vdd == VddStatus::Active {
+                arrange = widgets::button(ui, Tone::Ghost, None, "Arrange screens")
+                    .on_hover_text(
+                        "Opens Windows Settings at Display, where you drag the screens into place.",
+                    )
+                    .clicked();
+            }
+        });
+        ui.add_space(2.0);
+        ui.add(
+            egui::Label::new(muted(screen_mode_text(
+                &current,
+                output.as_deref(),
+                vdd,
+                running,
+            )))
+            .wrap(),
+        );
+        if arrange {
+            super::open_display_settings();
+        }
+        if second != (current == CAPTURE_VIRTUAL_SENTINEL) {
+            self.set_second_screen(second, running);
+        }
     }
 
     fn connect_card(&mut self, ui: &mut Ui, snap: &StatsSnapshot) {
@@ -316,7 +407,7 @@ impl AnalyzerApp {
         });
         widgets::paragraph(
             ui,
-            muted("On your iPad, open EternalMonitor and choose this PC, or tap Scan QR. USB connections pair automatically."),
+            muted("On your iPad, open EternalMonitor and tap this PC, or tap Scan QR code. Over a USB cable no code is needed."),
         );
         ui.add_space(8.0);
 
@@ -451,36 +542,6 @@ impl AnalyzerApp {
             if audio_on != enabled {
                 self.set_stream_audio(audio_on);
             }
-            widgets::divider(ui);
-
-            // Display
-            let description = match self.settings_capture_display.as_str() {
-                "" => "Mirrors your main screen on the iPad.".to_string(),
-                s if s == CAPTURE_VIRTUAL_SENTINEL => match *self.control.shared.vdd_status.lock() {
-                    VddStatus::Active => {
-                        "Extended display is on. Drag windows past the edge of your main screen."
-                            .to_string()
-                    }
-                    VddStatus::Failed | VddStatus::TaskFailed => {
-                        "The extended display didn't start, so the main screen is mirrored."
-                            .to_string()
-                    }
-                    _ => "Adds a second screen for the iPad. It appears when an iPad connects."
-                        .to_string(),
-                },
-                name => format!("Mirrors {}.", name.rsplit('\\').next().unwrap_or(name)),
-            };
-            widgets::icon_row(
-                ui,
-                Icon::Display,
-                TEXT_MUTED,
-                "Display",
-                &description,
-                250.0,
-                |ui| {
-                    self.display_picker(ui, 250.0);
-                },
-            );
         });
     }
 
@@ -540,6 +601,43 @@ enum HeaderAction {
     Restart,
 }
 
+pub(super) const SOFTWARE_FALLBACK_TITLE: &str =
+    "Video is using the processor instead of the graphics card";
+pub(super) const SECOND_SCREEN_FAILED_TITLE: &str =
+    "The second screen couldn't start, so your main screen is mirrored";
+const INSTALLER_URL: &str = "https://eternalmonitor.dev/download.html";
+
+/// What the Stream page says under the mirror / second screen choice.
+pub(super) fn screen_mode_text(
+    capture: &str,
+    output: Option<&str>,
+    vdd: VddStatus,
+    running: bool,
+) -> String {
+    let restart = if running {
+        " Switching restarts the stream, and the iPad reconnects by itself."
+    } else {
+        ""
+    };
+    let what = if capture == CAPTURE_VIRTUAL_SENTINEL {
+        match vdd {
+            VddStatus::Active => "The iPad is an extra screen. Drag windows past the edge of your main screen to move them onto it.",
+            VddStatus::Failed | VddStatus::TaskFailed => {
+                "The second screen didn't start, so your main screen is mirrored. See the message above."
+            }
+            _ => "The iPad becomes an extra screen next to your main one as soon as it connects.",
+        }
+        .to_string()
+    } else if let Some(name) = output {
+        format!(
+            "The iPad shows the same picture as {name}. Choose a different monitor in Settings."
+        )
+    } else {
+        "The iPad shows the same picture as your main screen.".to_string()
+    };
+    what + restart
+}
+
 /// Overline label, a large monospaced value and trailing controls.
 fn value_block(ui: &mut Ui, label: &str, value: &str, controls: impl FnOnce(&mut Ui)) {
     ui.vertical(|ui| {
@@ -570,7 +668,7 @@ fn client_card(ui: &mut Ui, client: &ClientSnapshot, streaming: bool) {
                 ui,
                 Icon::Tablet,
                 "Waiting for an iPad",
-                "It appears here as soon as it connects.",
+                "It appears here as soon as it connects. If the iPad says this PC didn't answer, put both on the same Wi-Fi, or plug in a USB cable.",
             );
         } else {
             widgets::empty_state(
@@ -679,12 +777,12 @@ pub(super) fn usb_cable_notice(
     Some(if installed {
         (
             "Your iPad is plugged in, but Apple Devices is not running",
-            "EternalMonitor reaches an iPad over the USB cable through Apple Devices. Open it and leave it running; it can stay minimized. WiFi works without it.",
+            "EternalMonitor reaches an iPad over the USB cable through Apple Devices. Open it and leave it running; it can stay minimized. Wi-Fi works without it.",
         )
     } else {
         (
             "Your iPad is plugged in, but Apple Devices is not installed",
-            "EternalMonitor needs Apple's free Apple Devices app to stream over the USB cable. Install it from the Microsoft Store, open it, and leave it running. WiFi works without it.",
+            "EternalMonitor needs Apple's free Apple Devices app to stream over the USB cable. Install it from the Microsoft Store, open it, and leave it running. Wi-Fi works without it.",
         )
     })
 }
