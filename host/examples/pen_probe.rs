@@ -203,7 +203,9 @@ fn sequences() {
     let down = POINTER_FLAG_DOWN | contact;
     let moved = POINTER_FLAG_UPDATE | contact;
     let hover = POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE;
-    let cases: [(&str, &[(POINTER_FLAGS, i32, u32)]); 8] = [
+    // (flags, x offset from the centre, pressure)
+    type Frame = (POINTER_FLAGS, i32, u32);
+    let cases: [(&str, &[Frame]); 8] = [
         (
             "control_stroke",
             &[(down, 0, 512), (moved, 0, 512), (POINTER_FLAG_UP, 0, 0)],
