@@ -40,6 +40,7 @@ impl AudioSender {
             stats.audio.dropped += 1;
             stats.audio.stale_dropped += 1;
             stats.audio.late_seqs.record(queued.packet.seq);
+            stats.audio.note_wire(queued.session_id, epoch);
             return None;
         }
         let stream = (queued.session_id, epoch);
@@ -59,6 +60,7 @@ impl AudioSender {
             stats.audio.dropped += 1;
             stats.audio.oversized_dropped += 1;
             stats.audio.failed_seqs.record(queued.packet.seq);
+            stats.audio.note_wire(queued.session_id, epoch);
             return None;
         }
         Some((peer, datagram))
@@ -80,13 +82,16 @@ impl AudioSender {
             if links.send_to(&datagram, peer).await.is_ok() {
                 self.last_stream = Some((session_id, epoch));
                 self.reset_pending = false;
-                PIPELINE_STATS.lock().audio.record_sent(payload_size);
+                let mut stats = PIPELINE_STATS.lock();
+                stats.audio.note_wire(session_id, epoch);
+                stats.audio.record_sent(payload_size);
             } else {
                 self.reset_pending = true;
                 let mut stats = PIPELINE_STATS.lock();
                 stats.audio.dropped += 1;
                 stats.audio.send_failed += 1;
                 stats.audio.failed_seqs.record(seq);
+                stats.audio.note_wire(session_id, epoch);
             }
         }
     }

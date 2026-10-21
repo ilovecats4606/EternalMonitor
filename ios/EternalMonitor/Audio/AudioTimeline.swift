@@ -12,9 +12,11 @@ final class AudioTimeline {
     private let decoder: OpusDecoder
     let pcm: AudioPCMBuffer
     private var pending: [UInt32: ReceivedAudio] = [:]
-    private var epoch: UInt32?
-    /// The current timeline's first sequence number and the next one it
-    /// expects. Every number in between was decoded or counted as lost.
+    /// The wire session and epoch this timeline follows, its first sequence
+    /// number and the next one it expects. Every number in between was
+    /// decoded or counted as lost.
+    private(set) var sessionId: UInt32?
+    private(set) var epoch: UInt32?
     private(set) var firstSeq: UInt32?
     private(set) var nextSeq: UInt32?
     private var lastCaptureUs: UInt64?
@@ -57,6 +59,7 @@ final class AudioTimeline {
 
     private func restart(at header: AudioHeader) throws {
         pending.removeAll(keepingCapacity: true)
+        sessionId = header.sessionId
         epoch = header.streamEpoch
         firstSeq = header.audioSeq
         nextSeq = header.audioSeq

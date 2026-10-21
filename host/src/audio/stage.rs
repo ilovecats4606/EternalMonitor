@@ -292,7 +292,8 @@ pub fn run_audio_stage(
                 dropped = stats.dropped, capture_queue_dropped = stats.capture_queue_dropped,
                 stale_dropped = stats.stale_dropped, oversized_dropped = stats.oversized_dropped,
                 send_failed = stats.send_failed, late_seqs = %stats.late_seqs,
-                failed_seqs = %stats.failed_seqs, "Audio stream stats");
+                failed_seqs = %stats.failed_seqs, audio_stream = stats.stream,
+                wire_stream = %stats.wire, "Audio stream stats");
         }
     }
     drop(active);

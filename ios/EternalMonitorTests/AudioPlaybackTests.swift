@@ -217,6 +217,8 @@ final class AudioTimelineTests: XCTestCase {
         try timeline.receive(packet(5)); try timeline.drain(nowUs: 0)
         try timeline.receive(packet(7, arrival: 20_000)); try timeline.drain(nowUs: 40_000)
         try timeline.receive(packet(30, timestamp: 600_000, arrival: 60_000)); try timeline.drain(nowUs: 90_000)
+        XCTAssertEqual(timeline.sessionId, 7)
+        XCTAssertEqual(timeline.epoch, 1)
         XCTAssertEqual(timeline.firstSeq, 5)
         XCTAssertEqual(timeline.nextSeq, 31)
         XCTAssertEqual(timeline.decoded, 3)

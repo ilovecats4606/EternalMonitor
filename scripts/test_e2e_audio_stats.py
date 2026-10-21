@@ -2,19 +2,20 @@ import unittest
 from e2e_audio_stats import measure
 
 
-def sample(decoded=100, lost=0, tone=-12, rms=0.177, first=None, after=None):
+def sample(decoded=100, lost=0, tone=-12, rms=0.177, first=None, after=None, session=7, epoch=3):
     line = f'E2E_AUDIO packets={decoded} decoded={decoded} lost={lost} buffer_ms=60 rms={rms} tone1k_db={tone}'
     if first is not None:
-        line += f' first_seq={first} next_seq={first + decoded + lost if after is None else after}'
+        after = first + decoded + lost if after is None else after
+        line += f' session_id={session} epoch={epoch} first_seq={first} next_seq={after % 2**32}'
     return line + '\n'
 
 
-def host(stale=0, queue=0, oversized=0, send_failed=0, late=None, failed='none'):
+def host(stale=0, queue=0, oversized=0, send_failed=0, late=None, failed='none', stream=1, wire='7/3'):
     # The host writes tracing fields with ANSI styling around each name.
     fields = dict(dropped=stale + queue + oversized + send_failed, capture_queue_dropped=queue,
                   stale_dropped=stale, oversized_dropped=oversized, send_failed=send_failed)
     if late is not None:
-        fields.update(late_seqs=late, failed_seqs=failed)
+        fields.update(late_seqs=late, failed_seqs=failed, audio_stream=stream, wire_stream=wire)
     styled = ' '.join(f'\x1b[3m{key}\x1b[0m\x1b[2m=\x1b[0m{value}' for key, value in fields.items())
     return f'\x1b[2m2026-10-21T17:34:28.124881Z\x1b[0m \x1b[32m INFO\x1b[0m Audio stream stats {styled}\n'
 
@@ -104,6 +105,40 @@ class AudioMeasurementTests(unittest.TestCase):
         for message, (app, host_log) in cases.items():
             with self.subTest(message), self.assertRaisesRegex(ValueError, message):
                 measure(app, host_log, 'record')
+
+    def test_packets_before_the_first_received_sequence_must_be_host_drops(self):
+        # Sol's case: the host numbers from 0, so sequences 0-99 were sent
+        # and vanished before the iPad's first packet.
+        app = sample(400, lost=0, first=100, after=500) * 2
+        for gate in ('enforce', 'record'):
+            with self.subTest(gate=gate), self.assertRaisesRegex(ValueError, '100 audio packets before'):
+                measure(app, host(late='none'), gate)
+        # Host drops that cover the prefix are attributed.
+        self.assertEqual(measure(app, host(stale=100, late='0-99'), 'record')['audio_host_late'], 100)
+
+    def test_a_later_stream_cannot_attribute_an_earlier_loss(self):
+        # The old stream's network loss fails against its own stats.
+        app = sample(400, lost=1, first=0) * 2
+        own = host(late='none')
+        with self.assertRaisesRegex(ValueError, '1 audio packets lost after'):
+            measure(app, own, 'record')
+        # A replacement stream after the app log froze, with a startup drop at
+        # sequence 10, must not cover it, whatever its epoch.
+        for replacement, message in ((host(stale=1, late='10', stream=2, wire='7/4'), '1 audio packets lost after'),
+                                     (host(stale=1, late='10', stream=2, wire='7/3'), 'restarted audio numbering')):
+            with self.subTest(replacement=replacement), self.assertRaisesRegex(ValueError, message):
+                measure(app, own + replacement, 'record')
+        with self.assertRaisesRegex(ValueError, 'no audio stats for session 7 epoch 3'):
+            measure(app, host(stale=1, late='10', wire='8/3'), 'record')
+        with self.assertRaisesRegex(ValueError, 'more than one wire stream'):
+            measure(app, host(stale=1, late='10', wire='mixed') + own, 'record')
+
+    def test_sequence_wrap_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, 'malformed host sequence range'):
+            measure(sample(400, lost=2, first=0) * 2, host(stale=2, late='4294967295-0'), 'record')
+        app = sample(400, first=2**32 - 100) * 2
+        with self.assertRaisesRegex(ValueError, 'wraps'):
+            measure(app, host(late='none'), 'record')
 
     def test_host_log_without_audio_stats_fails(self):
         with self.assertRaisesRegex(ValueError, 'no audio stream stats'):

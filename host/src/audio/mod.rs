@@ -69,26 +69,63 @@ pub struct AudioStats {
     /// capture queue full), and those the host failed to send.
     pub late_seqs: SeqRanges,
     pub failed_seqs: SeqRanges,
+    /// Each capture session numbers from 0. `stream` changes with every one,
+    /// and `wire` is the session and epoch its packets went out under.
+    pub stream: u64,
+    pub wire: WireStream,
     samples: VecDeque<(Instant, usize)>,
 }
 
+static NEXT_STREAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The wire session id and stream epoch of one capture session's packets.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum WireStream {
+    #[default]
+    Unknown,
+    Known(u32, u32),
+    Mixed,
+}
+
+impl std::fmt::Display for WireStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown => f.write_str("none"),
+            Self::Known(session_id, epoch) => write!(f, "{session_id}/{epoch}"),
+            Self::Mixed => f.write_str("mixed"),
+        }
+    }
+}
+
+const MAX_SEQ_RANGES: usize = 32;
+
 /// Inclusive sequence ranges for the stats log, such as `3-5,9`. At most
-/// 32 ranges are kept; a trailing `+` marks drops that did not fit.
-#[derive(Clone, Default)]
+/// 32 ranges are kept; a trailing `+` marks drops that did not fit. A range
+/// never crosses the u32 wrap.
+#[derive(Clone)]
 pub struct SeqRanges {
     ranges: Vec<(u32, u32)>,
     truncated: bool,
 }
 
+impl Default for SeqRanges {
+    fn default() -> Self {
+        Self {
+            ranges: Vec::with_capacity(MAX_SEQ_RANGES),
+            truncated: false,
+        }
+    }
+}
+
 impl SeqRanges {
     pub fn record(&mut self, seq: u32) {
         if let Some((_, end)) = self.ranges.last_mut() {
-            if end.wrapping_add(1) == seq {
+            if end.checked_add(1) == Some(seq) {
                 *end = seq;
                 return;
             }
         }
-        if self.ranges.len() < 32 {
+        if self.ranges.len() < MAX_SEQ_RANGES {
             self.ranges.push((seq, seq));
         } else {
             self.truncated = true;
@@ -101,21 +138,20 @@ impl std::fmt::Display for SeqRanges {
         if self.ranges.is_empty() && !self.truncated {
             return f.write_str("none");
         }
-        let mut parts: Vec<String> = self
-            .ranges
-            .iter()
-            .map(|&(start, end)| {
-                if start == end {
-                    start.to_string()
-                } else {
-                    format!("{start}-{end}")
-                }
-            })
-            .collect();
-        if self.truncated {
-            parts.push("+".into());
+        for (index, &(start, end)) in self.ranges.iter().enumerate() {
+            if index > 0 {
+                f.write_str(",")?;
+            }
+            if start == end {
+                write!(f, "{start}")?;
+            } else {
+                write!(f, "{start}-{end}")?;
+            }
         }
-        f.write_str(&parts.join(","))
+        if self.truncated {
+            f.write_str(if self.ranges.is_empty() { "+" } else { ",+" })?;
+        }
+        Ok(())
     }
 }
 
@@ -136,6 +172,8 @@ impl Default for AudioStats {
             send_failed: 0,
             late_seqs: SeqRanges::default(),
             failed_seqs: SeqRanges::default(),
+            stream: 0,
+            wire: WireStream::Unknown,
             samples: VecDeque::with_capacity(64),
         }
     }
@@ -146,8 +184,18 @@ impl AudioStats {
         Self {
             device: device.into(),
             status: "Streaming".into(),
+            stream: NEXT_STREAM.fetch_add(1, Ordering::Relaxed),
             ..Self::default()
         }
+    }
+
+    /// Note the wire stream of a packet from this capture session.
+    pub fn note_wire(&mut self, session_id: u32, epoch: u32) {
+        self.wire = match self.wire {
+            WireStream::Unknown => WireStream::Known(session_id, epoch),
+            WireStream::Known(s, e) if (s, e) == (session_id, epoch) => self.wire,
+            _ => WireStream::Mixed,
+        };
     }
 
     pub fn stopped(&mut self, status: &str) {
@@ -198,5 +246,26 @@ mod tests {
             "32 ranges and a truncation mark"
         );
         assert!(text.ends_with(",+"));
+    }
+
+    #[test]
+    fn a_range_never_crosses_the_sequence_wrap() {
+        let mut ranges = SeqRanges::default();
+        for seq in [u32::MAX - 1, u32::MAX, 0, 1] {
+            ranges.record(seq);
+        }
+        assert_eq!(ranges.to_string(), "4294967294-4294967295,0-1");
+    }
+
+    #[test]
+    fn a_capture_session_reports_one_wire_stream() {
+        let mut stats = super::AudioStats::started("test");
+        assert_eq!(stats.wire.to_string(), "none");
+        stats.note_wire(7, 3);
+        stats.note_wire(7, 3);
+        assert_eq!(stats.wire.to_string(), "7/3");
+        assert!(super::AudioStats::started("test").stream > stats.stream);
+        stats.note_wire(7, 4);
+        assert_eq!(stats.wire.to_string(), "mixed");
     }
 }
