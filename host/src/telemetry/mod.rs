@@ -13,14 +13,12 @@ use std::{
 
 const MAX_FILES: usize = 512;
 const BATCH_SIZE: usize = 4;
-/// Sent by the shutdown to the upload thread; never an event.
-const WAKE: &str = "";
 /// Longest a normal quit waits for uploads. Unsent batches stay in the outbox.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 /// Events another process adds to a launch number from here, clear of the
 /// launch's own sequence, which the backend keeps unique per launch.
 pub const FOREIGN_SEQUENCE_BASE: u64 = 1 << 40;
-static SENDER: OnceLock<mpsc::SyncSender<String>> = OnceLock::new();
+static SENDER: OnceLock<mpsc::SyncSender<Queued>> = OnceLock::new();
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static STATUS: Mutex<String> = Mutex::new(String::new());
@@ -161,6 +159,21 @@ pub fn set_enabled(value: bool) {
     });
 }
 
+/// What the upload thread receives. A log line, even an empty one, is always
+/// an event; only the shutdown sends `Wake`.
+enum Queued {
+    Line(String),
+    Wake,
+}
+
+/// The log lines among `queued`, as events.
+fn events(queued: impl Iterator<Item = Queued>) -> impl Iterator<Item = Event> {
+    queued.filter_map(|queued| match queued {
+        Queued::Line(line) => Some(event(&line, level(&line))),
+        Queued::Wake => None,
+    })
+}
+
 pub struct UploadGuard {
     _uploader: Option<Uploader>,
 }
@@ -171,14 +184,14 @@ struct Uploader {
     stop: std::sync::Arc<AtomicBool>,
     /// Wakes a thread waiting for lines, so an idle quit does not wait out
     /// its receive timeout.
-    wake: mpsc::SyncSender<String>,
-    receiver: std::sync::Arc<Mutex<mpsc::Receiver<String>>>,
+    wake: mpsc::SyncSender<Queued>,
+    receiver: std::sync::Arc<Mutex<mpsc::Receiver<Queued>>>,
     directory: PathBuf,
     done: mpsc::Receiver<()>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 impl Uploader {
-    fn spawn(config: Config, directory: PathBuf) -> (mpsc::SyncSender<String>, Self) {
+    fn spawn(config: Config, directory: PathBuf) -> (mpsc::SyncSender<Queued>, Self) {
         let (sender, receiver) = mpsc::sync_channel(256);
         let receiver = std::sync::Arc::new(Mutex::new(receiver));
         let stop = std::sync::Arc::new(AtomicBool::new(false));
@@ -206,7 +219,7 @@ impl Uploader {
 impl Drop for Uploader {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        let _ = self.wake.try_send(WAKE.into());
+        let _ = self.wake.try_send(Queued::Wake);
         if self.done.recv_timeout(SHUTDOWN_WAIT).is_ok() {
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
@@ -218,11 +231,7 @@ impl Drop for Uploader {
         let Ok(receiver) = self.receiver.lock() else {
             return;
         };
-        let events: Vec<Event> = receiver
-            .try_iter()
-            .filter(|line| line != WAKE)
-            .map(|line| event(&line, level(&line)))
-            .collect();
+        let events: Vec<Event> = events(receiver.try_iter()).collect();
         for chunk in events.chunks(BATCH_SIZE) {
             if let Ok(batch) = batch(chunk.to_vec()) {
                 let _ = persist(&self.directory, &batch);
@@ -282,7 +291,10 @@ pub fn record(line: &str) {
             while !line.is_char_boundary(end) {
                 end -= 1;
             }
-            if sender.try_send(line[..end].to_owned()).is_err() {
+            if sender
+                .try_send(Queued::Line(line[..end].to_owned()))
+                .is_err()
+            {
                 DROPPED.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -471,7 +483,7 @@ fn upload(
 fn run(
     config: Config,
     directory: PathBuf,
-    receiver: std::sync::Arc<Mutex<mpsc::Receiver<String>>>,
+    receiver: std::sync::Arc<Mutex<mpsc::Receiver<Queued>>>,
     stop: std::sync::Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -493,8 +505,8 @@ fn run(
             Err(_) => break,
         };
         match received {
-            Ok(line) if line == WAKE => {}
-            Ok(line) => pending.push(event(&line, level(&line))),
+            Ok(Queued::Wake) => {}
+            Ok(Queued::Line(line)) => pending.push(event(&line, level(&line))),
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
@@ -556,7 +568,7 @@ fn run(
 /// queue empty and let the process exit while drained events are unwritten.
 fn finish(
     directory: &Path,
-    receiver: &Mutex<mpsc::Receiver<String>>,
+    receiver: &Mutex<mpsc::Receiver<Queued>>,
     mut pending: Vec<Event>,
 ) -> std::io::Result<()> {
     let Ok(receiver) = receiver.lock() else {
@@ -569,12 +581,7 @@ fn finish(
         while receiver.try_recv().is_ok() {}
         return Ok(());
     }
-    pending.extend(
-        receiver
-            .try_iter()
-            .filter(|line| line != WAKE)
-            .map(|line| event(&line, level(&line))),
-    );
+    pending.extend(events(receiver.try_iter()));
     #[cfg(test)]
     tests::pause_before_final_write(directory);
     for chunk in pending.chunks(BATCH_SIZE) {
@@ -667,7 +674,9 @@ mod tests {
         // Let the first request start, then quit as main does.
         std::thread::sleep(Duration::from_millis(300));
         sender
-            .send("2026-10-21T17:11:31Z  INFO EternalMonitor shutting down".into())
+            .send(Queued::Line(
+                "2026-10-21T17:11:31Z  INFO EternalMonitor shutting down".into(),
+            ))
             .unwrap();
         let started = std::time::Instant::now();
         drop(uploader);
@@ -732,7 +741,9 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         for index in 0..10 {
             sender
-                .send(format!("2026-10-21T17:11:31Z  INFO last line {index}"))
+                .send(Queued::Line(format!(
+                    "2026-10-21T17:11:31Z  INFO last line {index}"
+                )))
                 .unwrap();
         }
         drop(uploader);
@@ -745,6 +756,27 @@ mod tests {
             .count();
         assert_eq!(kept, 10, "{messages:?}");
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn an_empty_log_line_is_an_event_and_not_the_shutdown_wake() {
+        let directory = std::env::temp_dir().join(id().unwrap());
+        fs::create_dir_all(&directory).unwrap();
+        let config = Config {
+            endpoint: "http://127.0.0.1:9/v1/events".into(),
+            ingest_key: "write-only".into(),
+            enabled: true,
+            allow_http: true,
+        };
+        let (sender, uploader) = Uploader::spawn(config, directory.clone());
+        for line in ["", "after the empty line"] {
+            sender.send(Queued::Line(line.into())).unwrap();
+        }
+        drop(uploader);
+        let mut messages = outbox_messages(&directory);
+        messages.sort();
+        assert_eq!(messages, ["", "after the empty line"]);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
