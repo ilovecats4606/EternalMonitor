@@ -31,7 +31,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
-use super::{Injection, PenPhase, PenSample, VirtualScreen};
+use super::pen_contact::{Outcome, PenContact, PointerKind};
+use super::{CaptureGeometry, Injection, PenPhase, PenSample, VirtualScreen};
 
 /// One device per relay, retained across samples and destroyed at shutdown.
 #[derive(Debug)]
@@ -39,8 +40,8 @@ pub struct PenDevice {
     handle: Option<HSYNTHETICPOINTERDEVICE>,
     /// Error codes already logged, so a repeated refusal logs once.
     warned: Vec<windows::core::HRESULT>,
-    /// Windows dropped our contact after a rejected sample.
-    lost: bool,
+    /// What Windows believes about the pen; chooses every frame.
+    contact: PenContact,
 }
 
 // This is a process-owned User32 handle, not a pointer we dereference. Tokio
@@ -60,9 +61,16 @@ impl Default for PenDevice {
         Self {
             handle,
             warned: Vec::new(),
-            lost: false,
+            contact: PenContact::default(),
         }
     }
+}
+
+/// Where a frame was aimed, for the once-per-error warning.
+#[derive(Clone, Copy)]
+struct FrameContext {
+    screen: VirtualScreen,
+    output: Option<CaptureGeometry>,
 }
 
 impl PenDevice {
@@ -70,108 +78,149 @@ impl PenDevice {
         self.handle.is_some()
     }
 
-    fn inject(&mut self, mut sample: PenSample, screen: VirtualScreen) {
-        let Some(handle) = self.handle else {
+    fn inject(&mut self, sample: PenSample, context: FrameContext) {
+        let Self {
+            handle: Some(handle),
+            warned,
+            contact,
+        } = self
+        else {
             return;
         };
-        if self.lost {
-            match super::resume_pen_phase(sample.phase) {
-                Some(phase) => sample.phase = phase,
-                None => {
-                    self.lost = false;
-                    return;
-                }
-            }
-        }
-        let (x, y) = super::desktop_pixel_to_pointer_location(sample.x, sample.y, screen);
-        let flags = match sample.phase {
-            PenPhase::Down => {
-                POINTER_FLAG_DOWN
-                    | POINTER_FLAG_INRANGE
-                    | POINTER_FLAG_INCONTACT
-                    | POINTER_FLAG_FIRSTBUTTON
-            }
-            PenPhase::Move => {
-                POINTER_FLAG_UPDATE
-                    | POINTER_FLAG_INRANGE
-                    | POINTER_FLAG_INCONTACT
-                    | POINTER_FLAG_FIRSTBUTTON
-            }
-            // Finish contact completely. Supported UIKit hover starts a new
-            // in-range update; unsupported devices must not leave ghost hover.
-            PenPhase::Up => POINTER_FLAG_UP,
-            PenPhase::Cancel => POINTER_FLAG_UP | POINTER_FLAG_CANCELED,
-            PenPhase::Hover => POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE,
-            PenPhase::Leave => POINTER_FLAG_UPDATE,
+        contact.deliver(sample, &mut |frame, from| {
+            inject_frame(*handle, frame, from, context, warned)
+        });
+    }
+
+    /// Retry a frame Windows was not ready for. Called on every refresh tick.
+    pub fn flush(&mut self, output: Option<CaptureGeometry>) {
+        let Self {
+            handle: Some(handle),
+            warned,
+            contact,
+        } = self
+        else {
+            return;
         };
-        let info = POINTER_TYPE_INFO {
-            r#type: PT_PEN,
-            Anonymous: POINTER_TYPE_INFO_0 {
-                penInfo: POINTER_PEN_INFO {
-                    pointerInfo: POINTER_INFO {
-                        pointerType: PT_PEN,
-                        pointerId: 1,
-                        pointerFlags: flags | POINTER_FLAG_PRIMARY,
-                        ptPixelLocation: POINT { x, y },
-                        ..Default::default()
-                    },
-                    penMask: PEN_MASK_PRESSURE | PEN_MASK_TILT_X | PEN_MASK_TILT_Y,
-                    pressure: sample.pressure,
-                    tiltX: sample.tilt_x,
-                    tiltY: sample.tilt_y,
+        if contact.pending().is_none() {
+            return;
+        }
+        let context = FrameContext {
+            screen: virtual_screen(),
+            output,
+        };
+        contact.flush(&mut |frame, from| inject_frame(*handle, frame, from, context, warned));
+    }
+}
+
+fn inject_frame(
+    handle: HSYNTHETICPOINTERDEVICE,
+    frame: PenSample,
+    from: PointerKind,
+    context: FrameContext,
+    warned: &mut Vec<windows::core::HRESULT>,
+) -> Outcome {
+    let screen = context.screen;
+    let (x, y) = super::desktop_pixel_to_pointer_location(frame.x, frame.y, screen);
+    let flags = match frame.phase {
+        PenPhase::Down => {
+            POINTER_FLAG_DOWN
+                | POINTER_FLAG_INRANGE
+                | POINTER_FLAG_INCONTACT
+                | POINTER_FLAG_FIRSTBUTTON
+        }
+        PenPhase::Move => {
+            POINTER_FLAG_UPDATE
+                | POINTER_FLAG_INRANGE
+                | POINTER_FLAG_INCONTACT
+                | POINTER_FLAG_FIRSTBUTTON
+        }
+        // Finish contact completely. Supported UIKit hover starts a new
+        // in-range update; unsupported devices must not leave ghost hover.
+        PenPhase::Up => POINTER_FLAG_UP,
+        PenPhase::Cancel => POINTER_FLAG_UP | POINTER_FLAG_CANCELED,
+        PenPhase::Hover => POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE,
+        PenPhase::Leave => POINTER_FLAG_UPDATE,
+    };
+    let info = POINTER_TYPE_INFO {
+        r#type: PT_PEN,
+        Anonymous: POINTER_TYPE_INFO_0 {
+            penInfo: POINTER_PEN_INFO {
+                pointerInfo: POINTER_INFO {
+                    pointerType: PT_PEN,
+                    pointerId: 1,
+                    pointerFlags: flags | POINTER_FLAG_PRIMARY,
+                    ptPixelLocation: POINT { x, y },
                     ..Default::default()
                 },
+                penMask: PEN_MASK_PRESSURE | PEN_MASK_TILT_X | PEN_MASK_TILT_Y,
+                pressure: frame.pressure,
+                tiltX: frame.tilt_x,
+                tiltY: frame.tilt_y,
+                ..Default::default()
             },
-        };
-        // Windows timestamps injection at 0.1 ms resolution. Coalesced UIKit
-        // samples can arrive together; retry that same sample if the OS clock
-        // has not advanced, instead of silently losing a stroke point or up.
-        let started = std::time::Instant::now();
-        let not_ready = windows::core::HRESULT::from_win32(ERROR_NOT_READY.0);
-        let result = loop {
-            let result = unsafe { InjectSyntheticPointerInput(handle, &[info]) };
-            if result
-                .as_ref()
-                .is_err_and(|error| error.code() == not_ready)
-                && started.elapsed() < std::time::Duration::from_millis(2)
-            {
-                std::thread::yield_now();
-                continue;
-            }
-            break result;
-        };
-        match result {
-            Ok(()) => {
-                self.lost = false;
-                super::log_injections(&[Injection::Pen(sample)]);
-            }
-            Err(error) => {
-                // ERROR_NOT_READY drops one sample but keeps the contact.
-                // Any other refusal cancels it; an end of contact leaves
-                // nothing to resume.
-                self.lost =
-                    error.code() != not_ready && super::resume_pen_phase(sample.phase).is_some();
-                if !self.warned.contains(&error.code()) {
-                    self.warned.push(error.code());
-                    // E_ACCESSDENIED: the secure desktop or an elevated window
-                    // has focus; SendInput is blocked there too, so there is no
-                    // useful fallback. Other codes point at the sample itself.
-                    warn!(
-                        %error,
-                        phase = ?sample.phase,
-                        desktop_x = sample.x,
-                        desktop_y = sample.y,
-                        location_x = x,
-                        location_y = y,
-                        virtual_left = screen.left,
-                        virtual_top = screen.top,
-                        virtual_width = screen.width,
-                        virtual_height = screen.height,
-                        "Windows rejected native pen input"
-                    );
-                }
-            }
+        },
+    };
+    // Windows timestamps injection at 0.1 ms resolution. Coalesced UIKit
+    // samples can arrive together; retry that same frame if the OS clock has
+    // not advanced. Past 2 ms, PenContact keeps it pending for the next tick.
+    let started = std::time::Instant::now();
+    let not_ready = windows::core::HRESULT::from_win32(ERROR_NOT_READY.0);
+    let result = loop {
+        let result = unsafe { InjectSyntheticPointerInput(handle, &[info]) };
+        if result
+            .as_ref()
+            .is_err_and(|error| error.code() == not_ready)
+            && started.elapsed() < std::time::Duration::from_millis(2)
+        {
+            std::thread::yield_now();
+            continue;
         }
+        break result;
+    };
+    let error = match result {
+        Ok(()) => {
+            super::log_injections(&[Injection::Pen(frame)]);
+            return Outcome::Injected;
+        }
+        Err(error) => error,
+    };
+    if !warned.contains(&error.code()) {
+        warned.push(error.code());
+        // E_ACCESSDENIED: the secure desktop or an elevated window has focus;
+        // SendInput is blocked there too, so there is no useful fallback.
+        // Other codes point at the frame, its starting state or the geometry.
+        let output = context.output.unwrap_or(CaptureGeometry {
+            left: 0,
+            top: 0,
+            width: 0,
+            height: 0,
+        });
+        warn!(
+            %error,
+            phase = ?frame.phase,
+            from = ?from,
+            pressure = frame.pressure,
+            desktop_x = frame.x,
+            desktop_y = frame.y,
+            location_x = x,
+            location_y = y,
+            virtual_left = screen.left,
+            virtual_top = screen.top,
+            virtual_width = screen.width,
+            virtual_height = screen.height,
+            output_left = output.left,
+            output_top = output.top,
+            output_width = output.width,
+            output_height = output.height,
+            dpi_awareness = dpi_awareness(),
+            "Windows rejected native pen input"
+        );
+    }
+    if error.code() == not_ready {
+        Outcome::NotReady
+    } else {
+        Outcome::Rejected
     }
 }
 
@@ -258,8 +307,9 @@ pub fn become_per_monitor_dpi_aware() {
     let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 }
 
-/// Execute a resolved injection batch.
-pub fn inject(injections: &[Injection], pen: &mut PenDevice) {
+/// Execute a resolved injection batch. `output` is the captured display the
+/// batch was mapped onto, for diagnostics.
+pub fn inject(injections: &[Injection], pen: &mut PenDevice, output: Option<CaptureGeometry>) {
     if !probe_guard_allows(injections) {
         warn!("Input probe guard rejected an injection batch");
         return;
@@ -274,7 +324,7 @@ pub fn inject(injections: &[Injection], pen: &mut PenDevice) {
                     unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
                     inputs.clear();
                 }
-                pen.inject(sample, screen);
+                pen.inject(sample, FrameContext { screen, output });
                 continue;
             }
             Injection::KeyDown { scan, extended } | Injection::KeyUp { scan, extended } => {

@@ -76,8 +76,15 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   monitor on the left moved the pen left by its width. The host is per-monitor
   DPI aware from startup, so scaled displays use physical pixels throughout.
 - Disconnect, backgrounding and view cancellation release contact. If Windows
-  rejects a sample or cancels the contact after a display change, the next
-  sample starts a new contact instead of losing the rest of the stroke.
+  rejects a sample or cancels the contact after a display change, the host
+  starts a new contact at that same sample instead of losing the rest of the
+  stroke. `ERROR_NOT_READY` frames are retried unchanged on the next sample or
+  refresh tick. `host/src/input/pen_contact.rs` chooses every frame from what
+  Windows last accepted, so an end of contact or hover is never sent for a
+  pointer Windows does not have.
+- A held contact remembers its normalised position. The refresh tick remaps it
+  onto the current capture rect, so a still Pencil follows a display that
+  moved or changed mode.
 - Each session logs `Input mapping geometry` once, and again when it changes:
   the captured display and virtual screen rectangles, the pen origin, the DPI
   awareness and whether Pencil uses the native pen or the mouse fallback.
@@ -109,6 +116,8 @@ pixels Windows reports with the expected ones. `-WithVirtualDisplay` also
 enables the Virtual Display Driver, places it left of and then above the
 primary, and draws a stroke while it moves. It records the display layout
 first and restores it at the end; `result.json` lists both layouts.
+`-PenSequences` also records which raw frame sequences Windows rejects, at the
+centre of the probe window.
 
 Before release, verify light-to-heavy strokes, pressure-sensitive dots, tilted
 brushes, diagonals and all canvas corners on a physical iPad. Rest a palm before

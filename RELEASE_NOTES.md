@@ -7,10 +7,11 @@
   Previously the pen moved left or up by that monitor's size, and strokes near
   the far edge stopped with "Windows rejected native pen input".
 - After Windows cancels a pen contact, for example when a display changes mode,
-  the next Pencil sample starts a new stroke instead of being dropped until the
-  Pencil lifts.
+  the stroke continues from the same Pencil sample instead of being dropped
+  until the Pencil lifts. A Pencil held still follows a display that moves.
 - The Windows host uses physical pixels from startup on scaled displays, and
-  touch clicks land on the exact pixel on every monitor layout.
+  touch clicks land on the exact pixel on every monitor layout, including very
+  wide desktops.
 - If Windows cannot create its pen device, Pencil outside Drawing mode works as
   a mouse instead of doing nothing.
 - The host log records the input mapping geometry for each session.

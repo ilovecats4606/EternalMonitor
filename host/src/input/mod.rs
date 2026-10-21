@@ -14,6 +14,8 @@ pub use hid::hid_to_scancode;
 pub mod windows_inject;
 
 #[cfg(any(windows, test))]
+mod pen_contact;
+#[cfg(any(windows, test))]
 mod probe_guard;
 
 /// Desktop-space rectangle of the captured output (from DXGI's
@@ -138,14 +140,26 @@ pub fn norm_to_output_pixel(x_norm: u16, y_norm: u16, output: CaptureGeometry) -
 
 /// Map a desktop pixel to `SendInput`'s absolute virtual-screen space
 /// (0..65535 across the whole virtual desktop, MOUSEEVENTF_VIRTUALDESK).
-/// Windows resolves a coordinate to `origin + abs * span / 65536`, rounded
-/// down, so aim at the pixel's centre; aiming at its left edge lands one pixel
-/// short wherever the division rounds down.
+///
+/// Assumed landing model: Windows resolves `abs` to
+/// `origin + floor(abs * span / 65536)`. That is the documented 0..65535
+/// normalisation over the virtual desktop with truncation, the model the
+/// probe guard uses, and it matched every pixel `Test-PenMapping.ps1`
+/// measured on 5,360 to 8,092 px wide desktops. Pixel `rel` therefore owns
+/// the abs interval `[ceil(rel * 65536 / span), ceil((rel + 1) * 65536 / span))`.
+/// Aim at the pixel centre, which survives a rounding (rather than
+/// truncating) driver too, but clamp it into that interval: on desktops wider
+/// than 32,768 px the centre alone can fall below it. Desktops wider than
+/// 65,536 px leave some pixels unreachable; those take the nearest one.
 pub fn desktop_pixel_to_abs(x: i32, y: i32, screen: VirtualScreen) -> (u16, u16) {
     let clamp_span = |value: i32, origin: i32, span: u32| -> u16 {
         let span = i64::from(span.max(1));
         let rel = (i64::from(value) - i64::from(origin)).clamp(0, span - 1);
-        ((2 * rel + 1) * 65_536 / (2 * span)).min(65_535) as u16
+        let ceil_div = |n: i64| (n + span - 1) / span;
+        let first = ceil_div(rel * 65_536);
+        let last = (ceil_div((rel + 1) * 65_536) - 1).max(first);
+        let centre = (2 * rel + 1) * 65_536 / (2 * span);
+        centre.clamp(first, last).min(65_535) as u16
     };
     (
         clamp_span(x, screen.left, screen.width),
@@ -173,18 +187,6 @@ pub fn pen_to_mouse(sample: PenSample, screen: VirtualScreen) -> Vec<Injection> 
             vec![Injection::MoveAbs { x, y }, Injection::LeftUp { x, y }]
         }
         PenPhase::Leave => Vec::new(),
-    }
-}
-
-/// Windows cancels every synthetic contact after a rejected injection or a
-/// display mode change, and then rejects updates to it. Start the contact
-/// or hover again from the next sample instead of losing the rest of the
-/// stroke; an end of contact has nothing left to end.
-pub fn resume_pen_phase(phase: PenPhase) -> Option<PenPhase> {
-    match phase {
-        PenPhase::Down | PenPhase::Move => Some(PenPhase::Down),
-        PenPhase::Hover => Some(PenPhase::Hover),
-        PenPhase::Up | PenPhase::Cancel | PenPhase::Leave => None,
     }
 }
 
@@ -398,6 +400,11 @@ pub struct InputRelay {
     held: HeldInputs,
     pen_sequence: Option<u32>,
     last_pen_input: Option<std::time::Instant>,
+    /// Normalised source of the held pen sample, so a refresh can remap it
+    /// when the captured display moves or changes mode under a still Pencil.
+    pen_norm: Option<(u16, u16)>,
+    /// The capture rect the last batch was mapped onto.
+    output: Option<CaptureGeometry>,
     logged_mapping: Option<InputMapping>,
     #[cfg(windows)]
     pen_device: windows_inject::PenDevice,
@@ -500,7 +507,7 @@ impl InputRelay {
         #[cfg(windows)]
         {
             if self.pen_device.available() {
-                windows_inject::inject(injections, &mut self.pen_device);
+                windows_inject::inject(injections, &mut self.pen_device, self.output);
             } else {
                 let screen = windows_inject::virtual_screen();
                 let mouse: Vec<_> = injections
@@ -510,7 +517,7 @@ impl InputRelay {
                         other => vec![other],
                     })
                     .collect();
-                windows_inject::inject(&mouse, &mut self.pen_device);
+                windows_inject::inject(&mouse, &mut self.pen_device, self.output);
             }
         }
         #[cfg(not(windows))]
@@ -527,6 +534,7 @@ impl InputRelay {
         self.session = None;
         self.pen_sequence = None;
         self.last_pen_input = None;
+        self.pen_norm = None;
         self.logged_mapping = None;
     }
 
@@ -567,13 +575,29 @@ impl InputRelay {
 
     /// Windows expires stationary synthetic contacts unless they are refreshed.
     /// Real samples always win; never keep a released or disconnected tip down.
-    pub fn keep_pen_alive(&mut self) {
-        if let Some(refresh) = self.pen_refresh(std::time::Instant::now()) {
+    /// `output` is the current capture rect: a held contact follows it if the
+    /// display moved or changed mode since the Pencil last moved.
+    pub fn keep_pen_alive(&mut self, output: Option<CaptureGeometry>) {
+        #[cfg(windows)]
+        self.pen_device.flush(output.or(self.output));
+        let Some(output) = output else {
+            return;
+        };
+        if let Some(refresh) = self.pen_refresh(std::time::Instant::now(), output) {
+            let screen = current_virtual_screen(output);
+            if let Some((session_id, _)) = self.session {
+                self.log_mapping(session_id, output, screen);
+            }
+            self.output = Some(output);
             self.inject(&[refresh]);
         }
     }
 
-    fn pen_refresh(&mut self, now: std::time::Instant) -> Option<Injection> {
+    fn pen_refresh(
+        &mut self,
+        now: std::time::Instant,
+        output: CaptureGeometry,
+    ) -> Option<Injection> {
         let last = self.last_pen_input?;
         if now.saturating_duration_since(last) < std::time::Duration::from_millis(50) {
             return None;
@@ -584,6 +608,10 @@ impl InputRelay {
             PenPhase::Hover => PenPhase::Hover,
             _ => return None,
         };
+        if let Some((x_norm, y_norm)) = self.pen_norm {
+            (sample.x, sample.y) = norm_to_output_pixel(x_norm, y_norm, output);
+        }
+        self.held.record(&[Injection::Pen(sample)]);
         self.last_pen_input = Some(now);
         Some(Injection::Pen(sample))
     }
@@ -617,6 +645,7 @@ impl InputRelay {
         }
         let screen = current_virtual_screen(output);
         self.log_mapping(session_id, output, screen);
+        self.output = Some(output);
         let mut injections = resolve(event, output, screen);
         if let Some(Injection::Pen(sample)) = injections.first().copied() {
             let held = self
@@ -670,6 +699,7 @@ impl InputRelay {
         self.held.record(&injections);
         if event.kind == KIND_PENCIL {
             self.last_pen_input = Some(std::time::Instant::now());
+            self.pen_norm = self.held.pen.map(|_| (event.x_norm, event.y_norm));
         }
         self.inject(&injections);
     }
@@ -957,10 +987,10 @@ mod tests {
         relay.relay(10, &pen, OUTPUT);
         let now = relay.last_pen_input.unwrap();
         assert!(relay
-            .pen_refresh(now + std::time::Duration::from_millis(49))
+            .pen_refresh(now + std::time::Duration::from_millis(49), OUTPUT)
             .is_none());
         assert!(matches!(
-            relay.pen_refresh(now + std::time::Duration::from_millis(50)),
+            relay.pen_refresh(now + std::time::Duration::from_millis(50), OUTPUT),
             Some(Injection::Pen(PenSample {
                 phase: PenPhase::Move,
                 ..
@@ -985,7 +1015,7 @@ mod tests {
             ]
         ));
         assert!(relay
-            .pen_refresh(now + std::time::Duration::from_secs(1))
+            .pen_refresh(now + std::time::Duration::from_secs(1), OUTPUT)
             .is_none());
         relay.reset();
         assert!(recorder::take().is_empty());
@@ -1355,13 +1385,147 @@ mod tests {
     }
 
     #[test]
-    fn a_cancelled_contact_resumes_at_the_next_sample() {
-        assert_eq!(resume_pen_phase(PenPhase::Move), Some(PenPhase::Down));
-        assert_eq!(resume_pen_phase(PenPhase::Down), Some(PenPhase::Down));
-        assert_eq!(resume_pen_phase(PenPhase::Hover), Some(PenPhase::Hover));
-        for phase in [PenPhase::Up, PenPhase::Cancel, PenPhase::Leave] {
-            assert_eq!(resume_pen_phase(phase), None);
+    fn abs_round_trip_is_exact_on_every_representable_desktop_width() {
+        // Exhaustive over each width, against the truncating landing model
+        // documented on desktop_pixel_to_abs, with negative origins.
+        let centre_only = |rel: i64, span: i64| ((2 * rel + 1) * 65_536 / (2 * span)).min(65_535);
+        for (span, origin) in [
+            (1u32, 0),
+            (2, -1),
+            (1920, 0),
+            (3640, -1080),
+            (8092, -2732),
+            (32_767, -100),
+            (32_768, -16_384),
+            (32_769, 0),
+            (38_400, -15_360),
+            (60_000, -30_000),
+            (65_535, -1),
+            (65_536, -32_768),
+        ] {
+            let screen = VirtualScreen {
+                left: origin,
+                top: origin,
+                width: span,
+                height: span,
+            };
+            let mut centre_misses = 0;
+            for rel in 0..i64::from(span) {
+                let pixel = origin + rel as i32;
+                let abs = desktop_pixel_to_abs(pixel, pixel, screen);
+                assert_eq!(
+                    windows_mouse_landing(abs, screen),
+                    (pixel, pixel),
+                    "span {span} origin {origin} pixel {pixel}"
+                );
+                let old = centre_only(rel, i64::from(span)) as u16;
+                if windows_mouse_landing((old, old), screen).0 != pixel {
+                    centre_misses += 1;
+                }
+            }
+            if span == 38_400 {
+                // The reviewer's case: pixel -15357 used to land on -15358.
+                assert_eq!(centre_misses, 5_120);
+                let abs = desktop_pixel_to_abs(-15_357, 0, screen);
+                assert_eq!(windows_mouse_landing(abs, screen).0, -15_357);
+            }
         }
+        // Wider than 65,536 px: some pixels cannot be addressed; never more
+        // than one pixel off, and still monotonic.
+        let screen = VirtualScreen {
+            left: -40_000,
+            top: 0,
+            width: 80_000,
+            height: 1,
+        };
+        let mut previous = i32::MIN;
+        for pixel in -40_000..40_000 {
+            let landed = windows_mouse_landing(desktop_pixel_to_abs(pixel, 0, screen), screen).0;
+            assert!((landed - pixel).abs() <= 1, "pixel {pixel} landed {landed}");
+            assert!(landed >= previous);
+            previous = landed;
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn keepalive_remaps_a_still_pencil_when_the_capture_rect_moves() {
+        // The reviewer's case: a 2360x1640 output moves from left=2560 to
+        // left=-2360 while the Pencil is held still.
+        let before = rect(2560, 0, 2360, 1640);
+        let after = rect(-2360, 0, 2360, 1640);
+        let mut relay = InputRelay::default();
+        let mut e = event(KIND_PENCIL, PHASE_BEGAN, 32_768, 32_768);
+        e.input_ver = 2;
+        e.pressure_x1000 = 500;
+        relay.relay(1, &e, before);
+        let [Injection::Pen(down)] = recorder::take()[..] else {
+            panic!("expected one pen down")
+        };
+        assert_eq!((down.x, down.y), (3739, 819));
+        // Stationary: only the refresh tick runs. It must follow the display
+        // and log the new geometry without any input event.
+        relay.last_pen_input =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_millis(60));
+        relay.keep_pen_alive(Some(after));
+        assert_eq!(
+            recorder::take(),
+            [Injection::Pen(PenSample {
+                phase: PenPhase::Move,
+                x: -1181,
+                y: 819,
+                ..down
+            })]
+        );
+        assert_eq!(relay.logged_mapping.unwrap().output, after);
+        // A disconnect now releases where the contact actually is.
+        relay.reset();
+        assert!(matches!(
+            recorder::take().as_slice(),
+            [Injection::Pen(PenSample {
+                phase: PenPhase::Cancel,
+                x: -1181,
+                y: 819,
+                ..
+            })]
+        ));
+        // Without geometry the refresh does nothing rather than guess.
+        let mut relay = InputRelay::default();
+        relay.relay(2, &e, before);
+        recorder::take();
+        relay.last_pen_input =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_millis(60));
+        relay.keep_pen_alive(None);
+        assert!(recorder::take().is_empty());
+        relay.reset();
+        recorder::take();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_moved_pencil_after_a_remap_lifts_where_it_is() {
+        let before = rect(0, 0, 1920, 1080);
+        let after = rect(-1920, 0, 1920, 1080);
+        let mut relay = InputRelay::default();
+        let mut e = event(KIND_PENCIL, PHASE_BEGAN, 0, 0);
+        e.input_ver = 2;
+        e.event_id = 1;
+        relay.relay(1, &e, before);
+        relay.last_pen_input =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_millis(60));
+        relay.keep_pen_alive(Some(after));
+        recorder::take();
+        e.event_id = 2;
+        e.phase = PHASE_ENDED;
+        relay.relay(1, &e, after);
+        let phases: Vec<_> = recorder::take()
+            .into_iter()
+            .map(|i| match i {
+                Injection::Pen(p) => (p.phase, p.x, p.y),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(phases, [(PenPhase::Up, -1920, 0)]);
     }
 
     #[cfg(not(windows))]
