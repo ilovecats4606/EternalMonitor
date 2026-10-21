@@ -31,6 +31,8 @@ pub struct AudioPacket {
 }
 
 pub const QUEUE_CAPACITY: usize = 3;
+/// The sender drops a packet captured longer ago than this.
+pub const SEND_DEADLINE_US: u64 = 100_000;
 
 pub struct SessionPacket {
     pub session_id: u32,

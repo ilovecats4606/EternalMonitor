@@ -20,6 +20,13 @@ bytes, speech VAD, or undocumented FFmpeg internals are used. This is
 silence compression, rather than libopus DTX: the host still sends 50 small
 packets per second while the input remains silent.
 
+A session's audio starts at its first capture read. WASAPI buffers from
+`Start()` while the session opens its encoder, and an idle engine's first
+read is silence reaching back to `Start()`. Whole 20 ms frames that ended
+before the first read are discarded before encoding, so they take no
+sequence number. Sending them would put packets past the 100 ms send
+deadline, and the viewer would count each one as lost.
+
 The codec test decodes 4.2 seconds of a -12 dBFS 1 kHz signal, including two
 100 ms silence gaps. It verifies packet sequence/time, exact 960-sample
 decodes, sub-10-byte silence packets, the tone level before and after each

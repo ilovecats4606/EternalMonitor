@@ -16,6 +16,7 @@ use crate::supervisor::{generation_is_current, HealthReporter, Stage, StageOutco
 // never discard half a frame and shift the tone/silence boundaries.
 const SYNTHETIC_BLOCK_FRAMES: usize = super::FRAME_SAMPLES;
 const SYNTHETIC_BLOCK_US: u64 = SYNTHETIC_BLOCK_FRAMES as u64 * 1_000_000 / SAMPLE_RATE as u64;
+const FRAME_US: u64 = super::FRAME_SAMPLES as u64 * 1_000_000 / SAMPLE_RATE as u64;
 
 enum Source {
     Synthetic {
@@ -26,6 +27,8 @@ enum Source {
     },
     #[cfg(windows)]
     Wasapi(Box<super::wasapi::WasapiSource>),
+    #[cfg(test)]
+    Scripted(std::collections::VecDeque<PcmBlock>),
 }
 
 impl Source {
@@ -58,6 +61,8 @@ impl Source {
             Self::Synthetic { .. } => "Synthetic 1 kHz tone",
             #[cfg(windows)]
             Self::Wasapi(source) => source.name(),
+            #[cfg(test)]
+            Self::Scripted(_) => "Scripted test source",
         }
     }
 
@@ -89,6 +94,8 @@ impl Source {
             }
             #[cfg(windows)]
             Self::Wasapi(source) => source.read(),
+            #[cfg(test)]
+            Self::Scripted(blocks) => Ok(blocks.pop_front()),
         }
     }
 }
@@ -100,6 +107,7 @@ struct CaptureSession {
     encoder: OpusEncoder,
     mark_discontinuity: bool,
     next_input_us: Option<u64>,
+    started_us: Option<u64>,
 }
 
 impl CaptureSession {
@@ -111,6 +119,7 @@ impl CaptureSession {
             encoder: OpusEncoder::new(576 - eternal_wire::v2::audio::AUDIO_HEADER_SIZE)?,
             mark_discontinuity: true,
             next_input_us: None,
+            started_us: None,
         })
     }
 
@@ -120,7 +129,7 @@ impl CaptureSession {
         shared: &SharedControl,
         generation: u64,
     ) -> AudioResult<bool> {
-        let Some(block) = self.source.read()? else {
+        let Some(block) = self.read()? else {
             return Ok(true);
         };
         if !generation_is_current(generation) || !shared.running.load(Ordering::SeqCst) {
@@ -129,6 +138,16 @@ impl CaptureSession {
         if wanted_session(shared) != Some(self.id) {
             return Ok(true);
         }
+        self.send(block, tx)
+    }
+
+    fn read(&mut self) -> AudioResult<Option<PcmBlock>> {
+        self.started_us
+            .get_or_insert_with(crate::clock::host_now_us);
+        self.source.read()
+    }
+
+    fn send(&mut self, block: PcmBlock, tx: &Sender<SessionPacket>) -> AudioResult<bool> {
         let gap = self
             .next_input_us
             .is_some_and(|expected| block.capture_ts_us.abs_diff(expected) > 100_000);
@@ -153,7 +172,17 @@ impl CaptureSession {
             stats.audio.device = self.source.name().into();
             stats.audio.status = "Streaming".into();
         }
+        let started_us = self.started_us.unwrap_or(0);
         for frame in self.resampler.as_mut().unwrap().push(&block)? {
+            // WASAPI buffers from Start() while the session opens its encoder,
+            // and an idle engine's first read is silence back to Start().
+            // Frames that ended before the first read predate the session and
+            // are already near the sender's deadline; numbering them would
+            // turn each late one into a gap for the viewer. Whole frames keep
+            // the Opus frame grid where the source put it.
+            if frame.capture_ts_us + FRAME_US <= started_us {
+                continue;
+            }
             let mut packet = self.encoder.encode(&frame.samples, frame.capture_ts_us)?;
             packet.discontinuity |= self.mark_discontinuity;
             match tx.try_send(SessionPacket {
@@ -311,5 +340,150 @@ mod tests {
             quiet, 5,
             "100 ms silence must retain five complete Opus frames"
         );
+    }
+
+    #[test]
+    fn loopback_backlog_from_before_the_session_is_not_sent_stale() {
+        ffmpeg_next::init().unwrap();
+        // WASAPI buffers from Start() while the session opens its encoder. A
+        // 0.3.1 host on an i7-5500U took 105 ms, and its first six packets
+        // missed the sender's deadline. Those packets carried sequence
+        // numbers, so the iPad counted each one as lost.
+        // The host clock counts from process start; leave room for a backlog.
+        while crate::clock::host_now_us() < 200_000 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut tone = SyntheticSource::default();
+        let mut block = |capture_ts_us: u64, frames: usize| PcmBlock {
+            format: PcmFormat::STEREO_48K,
+            samples: tone
+                .read(frames)
+                .into_iter()
+                .flat_map(|(l, r)| [l, r])
+                .collect(),
+            capture_ts_us,
+            discontinuity: false,
+        };
+        let start = crate::clock::host_now_us();
+        let cases = [
+            // Sixteen 10 ms engine periods published before the first read.
+            (
+                "packet backlog",
+                (0..36u64)
+                    .map(|index| block(start - 160_000 + index * 10_000, 480))
+                    .collect::<std::collections::VecDeque<_>>(),
+            ),
+            // An idle engine: the first read fills 100 ms since Start() with
+            // silence, most of it from before the session.
+            (
+                "idle silence",
+                std::iter::once(block(start - 95_000, 4800))
+                    .chain((0..20u64).map(|index| block(start + 5_000 + index * 10_000, 480)))
+                    .collect(),
+            ),
+        ];
+        let mut unstarted = CaptureSession {
+            id: 1,
+            source: Source::Scripted(Default::default()),
+            resampler: None,
+            encoder: OpusEncoder::new(1000).unwrap(),
+            mark_discontinuity: true,
+            next_input_us: None,
+            started_us: None,
+        };
+        assert!(unstarted.read().unwrap().is_none());
+        assert!(unstarted.started_us.is_some_and(|at| at >= start));
+        for (name, blocks) in cases {
+            let reads = blocks.len();
+            let mut session = CaptureSession {
+                id: 1,
+                source: Source::Scripted(blocks),
+                resampler: None,
+                encoder: OpusEncoder::new(1000).unwrap(),
+                mark_discontinuity: true,
+                next_input_us: None,
+                started_us: Some(start),
+            };
+            let (tx, mut rx) = tokio::sync::mpsc::channel(super::super::QUEUE_CAPACITY);
+            let mut sent = Vec::new();
+            for _ in 0..reads {
+                if let Some(block) = session.read().unwrap() {
+                    assert!(session.send(block, &tx).unwrap());
+                }
+                while let Ok(queued) = rx.try_recv() {
+                    let age =
+                        crate::clock::host_now_us().saturating_sub(queued.packet.capture_ts_us);
+                    sent.push((queued.packet, age));
+                }
+            }
+            assert!(sent.len() >= 8, "{name}: live audio was not sent");
+            let stale: Vec<_> = sent
+                .iter()
+                .filter(|(_, age)| *age > super::super::SEND_DEADLINE_US)
+                .map(|(packet, age)| (packet.seq, *age))
+                .collect();
+            assert!(
+                stale.is_empty(),
+                "{name}: packets past the send deadline: {stale:?}"
+            );
+            let (first, _) = &sent[0];
+            assert_eq!((first.seq, first.discontinuity), (0, true), "{name}");
+            assert!(
+                first.capture_ts_us + FRAME_US > start,
+                "{name}: the first packet replays audio captured {} us before the session",
+                start - first.capture_ts_us
+            );
+        }
+    }
+
+    /// Native check of the same startup path with the PC's real loopback.
+    /// The delay stands in for the encoder open that follows WASAPI Start().
+    /// Inaudible: it only reads the mix. Something must be rendering (even
+    /// silence) for WASAPI to publish packets instead of the idle fallback.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "opens the default output for loopback; run natively"]
+    fn wasapi_startup_backlog_probe() {
+        ffmpeg_next::init().unwrap();
+        let delays = std::env::var("EM_PROBE_DELAYS_MS").unwrap_or_else(|_| "0,50,105,200".into());
+        let trials: usize =
+            std::env::var("EM_PROBE_TRIALS").map_or(5, |value| value.parse().unwrap());
+        let mut late_starts = 0;
+        for delay in delays.split(',').map(|value| value.parse::<u64>().unwrap()) {
+            for trial in 0..trials {
+                let source =
+                    Source::Wasapi(Box::new(super::super::wasapi::WasapiSource::new().unwrap()));
+                std::thread::sleep(Duration::from_millis(delay));
+                let mut session = CaptureSession {
+                    id: 1,
+                    source,
+                    resampler: None,
+                    encoder: OpusEncoder::new(1000).unwrap(),
+                    mark_discontinuity: true,
+                    next_input_us: None,
+                    started_us: None,
+                };
+                let (tx, mut rx) = tokio::sync::mpsc::channel(super::super::QUEUE_CAPACITY);
+                let (mut sent, mut stale, mut first_age, mut blocks) = (0, 0, None, 0);
+                let until = Instant::now() + Duration::from_secs(1);
+                while Instant::now() < until {
+                    if let Some(block) = session.read().unwrap() {
+                        blocks += 1;
+                        session.send(block, &tx).unwrap();
+                    }
+                    while let Ok(queued) = rx.try_recv() {
+                        let age =
+                            crate::clock::host_now_us().saturating_sub(queued.packet.capture_ts_us);
+                        first_age.get_or_insert(age);
+                        sent += 1;
+                        stale += usize::from(age > super::super::SEND_DEADLINE_US);
+                    }
+                }
+                println!("PROBE delay_ms={delay} trial={trial} blocks={blocks} sent={sent} stale={stale} first_age_us={}", first_age.unwrap_or(0));
+                late_starts += usize::from(stale > 0);
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+        assert_eq!(late_starts, 0, "starts that sent audio past the deadline");
     }
 }

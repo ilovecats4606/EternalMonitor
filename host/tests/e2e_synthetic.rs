@@ -592,6 +592,92 @@ fn audio_stream_end_to_end() {
     }
 }
 
+/// Native first-second audio measurement across repeated connects with the
+/// PC's real WASAPI loopback (inaudible: it only reads the mix).
+#[cfg(windows)]
+#[test]
+#[ignore = "opens the default output for loopback; run natively"]
+fn wasapi_connect_first_second_audio() {
+    use eternal_wire::v2::audio::AudioHeader;
+    use eternal_wire::v2::control::FEATURE_WANTS_AUDIO;
+    use std::sync::atomic::Ordering;
+    let _guard = ENV_LOCK.lock().unwrap();
+    init_test_tracing();
+    ffmpeg_next::init().unwrap();
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::remove_var("ETERNAL_AUDIO");
+    std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
+    for name in ["ETERNAL_DROP", "ETERNAL_REORDER", "ETERNAL_JITTER_MS"] {
+        std::env::remove_var(name);
+    }
+    let connects: usize = std::env::var("EM_CONNECTS").map_or(8, |value| value.parse().unwrap());
+    let listen_port = free_udp_port();
+    let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
+    *shared.encoder_override.lock() = Some("libx264".into());
+    let (supervisor_tx, supervisor_rx) = mpsc::channel();
+    let supervisor_shared = shared.clone();
+    let supervisor_sender = supervisor_tx.clone();
+    let supervisor = std::thread::spawn(move || {
+        eternal_host::supervisor::run(
+            listen_port,
+            supervisor_shared,
+            GpuInfo::software_fallback(),
+            supervisor_sender,
+            supervisor_rx,
+        )
+    });
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut buffer = [0; 2048];
+        for connect in 0..connects {
+            let mut receiver =
+                FakeReceiver::connect_full(listen_port, CAP_DECODE_H264, FEATURE_WANTS_AUDIO);
+            let (mut packets, mut gaps, mut first) = (0, 0, None);
+            let mut previous: Option<u32> = None;
+            let until = Instant::now() + Duration::from_millis(1500);
+            while Instant::now() < until {
+                receiver.maybe_report(0, 0);
+                let Ok((len, _)) = receiver.socket.recv_from(&mut buffer) else {
+                    continue;
+                };
+                if !matches!(classify(&buffer[..len]), Classified::Audio { .. }) {
+                    continue;
+                }
+                let (header, _) = AudioHeader::decode(&buffer[..len]).unwrap();
+                first.get_or_insert((
+                    header.audio_seq,
+                    eternal_host::clock::host_now_us().saturating_sub(header.capture_ts_us),
+                ));
+                if let Some(previous) = previous {
+                    gaps += header.audio_seq.wrapping_sub(previous).saturating_sub(1);
+                }
+                previous = Some(header.audio_seq);
+                packets += 1;
+            }
+            let stats = eternal_host::stats::PIPELINE_STATS.lock().audio.clone();
+            let (first_seq, first_age_us) = first.unwrap_or((u32::MAX, 0));
+            println!(
+                "CONNECT {connect} packets={packets} first_seq={first_seq} first_age_us={first_age_us} gaps={gaps} dropped={} stale={} queue_full={} send_failed={} device={}",
+                stats.dropped, stats.stale_dropped, stats.capture_queue_dropped, stats.send_failed, stats.device
+            );
+            receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+            drop(receiver);
+            assert_eq!(
+                (first_seq, gaps, stats.dropped),
+                (0, 0, 0),
+                "connect {connect}"
+            );
+            std::thread::sleep(Duration::from_millis(700));
+        }
+    }));
+    shared.audio_enabled.store(false, Ordering::SeqCst);
+    let _ = supervisor_tx.send(SupervisorCommand::Shutdown);
+    supervisor.join().unwrap();
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 #[test]
 fn synthetic_stream_end_to_end_v2() {
     let _guard = ENV_LOCK.lock().unwrap();

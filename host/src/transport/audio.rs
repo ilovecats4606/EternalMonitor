@@ -34,7 +34,7 @@ impl AudioSender {
             }
             session.peer()?
         };
-        if now_us.saturating_sub(queued.packet.capture_ts_us) > 100_000 {
+        if now_us.saturating_sub(queued.packet.capture_ts_us) > crate::audio::SEND_DEADLINE_US {
             self.reset_pending = true;
             let mut stats = PIPELINE_STATS.lock();
             stats.audio.dropped += 1;
