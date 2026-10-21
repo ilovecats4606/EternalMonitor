@@ -11,7 +11,7 @@ pub mod usbmuxd;
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
@@ -43,8 +43,7 @@ static STREAM_EPOCH_COUNTER: AtomicU32 = AtomicU32::new(0);
 struct SharedConfigSource<'a> {
     shared: &'a SharedControl,
     stream_epoch: u32,
-    /// Whether native pen input works, as of the last HELLO.
-    pen_available: AtomicBool,
+    pen_available: bool,
 }
 
 impl ConfigSource for SharedConfigSource<'_> {
@@ -84,7 +83,7 @@ impl ConfigSource for SharedConfigSource<'_> {
             0
         };
         eternal_wire::v2::control::HOSTCAP_KEYBOARD
-            | if self.pen_available.load(Ordering::SeqCst) {
+            | if self.pen_available {
                 eternal_wire::v2::control::HOSTCAP_PEN
             } else {
                 0
@@ -170,7 +169,7 @@ pub async fn start_sender(
     let config = SharedConfigSource {
         shared: &shared,
         stream_epoch,
-        pen_available: AtomicBool::new(input_relay.pen_available()),
+        pen_available: input_relay.pen_available(),
     };
 
     let abr_enabled = !std::env::var("ETERNAL_ABR").is_ok_and(|v| v.trim() == "0");
@@ -267,9 +266,6 @@ pub async fn start_sender(
                                             eternal_wire::v2::control::ControlMessage::Nack(nack) => Some(nack.frag_count),
                                             _ => None,
                                         };
-                                        if matches!(message, eternal_wire::v2::control::ControlMessage::Hello2(_)) {
-                                            advertise_pen(&config, &mut input_relay);
-                                        }
                                         let mut actions = shared.session.lock().handle_control(
                                             src,
                                             header.session_id,
@@ -489,16 +485,6 @@ pub async fn start_sender(
 
 type DeferredControl = VecDeque<LinkEvent>;
 
-/// A HELLO may start a session: offer native pen input as it is now, after
-/// asking again for a device Windows refused. HELLO_ACK is the only message
-/// that carries host caps, so a running session keeps the ones it got.
-fn advertise_pen(config: &SharedConfigSource, input_relay: &mut crate::input::InputRelay) {
-    input_relay.revive_pen();
-    config
-        .pen_available
-        .store(input_relay.pen_available(), Ordering::SeqCst);
-}
-
 async fn receive_control(
     links: &mut TransportLinks,
     deferred: &mut DeferredControl,
@@ -670,7 +656,7 @@ mod tests {
         let config = SharedConfigSource {
             shared: &shared,
             stream_epoch: 1,
-            pen_available: AtomicBool::new(false),
+            pen_available: false,
         };
         let hello = ControlMessage::Hello2(Hello2 {
             proto_min: 2,
@@ -720,7 +706,7 @@ mod tests {
             let config = SharedConfigSource {
                 shared: &shared,
                 stream_epoch: 1,
-                pen_available: AtomicBool::new(false),
+                pen_available: false,
             };
             let mut deferred = DeferredControl::new();
             repair_while_pacing(
@@ -780,58 +766,5 @@ mod tests {
             assert_eq!(source, PeerId::udp(peer));
             assert_eq!(parse_control(&bytes).unwrap().1, expected);
         }
-    }
-
-    #[test]
-    fn each_session_is_offered_the_pen_as_it_is_when_it_starts() {
-        let shared = SharedControl::new(0, 15_000_000);
-        shared.pairing.lock().required = false;
-        // Pen available when the transport started.
-        let config = SharedConfigSource {
-            shared: &shared,
-            stream_epoch: 1,
-            pen_available: AtomicBool::new(true),
-        };
-        let peer = PeerId::udp("127.0.0.1:40000".parse().unwrap());
-        let offered_pen = |nonce| {
-            let hello = ControlMessage::Hello2(Hello2 {
-                proto_min: 2,
-                proto_max: 2,
-                client_nonce: nonce,
-                listen_port: 40000,
-                decoder_caps: CAP_DECODE_H264,
-                feature_caps: FEATURE_SUPPORTS_NACK,
-                screen_px_w: 1920,
-                screen_px_h: 1080,
-                screen_pt_w: 960,
-                screen_pt_h: 540,
-                refresh_hz: 60,
-                device_name: "pen caps test".into(),
-                device_id: 7,
-                preferred_fps: 0,
-                auth_token: [0; 16],
-                pairing_code: 0,
-            });
-            let actions =
-                shared
-                    .session
-                    .lock()
-                    .handle_control(peer, 0, hello, &config, Instant::now());
-            let Ok((_, ControlMessage::HelloAck(ack))) = parse_control(&actions.replies[0].1)
-            else {
-                panic!("expected a HELLO_ACK");
-            };
-            ack.host_caps & eternal_wire::v2::control::HOSTCAP_PEN != 0
-        };
-        assert!(offered_pen(1));
-        // The next HELLO reads the relay again, and the new session is offered
-        // what it reports then. Off Windows the relay has no native pen, like
-        // one whose device Windows refused to recreate.
-        let mut relay = crate::input::InputRelay::default();
-        advertise_pen(&config, &mut relay);
-        assert_eq!(offered_pen(2), relay.pen_available());
-        // Once the device is back, the next session is offered it again.
-        config.pen_available.store(true, Ordering::SeqCst);
-        assert!(offered_pen(3));
     }
 }

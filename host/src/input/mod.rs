@@ -541,13 +541,10 @@ impl InputRelay {
     }
 
     /// A session is starting: ask again for a pen device Windows refused, so
-    /// the session can be offered native pen input if it is back. Not while
-    /// a Pencil stroke or hover is in progress on the mouse fallback.
+    /// the session can be offered native pen input if it is back.
     pub fn revive_pen(&mut self) {
         #[cfg(windows)]
-        if self.held.pen.is_none() {
-            self.pen_device.revive(std::time::Instant::now());
-        }
+        self.pen_device.revive(std::time::Instant::now());
     }
 
     /// Release keys/buttons when a session ends, expires, or is superseded.
