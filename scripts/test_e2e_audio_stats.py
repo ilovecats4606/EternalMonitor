@@ -123,15 +123,34 @@ class AudioMeasurementTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '1 audio packets lost after'):
             measure(app, own, 'record')
         # A replacement stream after the app log froze, with a startup drop at
-        # sequence 10, must not cover it, whatever its epoch.
-        for replacement, message in ((host(stale=1, late='10', stream=2, wire='7/4'), '1 audio packets lost after'),
-                                     (host(stale=1, late='10', stream=2, wire='7/3'), 'restarted audio numbering')):
-            with self.subTest(replacement=replacement), self.assertRaisesRegex(ValueError, message):
-                measure(app, own + replacement, 'record')
+        # sequence 10, must not cover it. Under a new epoch it is ignored;
+        # under the same epoch nothing is attributed and the loss counts
+        # against the original limit of two.
+        with self.assertRaisesRegex(ValueError, '1 audio packets lost after'):
+            measure(app, own + host(stale=1, late='10', stream=2, wire='7/4'), 'record')
+        result = measure(app, own + host(stale=1, late='10', stream=2, wire='7/3'), 'record')
+        self.assertNotIn('audio_host_late', result)
+        self.assertRegex(result['audio_notes'][0], 'not attributed')
         with self.assertRaisesRegex(ValueError, 'no audio stats for session 7 epoch 3'):
             measure(app, host(stale=1, late='10', wire='8/3'), 'record')
         with self.assertRaisesRegex(ValueError, 'more than one wire stream'):
             measure(app, host(stale=1, late='10', wire='mixed') + own, 'record')
+
+    def test_a_clean_capture_restart_outside_the_measurement_passes(self):
+        # Sol's case: an audio off/on toggle after the app log froze gives two
+        # loss-free captures under the iPad's session and epoch.
+        app = sample(200, first=0) + sample(400, first=0)
+        result = measure(app, host(late='none') + host(late='none', stream=2), 'enforce')
+        self.assertEqual(result['audio_lost'], 0)
+        self.assertRegex(result['audio_notes'][0], 'not attributed')
+
+    def test_ambiguous_captures_never_get_the_waiver(self):
+        captures = host(stale=3, late='5-7') + host(late='none', stream=2)
+        with self.assertRaisesRegex(ValueError, 'audio packet loss 3 exceeds 2'):
+            measure(sample(400, lost=3, first=0) * 2, captures, 'record')
+        # Unattributed packets before the iPad's first one count as lost.
+        with self.assertRaisesRegex(ValueError, 'audio packet loss 100 exceeds 2'):
+            measure(sample(400, first=100, after=500) * 2, captures, 'record')
 
     def test_sequence_wrap_fails_closed(self):
         with self.assertRaisesRegex(ValueError, 'malformed host sequence range'):

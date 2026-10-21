@@ -68,15 +68,16 @@ def host_drops(text):
     return host_stats(text)[-1]
 
 
+def captures(host, session, epoch):
+    """Host capture streams that numbered packets under this wire stream."""
+    return {line['stream'] for line in host if line.get('wire') == f'{session}/{epoch}'}
+
+
 def stream_stats(host, session, epoch, errors):
     """The last stats of the one host stream numbered under this wire stream."""
-    wire = f'{session}/{epoch}'
-    streams = {line['stream'] for line in host if line.get('wire') == wire}
+    streams = captures(host, session, epoch)
     if not streams:
         errors.append(f'host logged no audio stats for session {session} epoch {epoch}')
-        return None
-    if len(streams) > 1:
-        errors.append(f'host restarted audio numbering within session {session} epoch {epoch}')
         return None
     stream = streams.pop()
     if any(line.get('wire') == 'mixed' for line in host if line.get('stream') == stream):
@@ -159,15 +160,26 @@ def measure(text, host_text=None, scheduling_gate='enforce'):
         errors.append('audio loss counter reset during the measurement')
     host = host_stats(host_text) if host_text is not None else None
     attributed = None
-    if host is not None and any('stream' in line for line in host) and 'session_id' in last and not errors:
+    identified = host is not None and any('stream' in line for line in host) and 'session_id' in last
+    restarted = identified and len(captures(host, int(last['session_id']), int(last['epoch']))) > 1
+    if identified and not restarted and not errors:
         # The iPad counts every sequence gap as lost, including packets the
         # host discarded itself. Packets the host held past their 100 ms
         # deadline because its sender did not get the CPU measure the
         # machine, but only while the app launches.
         attributed = attribute(samples, host, scheduling_gate, errors, notes)
-    elif lost > 2:
-        # Without host and iPad sequence numbers no loss can be attributed.
-        errors.append(f"audio packet loss {lost:.0f} exceeds 2")
+    else:
+        # Without one identified host stream no loss can be attributed, and
+        # no drop is waived. Host numbering starts at 0, so sequences before
+        # the iPad's first packet count as lost too.
+        if restarted:
+            # Several captures numbered under this session and epoch (audio
+            # was toggled), and nothing ties the frozen timeline to one.
+            notes.append(f"host restarted audio numbering within session {last['session_id']:.0f} "
+                         f"epoch {last['epoch']:.0f}; loss not attributed")
+        unattributed = lost + last.get('first_seq', 0)
+        if unattributed > 2:
+            errors.append(f"audio packet loss {unattributed:.0f} exceeds 2")
     # The source deliberately includes quiet intervals; require the tone in
     # at least two distinct rendered windows, not in a window of silence.
     tones = [sample for sample in samples if sample['tone1k_db'] > -20 and sample['rms'] > 0.05]
