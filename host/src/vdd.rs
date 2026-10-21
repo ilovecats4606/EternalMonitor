@@ -34,6 +34,16 @@ pub enum VddTaskHealth {
 #[cfg_attr(not(windows), allow(dead_code))] // Driver tasks exist only on Windows.
 const STUCK_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// Why a driver task is requested. The gate throttles the pipeline's own
+/// attempts; cleanup (at startup, at quit and after a panic) always tries
+/// when the display may be on, so a refused attempt never strands it.
+#[cfg_attr(not(windows), allow(dead_code))] // Driver tasks exist only on Windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    Attempt,
+    Cleanup,
+}
+
 #[cfg_attr(not(windows), allow(dead_code))] // Driver tasks exist only on Windows.
 #[derive(Debug, PartialEq, Eq)]
 enum Gate {
@@ -73,6 +83,9 @@ struct TaskGate {
     known_enabled: Option<bool>,
     health: VddTaskHealth,
     stuck_at: Option<Instant>,
+    /// An Enable task ran since the last completed Disable, so the display
+    /// may be on, even when that Enable timed out and is still running.
+    enable_ran: bool,
 }
 
 #[cfg_attr(not(windows), allow(dead_code))] // Driver tasks exist only on Windows.
@@ -82,12 +95,21 @@ impl TaskGate {
             known_enabled: None,
             health: VddTaskHealth::Ok,
             stuck_at: None,
+            enable_ran: false,
         }
     }
 
-    fn before(&self, enabled: bool, now: Instant) -> Gate {
+    fn before(&self, enabled: bool, purpose: Purpose, now: Instant) -> Gate {
         if self.known_enabled == Some(enabled) {
             return Gate::AlreadyDone;
+        }
+        if purpose == Purpose::Cleanup {
+            // Missing tasks only matter if no Enable could have run.
+            return if self.health == VddTaskHealth::TasksMissing && !self.enable_ran {
+                Gate::Refuse
+            } else {
+                Gate::Run
+            };
         }
         match self.health {
             VddTaskHealth::TasksMissing => Gate::Refuse,
@@ -104,6 +126,12 @@ impl TaskGate {
 
     fn after(&mut self, enabled: bool, outcome: TaskOutcome, now: Instant) {
         self.known_enabled = None;
+        if enabled && outcome != TaskOutcome::Missing {
+            self.enable_ran = true;
+        }
+        if !enabled && outcome == TaskOutcome::Done {
+            self.enable_ran = false;
+        }
         match outcome {
             TaskOutcome::Done => {
                 self.known_enabled = Some(enabled);
@@ -150,6 +178,7 @@ impl DriverTasks {
     fn set_enabled(
         &self,
         enabled: bool,
+        purpose: Purpose,
         mut progress: impl FnMut(),
         run: impl FnOnce(bool, &mut dyn FnMut()) -> TaskOutcome,
     ) -> bool {
@@ -162,7 +191,7 @@ impl DriverTasks {
         // The gate guard ends with this statement. Logging below reads the
         // health through the same mutex, which deadlocked when the guard
         // lived through the whole match.
-        let decision = self.gate.lock().before(enabled, Instant::now());
+        let decision = self.gate.lock().before(enabled, purpose, Instant::now());
         match decision {
             Gate::AlreadyDone => return true,
             Gate::Refuse => {
@@ -188,7 +217,19 @@ pub const TASK_DISABLE: &str = "EternalMonitor VDD Disable";
 fn run_task(task: &str, progress: &mut dyn FnMut()) -> TaskOutcome {
     use std::os::windows::process::CommandExt;
     let started = Instant::now();
-    let script = format!("& {{ {} }} -Task '{}'", include_str!("vdd_task.ps1"), task);
+    // An Enable that timed out here can still be running in Task Scheduler;
+    // each direction waits for the other first, so the last request wins.
+    let other = if task == TASK_ENABLE {
+        TASK_DISABLE
+    } else {
+        TASK_ENABLE
+    };
+    let script = format!(
+        "& {{ {} }} -Task '{}' -After '{}'",
+        include_str!("vdd_task.ps1"),
+        task,
+        other
+    );
     let mut command = Command::new("powershell.exe");
     command
         .args([
@@ -256,10 +297,15 @@ fn run_task(task: &str, progress: &mut dyn FnMut()) -> TaskOutcome {
 }
 
 /// Complete one installer-owned driver action while capture reports startup progress.
+#[cfg_attr(not(windows), allow(dead_code))] // Only Windows capture asks.
 pub(crate) fn set_enabled(enabled: bool, progress: impl FnMut()) -> bool {
+    request(enabled, Purpose::Attempt, progress)
+}
+
+fn request(enabled: bool, purpose: Purpose, progress: impl FnMut()) -> bool {
     #[cfg(windows)]
     {
-        TASKS.set_enabled(enabled, progress, |enabled, progress| {
+        TASKS.set_enabled(enabled, purpose, progress, |enabled, progress| {
             let mut outcome = TaskOutcome::Failed;
             crate::startup::display::change(enabled, || {
                 outcome = run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress);
@@ -270,14 +316,16 @@ pub(crate) fn set_enabled(enabled: bool, progress: impl FnMut()) -> bool {
     }
     #[cfg(not(windows))]
     {
-        let _ = (enabled, progress);
+        let _ = (enabled, purpose, progress);
         false
     }
 }
 
 /// Disable the virtual display device (best effort — failures are non-fatal).
+/// For startup, quit and panics: a hung or refused earlier task does not stop
+/// it, and it waits for an Enable still running, within the task's bounds.
 pub fn disable() {
-    set_enabled(false, || {});
+    request(false, Purpose::Cleanup, || {});
 }
 
 /// Disable the virtual display after `host` ended abnormally, if it owned the
@@ -303,13 +351,13 @@ mod tests {
         let mut gate = TaskGate::new();
         let now = Instant::now();
         // Unknown at launch: the first disable runs.
-        assert_eq!(gate.before(false, now), Gate::Run);
+        assert_eq!(gate.before(false, Purpose::Attempt, now), Gate::Run);
         gate.after(false, TaskOutcome::Done, now);
-        assert_eq!(gate.before(false, now), Gate::AlreadyDone);
-        assert_eq!(gate.before(true, now), Gate::Run);
+        assert_eq!(gate.before(false, Purpose::Attempt, now), Gate::AlreadyDone);
+        assert_eq!(gate.before(true, Purpose::Attempt, now), Gate::Run);
         gate.after(true, TaskOutcome::Done, now);
-        assert_eq!(gate.before(true, now), Gate::AlreadyDone);
-        assert_eq!(gate.before(false, now), Gate::Run);
+        assert_eq!(gate.before(true, Purpose::Attempt, now), Gate::AlreadyDone);
+        assert_eq!(gate.before(false, Purpose::Attempt, now), Gate::Run);
     }
 
     #[test]
@@ -319,14 +367,17 @@ mod tests {
         gate.after(true, TaskOutcome::TimedOut, now);
         assert_eq!(gate.health, VddTaskHealth::NotResponding);
         assert_eq!(
-            gate.before(true, now + Duration::from_secs(5)),
+            gate.before(true, Purpose::Attempt, now + Duration::from_secs(5)),
             Gate::Refuse
         );
         assert_eq!(
-            gate.before(false, now + Duration::from_secs(5)),
+            gate.before(false, Purpose::Attempt, now + Duration::from_secs(5)),
             Gate::Refuse
         );
-        assert_eq!(gate.before(true, now + STUCK_COOLDOWN), Gate::Run);
+        assert_eq!(
+            gate.before(true, Purpose::Attempt, now + STUCK_COOLDOWN),
+            Gate::Run
+        );
         gate.after(true, TaskOutcome::Done, now + STUCK_COOLDOWN);
         assert_eq!(gate.health, VddTaskHealth::Ok);
     }
@@ -338,9 +389,67 @@ mod tests {
         gate.after(false, TaskOutcome::Done, now);
         gate.after(true, TaskOutcome::Failed, now);
         // A failed task leaves the device state unknown, so disable runs again.
-        assert_eq!(gate.before(false, now), Gate::Run);
+        assert_eq!(gate.before(false, Purpose::Attempt, now), Gate::Run);
         gate.after(false, TaskOutcome::Missing, now);
-        assert_eq!(gate.before(true, now + STUCK_COOLDOWN * 10), Gate::Refuse);
+        assert_eq!(
+            gate.before(true, Purpose::Attempt, now + STUCK_COOLDOWN * 10),
+            Gate::Refuse
+        );
+    }
+
+    #[test]
+    fn quitting_inside_the_cooldown_after_an_enable_timed_out_still_disables() {
+        let tasks = DriverTasks::new();
+        // The Enable timed out here; Task Scheduler may still be running it.
+        assert!(!tasks.set_enabled(
+            true,
+            Purpose::Attempt,
+            || {},
+            |_, _| { TaskOutcome::TimedOut }
+        ));
+        // The pipeline's own requests stay throttled during the cooldown.
+        assert!(!tasks.set_enabled(
+            false,
+            Purpose::Attempt,
+            || {},
+            |_, _| { panic!("an attempt inside the cooldown must not run") }
+        ));
+        // The quit's Disable still runs.
+        let mut ran = Vec::new();
+        assert!(tasks.set_enabled(
+            false,
+            Purpose::Cleanup,
+            || {},
+            |enabled, _| {
+                ran.push(enabled);
+                TaskOutcome::Done
+            }
+        ));
+        assert_eq!(ran, [false]);
+        assert_eq!(tasks.gate.lock().known_enabled, Some(false));
+    }
+
+    #[test]
+    fn cleanup_skips_only_a_display_this_host_cannot_have_turned_on() {
+        let now = Instant::now();
+        // Off for certain: nothing to do.
+        let mut gate = TaskGate::new();
+        gate.after(false, TaskOutcome::Done, now);
+        assert_eq!(gate.before(false, Purpose::Cleanup, now), Gate::AlreadyDone);
+        // The tasks were missing from the start: no Enable ever ran.
+        let mut gate = TaskGate::new();
+        gate.after(false, TaskOutcome::Missing, now);
+        assert_eq!(gate.before(false, Purpose::Cleanup, now), Gate::Refuse);
+        // An Enable ran before the tasks went missing: try anyway.
+        let mut gate = TaskGate::new();
+        gate.after(true, TaskOutcome::Done, now);
+        gate.after(false, TaskOutcome::Missing, now);
+        assert_eq!(gate.before(false, Purpose::Cleanup, now), Gate::Run);
+        // A failed Disable leaves the state unknown, so quit tries again.
+        let mut gate = TaskGate::new();
+        gate.after(true, TaskOutcome::Done, now);
+        gate.after(false, TaskOutcome::Failed, now);
+        assert_eq!(gate.before(false, Purpose::Cleanup, now), Gate::Run);
     }
 
     #[test]
@@ -357,7 +466,12 @@ mod tests {
                 .with_writer(std::io::sink)
                 .finish();
             let ran = tracing::subscriber::with_default(subscriber, || {
-                tasks.set_enabled(true, || {}, |_, _| panic!("a refused task must not run"))
+                tasks.set_enabled(
+                    true,
+                    Purpose::Attempt,
+                    || {},
+                    |_, _| panic!("a refused task must not run"),
+                )
             });
             let _ = done_tx.send(ran);
         });
@@ -377,6 +491,7 @@ mod tests {
         // Startup leaves the device known to be off.
         assert!(tasks.set_enabled(
             false,
+            Purpose::Attempt,
             || {},
             |e, _| {
                 record(&runs, e);
@@ -391,6 +506,7 @@ mod tests {
             std::thread::spawn(move || {
                 tasks.set_enabled(
                     true,
+                    Purpose::Attempt,
                     || {},
                     |e, _| {
                         record(&runs, e);
@@ -410,6 +526,7 @@ mod tests {
             std::thread::spawn(move || {
                 tasks.set_enabled(
                     false,
+                    Purpose::Cleanup,
                     || {
                         let _ = waiting_tx.send(());
                     },

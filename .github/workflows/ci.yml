@@ -81,6 +81,7 @@ jobs:
         run: |
           ./scripts/win/Test-VddToggle.ps1
           ./scripts/win/Test-VddState.ps1
+          ./scripts/win/Test-VddTask.ps1
       - name: Verify virtual display driver ownership on uninstall
         shell: powershell
         run: ./installer/tests/Test-VddDriverRemoval.ps1
