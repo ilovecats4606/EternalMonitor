@@ -32,14 +32,13 @@ mod imp {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Shell::{
         Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_LARGE_ICON,
-        NIIF_RESPECT_QUIET_TIME, NIIF_USER, NIM_ADD, NIM_DELETE, NIM_SETVERSION,
+        NIIF_RESPECT_QUIET_TIME, NIIF_USER, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
         NIN_BALLOONUSERCLICK, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, LoadIconW,
-        PostMessageW, PostQuitMessage, RegisterClassW, TranslateMessage, HWND_MESSAGE,
-        IDI_APPLICATION, MSG, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_DESTROY,
-        WM_LBUTTONUP, WNDCLASSW,
+        PostMessageW, PostQuitMessage, RegisterClassW, TranslateMessage, IDI_APPLICATION, MSG,
+        WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_LBUTTONUP, WNDCLASSW,
     };
 
     const CALLBACK: u32 = WM_APP + 1;
@@ -120,7 +119,9 @@ mod imp {
             0,
             0,
             0,
-            HWND_MESSAGE,
+            // A hidden top-level window: the shell does not show balloons
+            // reliably for message-only windows.
+            None,
             None,
             instance,
             None,
@@ -128,22 +129,27 @@ mod imp {
         // winresource embeds the app icon as resource 1.
         let icon =
             LoadIconW(instance, PCWSTR(1 as _)).or_else(|_| LoadIconW(None, IDI_APPLICATION))?;
+        // Add the icon and set its version first; the balloon is a separate
+        // modify, which the shell shows more reliably than one sent with NIM_ADD.
         let mut data = icon_data(hwnd);
-        data.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_INFO;
+        data.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
         data.uCallbackMessage = CALLBACK;
         data.hIcon = icon;
-        data.hBalloonIcon = icon;
-        data.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON | NIIF_RESPECT_QUIET_TIME;
         copy(&mut data.szTip, "EternalMonitor update available");
-        copy(&mut data.szInfoTitle, title);
-        copy(&mut data.szInfo, "Click to open EternalMonitor and update.");
         data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
         if !Shell_NotifyIconW(NIM_ADD, &data).as_bool() {
             let _ = DestroyWindow(hwnd);
             return Err(windows::core::Error::from_win32());
         }
-        let _ = Shell_NotifyIconW(NIM_SETVERSION, &data);
         WINDOW.store(hwnd.0 as isize, Ordering::SeqCst);
+        let _ = Shell_NotifyIconW(NIM_SETVERSION, &data);
+        data.uFlags = NIF_INFO;
+        data.hBalloonIcon = icon;
+        data.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON | NIIF_RESPECT_QUIET_TIME;
+        copy(&mut data.szInfoTitle, title);
+        copy(&mut data.szInfo, "Click to open EternalMonitor and update.");
+        let shown = Shell_NotifyIconW(NIM_MODIFY, &data).as_bool();
+        tracing::info!(shown, "Update notification");
         let mut message = MSG::default();
         while GetMessageW(&mut message, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&message);
