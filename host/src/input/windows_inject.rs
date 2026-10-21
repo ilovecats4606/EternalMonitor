@@ -21,7 +21,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Input::Pointer::{
-    InjectSyntheticPointerInput, POINTER_FLAG_CANCELED, POINTER_FLAG_DOWN,
+    InjectSyntheticPointerInput, POINTER_FLAGS, POINTER_FLAG_CANCELED, POINTER_FLAG_DOWN,
     POINTER_FLAG_FIRSTBUTTON, POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE, POINTER_FLAG_PRIMARY,
     POINTER_FLAG_UP, POINTER_FLAG_UPDATE, POINTER_INFO, POINTER_PEN_INFO,
 };
@@ -31,8 +31,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
-use super::pen_contact::{Outcome, PenContact, PointerKind};
-use super::{CaptureGeometry, Injection, PenPhase, PenSample, VirtualScreen};
+use super::pen_contact::{pointer_flag, Outcome, PenContact, PointerFrame, PointerKind};
+use super::{CaptureGeometry, Injection, PenSample, VirtualScreen};
+
+// Frames are built, and tested, without the SDK.
+const _: () = {
+    assert!(POINTER_FLAG_INRANGE.0 == pointer_flag::INRANGE);
+    assert!(POINTER_FLAG_INCONTACT.0 == pointer_flag::INCONTACT);
+    assert!(POINTER_FLAG_FIRSTBUTTON.0 == pointer_flag::FIRSTBUTTON);
+    assert!(POINTER_FLAG_PRIMARY.0 == pointer_flag::PRIMARY);
+    assert!(POINTER_FLAG_CANCELED.0 == pointer_flag::CANCELED);
+    assert!(POINTER_FLAG_DOWN.0 == pointer_flag::DOWN);
+    assert!(POINTER_FLAG_UPDATE.0 == pointer_flag::UPDATE);
+    assert!(POINTER_FLAG_UP.0 == pointer_flag::UP);
+};
 
 /// One device per relay, retained across samples and destroyed at shutdown.
 #[derive(Debug)]
@@ -121,27 +133,8 @@ fn inject_frame(
     warned: &mut Vec<windows::core::HRESULT>,
 ) -> Outcome {
     let screen = context.screen;
-    let (x, y) = super::desktop_pixel_to_pointer_location(frame.x, frame.y, screen);
-    let flags = match frame.phase {
-        PenPhase::Down => {
-            POINTER_FLAG_DOWN
-                | POINTER_FLAG_INRANGE
-                | POINTER_FLAG_INCONTACT
-                | POINTER_FLAG_FIRSTBUTTON
-        }
-        PenPhase::Move => {
-            POINTER_FLAG_UPDATE
-                | POINTER_FLAG_INRANGE
-                | POINTER_FLAG_INCONTACT
-                | POINTER_FLAG_FIRSTBUTTON
-        }
-        // Finish contact completely. Supported UIKit hover starts a new
-        // in-range update; unsupported devices must not leave ghost hover.
-        PenPhase::Up => POINTER_FLAG_UP,
-        PenPhase::Cancel => POINTER_FLAG_UP | POINTER_FLAG_CANCELED,
-        PenPhase::Hover => POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE,
-        PenPhase::Leave => POINTER_FLAG_UPDATE,
-    };
+    let pointer = PointerFrame::new(frame, screen);
+    let (x, y) = pointer.location;
     let info = POINTER_TYPE_INFO {
         r#type: PT_PEN,
         Anonymous: POINTER_TYPE_INFO_0 {
@@ -149,14 +142,14 @@ fn inject_frame(
                 pointerInfo: POINTER_INFO {
                     pointerType: PT_PEN,
                     pointerId: 1,
-                    pointerFlags: flags | POINTER_FLAG_PRIMARY,
+                    pointerFlags: POINTER_FLAGS(pointer.flags),
                     ptPixelLocation: POINT { x, y },
                     ..Default::default()
                 },
                 penMask: PEN_MASK_PRESSURE | PEN_MASK_TILT_X | PEN_MASK_TILT_Y,
-                pressure: frame.pressure,
-                tiltX: frame.tilt_x,
-                tiltY: frame.tilt_y,
+                pressure: pointer.pressure,
+                tiltX: pointer.tilt_x,
+                tiltY: pointer.tilt_y,
                 ..Default::default()
             },
         },

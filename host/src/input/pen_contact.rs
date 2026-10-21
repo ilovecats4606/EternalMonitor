@@ -11,7 +11,54 @@
 //! cancels every injected contact. ERROR_NOT_READY applies nothing; the same
 //! frame must be retried.
 
-use super::{PenPhase, PenSample};
+use super::{PenPhase, PenSample, VirtualScreen};
+
+/// `POINTER_FLAG_*` values from winuser.h, so frames can be built and checked
+/// off Windows. `windows_inject.rs` asserts that they match the SDK's.
+pub mod pointer_flag {
+    pub const INRANGE: u32 = 0x0000_0002;
+    pub const INCONTACT: u32 = 0x0000_0004;
+    pub const FIRSTBUTTON: u32 = 0x0000_0010;
+    pub const PRIMARY: u32 = 0x0000_2000;
+    pub const CANCELED: u32 = 0x0000_8000;
+    pub const DOWN: u32 = 0x0001_0000;
+    pub const UPDATE: u32 = 0x0002_0000;
+    pub const UP: u32 = 0x0004_0000;
+}
+
+/// The `POINTER_PEN_INFO` fields one injected frame sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PointerFrame {
+    pub flags: u32,
+    /// `ptPixelLocation`, measured from the virtual screen's top-left.
+    pub location: (i32, i32),
+    pub pressure: u32,
+    pub tilt_x: i32,
+    pub tilt_y: i32,
+}
+
+impl PointerFrame {
+    pub fn new(frame: PenSample, screen: VirtualScreen) -> Self {
+        use pointer_flag::*;
+        let flags = match frame.phase {
+            PenPhase::Down => DOWN | INRANGE | INCONTACT | FIRSTBUTTON,
+            PenPhase::Move => UPDATE | INRANGE | INCONTACT | FIRSTBUTTON,
+            // Finish contact completely. Supported UIKit hover starts a new
+            // in-range update; unsupported devices must not leave ghost hover.
+            PenPhase::Up => UP,
+            PenPhase::Cancel => UP | CANCELED,
+            PenPhase::Hover => UPDATE | INRANGE,
+            PenPhase::Leave => UPDATE,
+        };
+        Self {
+            flags: flags | PRIMARY,
+            location: super::desktop_pixel_to_pointer_location(frame.x, frame.y, screen),
+            pressure: frame.pressure,
+            tilt_x: frame.tilt_x,
+            tilt_y: frame.tilt_y,
+        }
+    }
+}
 
 /// Windows' view of our pointer after the last frame it accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -496,5 +543,30 @@ mod tests {
             ]
         );
         assert!(windows.illegal.is_empty());
+    }
+
+    #[test]
+    fn frames_carry_the_documented_flags_relative_to_the_virtual_screen() {
+        use pointer_flag::*;
+        let screen = VirtualScreen {
+            left: -2732,
+            top: -2048,
+            width: 6172,
+            height: 3488,
+        };
+        let flags = |phase| {
+            let frame = PointerFrame::new(pen(phase, -1, 0), screen);
+            assert_eq!(frame.location, (2731, 2048));
+            frame.flags & !PRIMARY
+        };
+        assert_eq!(flags(Down), DOWN | INRANGE | INCONTACT | FIRSTBUTTON);
+        assert_eq!(flags(Move), UPDATE | INRANGE | INCONTACT | FIRSTBUTTON);
+        assert_eq!(flags(Up), UP);
+        assert_eq!(flags(Cancel), UP | CANCELED);
+        assert_eq!(flags(Hover), UPDATE | INRANGE);
+        assert_eq!(flags(Leave), UPDATE);
+        let frame = PointerFrame::new(pen(Down, 0, 0), screen);
+        assert_ne!(frame.flags & PRIMARY, 0);
+        assert_eq!((frame.pressure, frame.tilt_x, frame.tilt_y), (512, 0, 0));
     }
 }
