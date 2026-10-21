@@ -349,10 +349,11 @@ mod tests {
         // 0.3.1 host on an i7-5500U took 105 ms, and its first six packets
         // missed the sender's deadline. Those packets carried sequence
         // numbers, so the iPad counted each one as lost.
-        // The host clock counts from process start; leave room for a backlog.
-        while crate::clock::host_now_us() < 200_000 {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        //
+        // Timestamps are explicit, so the test needs no particular speed:
+        // a packet goes out once its audio exists and the session has
+        // started, so its age at send is max(start, end of its audio) - capture.
+        const START: u64 = 10_000_000;
         let mut tone = SyntheticSource::default();
         let mut block = |capture_ts_us: u64, frames: usize| PcmBlock {
             format: PcmFormat::STEREO_48K,
@@ -364,24 +365,25 @@ mod tests {
             capture_ts_us,
             discontinuity: false,
         };
-        let start = crate::clock::host_now_us();
         let cases = [
             // Sixteen 10 ms engine periods published before the first read.
             (
                 "packet backlog",
                 (0..36u64)
-                    .map(|index| block(start - 160_000 + index * 10_000, 480))
+                    .map(|index| block(START - 160_000 + index * 10_000, 480))
                     .collect::<std::collections::VecDeque<_>>(),
             ),
             // An idle engine: the first read fills 100 ms since Start() with
             // silence, most of it from before the session.
             (
                 "idle silence",
-                std::iter::once(block(start - 95_000, 4800))
-                    .chain((0..20u64).map(|index| block(start + 5_000 + index * 10_000, 480)))
+                std::iter::once(block(START - 95_000, 4800))
+                    .chain((0..20u64).map(|index| block(START + 5_000 + index * 10_000, 480)))
                     .collect(),
             ),
         ];
+        // The first read starts the session on the host clock.
+        let before = crate::clock::host_now_us();
         let mut unstarted = CaptureSession {
             id: 1,
             source: Source::Scripted(Default::default()),
@@ -392,7 +394,7 @@ mod tests {
             started_us: None,
         };
         assert!(unstarted.read().unwrap().is_none());
-        assert!(unstarted.started_us.is_some_and(|at| at >= start));
+        assert!(unstarted.started_us.is_some_and(|at| at >= before));
         for (name, blocks) in cases {
             let reads = blocks.len();
             let mut session = CaptureSession {
@@ -402,7 +404,7 @@ mod tests {
                 encoder: OpusEncoder::new(1000).unwrap(),
                 mark_discontinuity: true,
                 next_input_us: None,
-                started_us: Some(start),
+                started_us: Some(START),
             };
             let (tx, mut rx) = tokio::sync::mpsc::channel(super::super::QUEUE_CAPACITY);
             let mut sent = Vec::new();
@@ -411,27 +413,28 @@ mod tests {
                     assert!(session.send(block, &tx).unwrap());
                 }
                 while let Ok(queued) = rx.try_recv() {
-                    let age =
-                        crate::clock::host_now_us().saturating_sub(queued.packet.capture_ts_us);
-                    sent.push((queued.packet, age));
+                    sent.push(queued.packet);
                 }
             }
             assert!(sent.len() >= 8, "{name}: live audio was not sent");
             let stale: Vec<_> = sent
                 .iter()
-                .filter(|(_, age)| *age > super::super::SEND_DEADLINE_US)
-                .map(|(packet, age)| (packet.seq, *age))
+                .map(|packet| {
+                    let send_us = START.max(packet.capture_ts_us + FRAME_US);
+                    (packet.seq, send_us - packet.capture_ts_us)
+                })
+                .filter(|&(_, age)| age > super::super::SEND_DEADLINE_US)
                 .collect();
             assert!(
                 stale.is_empty(),
                 "{name}: packets past the send deadline: {stale:?}"
             );
-            let (first, _) = &sent[0];
+            let first = &sent[0];
             assert_eq!((first.seq, first.discontinuity), (0, true), "{name}");
             assert!(
-                first.capture_ts_us + FRAME_US > start,
+                first.capture_ts_us + FRAME_US > START,
                 "{name}: the first packet replays audio captured {} us before the session",
-                start - first.capture_ts_us
+                START - first.capture_ts_us
             );
         }
     }
