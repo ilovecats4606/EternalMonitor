@@ -143,10 +143,19 @@ final class ConnectionManager: ObservableObject {
     private var backgroundGoodbyeTask: UIBackgroundTaskIdentifier = .invalid
 
     static let connectionTimeoutSeconds: UInt64 = 10
-    /// Reconnect timing. Tests shorten these; the app uses the defaults.
-    var connectTimeoutSeconds = Double(ConnectionManager.connectionTimeoutSeconds)
-    var reconnectGraceSeconds = 2.0
-    var reconnectBackoffSeconds: (Int) -> Double = { attempt in Double(min(1 << (attempt - 1), 15)) }
+
+    /// Connect and reconnect timing. The app uses the defaults; tests pass
+    /// shorter ones when they create the manager.
+    struct Timing {
+        var connectTimeoutSeconds = Double(ConnectionManager.connectionTimeoutSeconds)
+        var reconnectGraceSeconds = 2.0
+        var reconnectBackoffSeconds: (Int) -> Double = { attempt in Double(min(1 << (attempt - 1), 15)) }
+    }
+    private let timing: Timing
+
+    init(timing: Timing = Timing()) {
+        self.timing = timing
+    }
 
     func refreshUSBAvailability() {
         let allowed = UserDefaults.standard.flag(forKey: "allowUSB")
@@ -445,7 +454,7 @@ final class ConnectionManager: ObservableObject {
                 if self.awaitingPairing {
                     self.awaitingPairing = false
                     self.pairingPrompt = nil
-                    self.armConnectTimeout(seconds: self.connectTimeoutSeconds)
+                    self.armConnectTimeout(seconds: self.timing.connectTimeoutSeconds)
                 }
                 if PairingStore.valid(info.authToken) {
                     do { try self.pairingStore.save(token: info.authToken, hostName: info.hostName, address: pairingAddress) }
@@ -629,7 +638,7 @@ final class ConnectionManager: ObservableObject {
         startStatsFlushLoop()
 
         // Timeout after N seconds (re-armed once when datagrams start arriving).
-        armConnectTimeout(seconds: connectTimeoutSeconds)
+        armConnectTimeout(seconds: timing.connectTimeoutSeconds)
     }
 
     /// Drains the hot-path counters onto the MainActor at 4 Hz — cheap enough
@@ -665,7 +674,7 @@ final class ConnectionManager: ObservableObject {
                         // off mid-handshake.
                         if self.state == .connecting && !self.didExtendTimeout {
                             self.didExtendTimeout = true
-                            self.armConnectTimeout(seconds: self.connectTimeoutSeconds)
+                            self.armConnectTimeout(seconds: self.timing.connectTimeoutSeconds)
                         }
                     }
                     if firstAssembled {
@@ -774,11 +783,11 @@ final class ConnectionManager: ObservableObject {
                 guard let self, !Task.isCancelled else { return }
                 self.reconnectAttempt = attempt
                 self.problem = .reconnecting(attempt: attempt, of: 6)
-                try? await Task.sleep(for: .seconds(self.reconnectBackoffSeconds(attempt)))
+                try? await Task.sleep(for: .seconds(self.timing.reconnectBackoffSeconds(attempt)))
                 guard !Task.isCancelled, self.state == .disconnected else { return }
                 self.connect(host: target.host, port: target.port)
                 // Give the attempt its connect-timeout window to succeed.
-                try? await Task.sleep(for: .seconds(self.connectTimeoutSeconds + self.reconnectGraceSeconds))
+                try? await Task.sleep(for: .seconds(self.timing.connectTimeoutSeconds + self.timing.reconnectGraceSeconds))
                 guard !Task.isCancelled else { return }
                 if self.state == .connected {
                     self.reconnectAttempt = 0

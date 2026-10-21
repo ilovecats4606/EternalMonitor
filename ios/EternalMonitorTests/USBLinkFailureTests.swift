@@ -31,7 +31,7 @@ final class USBLinkFailureTests: XCTestCase {
 
     /// A ConnectionManager connecting over a FramedLink whose far end is
     /// `peer`, past the preamble.
-    private func connectOverCable() async throws -> (ConnectionManager, FramedLink) {
+    private func connectOverCable(timing: ConnectionManager.Timing = .init()) async throws -> (ConnectionManager, FramedLink) {
         server = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
         XCTAssertGreaterThanOrEqual(server, 0)
         var address = sockaddr_in()
@@ -60,7 +60,7 @@ final class USBLinkFailureTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(peer, 0)
         _ = EMLinkFramer.preamble.withUnsafeBytes { Darwin.send(peer, $0.baseAddress, $0.count, 0) }
         await fulfillment(of: [ready], timeout: 3)
-        let manager = ConnectionManager()
+        let manager = ConnectionManager(timing: timing)
         manager.connect(target: .usb(link))
         XCTAssertEqual(manager.state, .connecting)
         return (manager, link)
@@ -140,6 +140,10 @@ final class USBLinkFailureTests: XCTestCase {
         try await assertFallsBackOnce(manager, to: wifi)
     }
 
+    /// Reconnect timing short enough to run a whole cycle in seconds.
+    private let fast = ConnectionManager.Timing(connectTimeoutSeconds: 0.4, reconnectGraceSeconds: 0.1,
+        reconnectBackoffSeconds: { _ in 0.05 })
+
     /// Waits for the reconnect cycle to start and then to run out.
     private func waitForFallbackToGiveUp(_ manager: ConnectionManager) async throws {
         var started = false
@@ -156,11 +160,8 @@ final class USBLinkFailureTests: XCTestCase {
     func testCableFailureAdviceSurvivesAnExhaustedWiFiFallback() async throws {
         let wifi = FakeUDPHost()  // never answers
         enableWiFiFallback(to: wifi)
-        let (manager, link) = try await connectOverCable()
+        let (manager, link) = try await connectOverCable(timing: fast)
         defer { link.stop(); manager.cancel() }
-        manager.reconnectBackoffSeconds = { _ in 0.05 }
-        manager.connectTimeoutSeconds = 0.4
-        manager.reconnectGraceSeconds = 0.1
         let attempts = Task.detached { wifi.helloAttempts(within: 6) }
         let invalid = Data([0, 0])
         _ = invalid.withUnsafeBytes { Darwin.send(peer, $0.baseAddress, $0.count, 0) }
@@ -179,11 +180,8 @@ final class USBLinkFailureTests: XCTestCase {
         UserDefaults.standard.set(true, forKey: "autoReconnect")
         UserDefaults.standard.set("eternalmonitor-test.invalid", forKey: "lastHost")
         UserDefaults.standard.set(9876, forKey: "lastPort")
-        let (manager, link) = try await connectOverCable()
+        let (manager, link) = try await connectOverCable(timing: fast)
         defer { link.stop(); manager.cancel() }
-        manager.reconnectBackoffSeconds = { _ in 0.05 }
-        manager.connectTimeoutSeconds = 0.4
-        manager.reconnectGraceSeconds = 0.1
         let invalid = Data([0, 0])
         _ = invalid.withUnsafeBytes { Darwin.send(peer, $0.baseAddress, $0.count, 0) }
         try await waitForFallbackToGiveUp(manager)
