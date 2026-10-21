@@ -77,11 +77,21 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   monitor on the left moved the pen left by its width. The host is per-monitor
   DPI aware from startup, so scaled displays use physical pixels throughout.
 - Disconnect, backgrounding and view cancellation release contact. If Windows
-  rejects a sample or cancels the contact after a display change, the host
-  starts a new contact at that same sample instead of losing the rest of the
-  stroke. `host/src/input/pen_contact.rs` chooses every frame from what
+  rejects a move or hover or cancels the contact after a display change, the
+  host starts a new contact at that same sample instead of losing the rest of
+  the stroke. `host/src/input/pen_contact.rs` chooses every frame from what
   Windows last accepted, so an end of contact or hover is never sent for a
   pointer Windows does not have.
+- Every Pencil sample reaches Windows once, natively or as mouse input, in
+  order. A stroke moves to the mouse fallback when native input cannot carry
+  it: Windows rejects a down or up, or still rejects a fresh start, the pen
+  device is lost, or Windows stays not ready for a whole queue of samples
+  (the device is then recreated to end its pointer). The waiting samples and
+  the rest of that stroke follow it, pressing the mouse at the first. Native
+  input resumes at the next pen down or hover once the mouse holds nothing.
+  The fallback tracks what `SendInput` inserted: a release Windows refuses,
+  for example under UIPI, is retried at the next sample, refresh tick or
+  reset, and native input waits for it.
 - When a session ends or another takes over, the host drops pen samples
   Windows never received and ends only the pointer Windows holds, where it
   holds it. If that place is off the virtual screen after a display change,
@@ -98,8 +108,8 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   Pencil outside Drawing mode works as a mouse.
 - After `ERROR_NOT_READY`, that sample and any behind it wait in order, and
   the next sample or refresh tick retries the same frame first; later
-  positions coalesce behind it. A release is never dropped for a later
-  stroke. Each waiting sample is mapped again
+  positions coalesce behind it. No other sample is dropped. Each waiting
+  sample is mapped again
   from its normalised position when it is sent, so it lands on the display
   where it is at that moment.
 - A held contact remembers its normalised position. The refresh tick remaps it
