@@ -315,7 +315,7 @@ fn run(args: &[String]) -> i32 {
             let note = match crate::vdd::disable_for_ended(owner, &reporters) {
                 Ok(true) => Some("turned the virtual display off".to_string()),
                 Ok(false) => Some("could not turn the virtual display off".to_string()),
-                Err("no host turned it on") => None,
+                Err(reason) if reason == super::display::NO_OWNER => None,
                 Err(reason) => Some(format!("left the virtual display on: {reason}")),
             };
             if let Some(note) = note {
@@ -325,6 +325,9 @@ fn run(args: &[String]) -> i32 {
             }
             let _ = done_tx.send(());
         });
+    } else {
+        // Nothing to clean up after a normal quit: the waits below end at once.
+        drop(done_tx);
     }
 
     if report.is_none() {

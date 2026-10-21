@@ -120,10 +120,10 @@ pub fn disable() {
 pub(crate) fn disable_for_ended(
     host: crate::startup::ProcessId,
     reporters: &[crate::startup::ProcessId],
-) -> Result<bool, &'static str> {
+) -> Result<bool, String> {
     crate::startup::display::disable_for_ended(
         host,
-        || crate::startup::display::other_host_running(host, reporters),
+        || crate::startup::display::other_host(host, reporters),
         || run_task(TASK_DISABLE, || {}),
     )
 }
