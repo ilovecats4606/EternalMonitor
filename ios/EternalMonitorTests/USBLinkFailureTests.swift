@@ -9,16 +9,22 @@ import XCTest
 @MainActor
 final class USBLinkFailureTests: XCTestCase {
     private var previousAuto: Any?
+    private var previousHost: Any?
+    private var previousPort: Any?
     private var server: Int32 = -1
     private var peer: Int32 = -1
 
     override func setUp() async throws {
         previousAuto = UserDefaults.standard.object(forKey: "autoReconnect")
+        previousHost = UserDefaults.standard.object(forKey: "lastHost")
+        previousPort = UserDefaults.standard.object(forKey: "lastPort")
         UserDefaults.standard.set(false, forKey: "autoReconnect")
     }
 
     override func tearDown() async throws {
         UserDefaults.standard.set(previousAuto, forKey: "autoReconnect")
+        UserDefaults.standard.set(previousHost, forKey: "lastHost")
+        UserDefaults.standard.set(previousPort, forKey: "lastPort")
         if peer >= 0 { Darwin.close(peer) }
         if server >= 0 { Darwin.close(server) }
     }
@@ -92,5 +98,45 @@ final class USBLinkFailureTests: XCTestCase {
         try await waitUntilDisconnected(manager)
         XCTAssertEqual(manager.problem, .lost(.cableUnplugged))
         XCTAssertEqual(manager.usbStatus, "USB: waiting for a cable")
+    }
+
+    // MARK: Automatic reconnecting on: a cable that fails or closes during
+    // setup falls back to the saved Wi-Fi PC, once.
+
+    /// Saves `host` as the last Wi-Fi PC and turns automatic reconnecting on.
+    private func enableWiFiFallback(to host: FakeUDPHost) {
+        UserDefaults.standard.set(true, forKey: "autoReconnect")
+        UserDefaults.standard.set("127.0.0.1", forKey: "lastHost")
+        UserDefaults.standard.set(Int(host.port), forKey: "lastPort")
+    }
+
+    private func assertFallsBackOnce(_ manager: ConnectionManager, to wifi: FakeUDPHost) async throws {
+        try await waitUntilDisconnected(manager)
+        // Falling back, not giving up: the banner says what is happening.
+        XCTAssertEqual(manager.problem, .reconnecting(attempt: 1, of: 6))
+        XCTAssertEqual(manager.diagnostics.filter { $0.message.hasPrefix("Connection lost") }.count, 1,
+            "the reconnect decision must run exactly once")
+        // The first retry waits one second; allow four.
+        let attempts = await Task.detached { wifi.helloAttempts(within: 4) }.value
+        XCTAssertEqual(attempts, 1, "exactly one Wi-Fi fallback attempt")
+    }
+
+    func testCableFailureDuringSetupFallsBackToWiFiOnce() async throws {
+        let wifi = FakeUDPHost()
+        enableWiFiFallback(to: wifi)
+        let (manager, link) = try await connectOverCable()
+        defer { link.stop(); manager.cancel() }
+        let invalid = Data([0, 0])
+        _ = invalid.withUnsafeBytes { Darwin.send(peer, $0.baseAddress, $0.count, 0) }
+        try await assertFallsBackOnce(manager, to: wifi)
+    }
+
+    func testCleanCloseDuringSetupFallsBackToWiFiOnce() async throws {
+        let wifi = FakeUDPHost()
+        enableWiFiFallback(to: wifi)
+        let (manager, link) = try await connectOverCable()
+        defer { link.stop(); manager.cancel() }
+        XCTAssertEqual(shutdown(peer, SHUT_WR), 0)
+        try await assertFallsBackOnce(manager, to: wifi)
     }
 }

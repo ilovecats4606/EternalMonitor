@@ -584,12 +584,18 @@ final class ConnectionManager: ObservableObject {
                     if isUSB { self.linkFailure = failure }
                     return
                 }
-                // End the attempt once. That retires connectionID, so the
-                // close callback FramedLink sends after a failure is ignored
-                // instead of relabelling it as an unplugged cable.
-                if isUSB { self.usbStatus = "USB: waiting for a cable" }
-                self.disconnect()
-                self.problem = failure
+                guard isUSB else {
+                    self.disconnect()
+                    self.problem = failure
+                    return
+                }
+                // Decide once, here, as a close would: fall back to Wi-Fi when
+                // automatic reconnecting is on, otherwise show the cable
+                // advice. beginReconnect disconnects, which retires
+                // connectionID, so the close FramedLink sends next is ignored
+                // instead of relabelling this as an unplugged cable.
+                self.usbStatus = "USB: waiting for a cable"
+                self.beginReconnect(.cableUnplugged, failure: failure)
             }
         }
 
@@ -740,7 +746,7 @@ final class ConnectionManager: ObservableObject {
         let logged: String
         switch reason {
         case .pcStoppedResponding: logged = "host stopped responding"
-        case .cableUnplugged: logged = "USB disconnected"
+        case .cableUnplugged: logged = failure == nil ? "USB disconnected" : "USB link failed"
         case .usbTurnedOff: logged = "USB connections turned off"
         }
         record(.warning, "ctrl", "Connection lost (\(logged))")
