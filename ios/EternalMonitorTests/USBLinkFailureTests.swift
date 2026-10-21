@@ -139,4 +139,55 @@ final class USBLinkFailureTests: XCTestCase {
         XCTAssertEqual(shutdown(peer, SHUT_WR), 0)
         try await assertFallsBackOnce(manager, to: wifi)
     }
+
+    /// Waits for the reconnect cycle to start and then to run out.
+    private func waitForFallbackToGiveUp(_ manager: ConnectionManager) async throws {
+        var started = false
+        for _ in 0..<1000 {
+            if manager.reconnectAttempt > 0 { started = true }
+            if started && manager.reconnectAttempt == 0 { return }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTFail("the Wi-Fi fallback never finished")
+    }
+
+    /// Every Wi-Fi fallback attempt times out: the user ends on the cable
+    /// advice and Try again, not "Couldn't reconnect".
+    func testCableFailureAdviceSurvivesAnExhaustedWiFiFallback() async throws {
+        let wifi = FakeUDPHost()  // never answers
+        enableWiFiFallback(to: wifi)
+        let (manager, link) = try await connectOverCable()
+        defer { link.stop(); manager.cancel() }
+        manager.reconnectBackoffSeconds = { _ in 0.05 }
+        manager.connectTimeoutSeconds = 0.4
+        manager.reconnectGraceSeconds = 0.1
+        let attempts = Task.detached { wifi.helloAttempts(within: 6) }
+        let invalid = Data([0, 0])
+        _ = invalid.withUnsafeBytes { Darwin.send(peer, $0.baseAddress, $0.count, 0) }
+        try await waitForFallbackToGiveUp(manager)
+        let attempted = await attempts.value
+        XCTAssertEqual(attempted, 6, "all six Wi-Fi attempts ran")
+        XCTAssertEqual(manager.state, .disconnected)
+        XCTAssertEqual(manager.reconnectAttempt, 0)
+        XCTAssertEqual(manager.problem, .usbFailed)
+        XCTAssertEqual(manager.problem?.actions, [.retry])
+    }
+
+    /// A later, more specific failure (the saved address doesn't resolve)
+    /// replaces the cable advice when the fallback gives up.
+    func testALaterSpecificFailureReplacesTheCableAdvice() async throws {
+        UserDefaults.standard.set(true, forKey: "autoReconnect")
+        UserDefaults.standard.set("eternalmonitor-test.invalid", forKey: "lastHost")
+        UserDefaults.standard.set(9876, forKey: "lastPort")
+        let (manager, link) = try await connectOverCable()
+        defer { link.stop(); manager.cancel() }
+        manager.reconnectBackoffSeconds = { _ in 0.05 }
+        manager.connectTimeoutSeconds = 0.4
+        manager.reconnectGraceSeconds = 0.1
+        let invalid = Data([0, 0])
+        _ = invalid.withUnsafeBytes { Darwin.send(peer, $0.baseAddress, $0.count, 0) }
+        try await waitForFallbackToGiveUp(manager)
+        XCTAssertEqual(manager.reconnectAttempt, 0)
+        XCTAssertEqual(manager.problem, .badAddress("eternalmonitor-test.invalid"))
+    }
 }

@@ -143,6 +143,10 @@ final class ConnectionManager: ObservableObject {
     private var backgroundGoodbyeTask: UIBackgroundTaskIdentifier = .invalid
 
     static let connectionTimeoutSeconds: UInt64 = 10
+    /// Reconnect timing. Tests shorten these; the app uses the defaults.
+    var connectTimeoutSeconds = Double(ConnectionManager.connectionTimeoutSeconds)
+    var reconnectGraceSeconds = 2.0
+    var reconnectBackoffSeconds: (Int) -> Double = { attempt in Double(min(1 << (attempt - 1), 15)) }
 
     func refreshUSBAvailability() {
         let allowed = UserDefaults.standard.flag(forKey: "allowUSB")
@@ -441,7 +445,7 @@ final class ConnectionManager: ObservableObject {
                 if self.awaitingPairing {
                     self.awaitingPairing = false
                     self.pairingPrompt = nil
-                    self.armConnectTimeout(seconds: Self.connectionTimeoutSeconds)
+                    self.armConnectTimeout(seconds: self.connectTimeoutSeconds)
                 }
                 if PairingStore.valid(info.authToken) {
                     do { try self.pairingStore.save(token: info.authToken, hostName: info.hostName, address: pairingAddress) }
@@ -625,7 +629,7 @@ final class ConnectionManager: ObservableObject {
         startStatsFlushLoop()
 
         // Timeout after N seconds (re-armed once when datagrams start arriving).
-        armConnectTimeout(seconds: Self.connectionTimeoutSeconds)
+        armConnectTimeout(seconds: connectTimeoutSeconds)
     }
 
     /// Drains the hot-path counters onto the MainActor at 4 Hz — cheap enough
@@ -661,7 +665,7 @@ final class ConnectionManager: ObservableObject {
                         // off mid-handshake.
                         if self.state == .connecting && !self.didExtendTimeout {
                             self.didExtendTimeout = true
-                            self.armConnectTimeout(seconds: Self.connectionTimeoutSeconds)
+                            self.armConnectTimeout(seconds: self.connectTimeoutSeconds)
                         }
                     }
                     if firstAssembled {
@@ -755,41 +759,48 @@ final class ConnectionManager: ObservableObject {
             problem = failure ?? .lost(reason)
             return
         }
-        startReconnectCycle(to: target)
+        startReconnectCycle(to: target, failure: failure)
     }
 
-    private func startReconnectCycle(to target: (host: String, port: UInt16)) {
+    /// Retries the last Wi-Fi PC. `failure` is the classified problem that
+    /// ended the session (a failed cable); a more specific failure in a later
+    /// attempt replaces it, and whichever is left is shown if every attempt
+    /// fails, rather than the generic message.
+    private func startReconnectCycle(to target: (host: String, port: UInt16), failure: ConnectionProblem? = nil) {
         reconnectTask?.cancel()
         reconnectTask = Task { @MainActor [weak self] in
+            var specific = failure
             for attempt in 1...6 {
                 guard let self, !Task.isCancelled else { return }
                 self.reconnectAttempt = attempt
                 self.problem = .reconnecting(attempt: attempt, of: 6)
-                let backoff = min(1 << (attempt - 1), 15)
-                try? await Task.sleep(for: .seconds(Double(backoff)))
+                try? await Task.sleep(for: .seconds(self.reconnectBackoffSeconds(attempt)))
                 guard !Task.isCancelled, self.state == .disconnected else { return }
                 self.connect(host: target.host, port: target.port)
                 // Give the attempt its connect-timeout window to succeed.
-                try? await Task.sleep(for: .seconds(Double(Self.connectionTimeoutSeconds) + 2))
+                try? await Task.sleep(for: .seconds(self.connectTimeoutSeconds + self.reconnectGraceSeconds))
                 guard !Task.isCancelled else { return }
                 if self.state == .connected {
                     self.reconnectAttempt = 0
                     self.problem = nil
                     return
                 }
+                if ConnectionProblem.afterReconnecting(lastAttempt: self.problem) != .reconnectFailed {
+                    specific = self.problem
+                }
             }
             guard let self, !Task.isCancelled else { return }
             self.reconnectAttempt = 0
-            self.problem = ConnectionProblem.afterReconnecting(lastAttempt: self.problem)
+            self.problem = specific ?? .reconnectFailed
         }
     }
 
     /// (Re)arm the connect-timeout watchdog. Cancels any existing timer and starts a fresh one;
     /// if we're still `.connecting` when it fires, surface a diagnostic and disconnect.
-    private func armConnectTimeout(seconds: UInt64) {
+    private func armConnectTimeout(seconds: Double) {
         timeoutTask?.cancel()
         timeoutTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: seconds * 1_000_000_000)
+            try? await Task.sleep(for: .seconds(seconds))
             if !Task.isCancelled && self.state == .connecting {
                 let summary = self.debugState.timeoutSummary
                 self.record(.error, "timeout", summary)
