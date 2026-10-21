@@ -170,6 +170,8 @@ struct SettingsView: View {
                 }
                 .listRowBackground(Theme.surfaceRaised)
 
+                UpdateSettingsSection()
+
                 Section {
                     HStack(spacing: 14) {
                         LogoMark(size: 40)

@@ -58,6 +58,8 @@ struct ConnectView: View {
                                 .padding(.bottom, 8)
                                 .entrance(appeared)
 
+                            UpdateBanner()
+
                             if !didSeeOnboarding {
                                 onboardingCard
                                     .entrance(appeared, delay: 0.08)
@@ -223,11 +225,14 @@ struct ConnectView: View {
                 .foregroundStyle(Theme.warning)
                 .padding(.top, 1)
 
-            Text(message)
-                .font(.app(14, relativeTo: .callout))
-                .foregroundStyle(Theme.text)
-                .multilineTextAlignment(.leading)
-                .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 10) {
+                Text(message)
+                    .font(.app(14, relativeTo: .callout))
+                    .foregroundStyle(Theme.text)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                VersionMismatchAction(mismatch: connectionManager.versionMismatch)
+            }
 
             Spacer(minLength: 0)
 

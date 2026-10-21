@@ -72,6 +72,8 @@ final class ConnectionManager: ObservableObject {
     @Published var fps: Double = 0
     @Published var transportMode: String = "WiFi"
     @Published var connectionError: String?
+    /// Set with `connectionError` when the PC and iPad versions differ.
+    @Published var versionMismatch: VersionMismatch?
     @Published var pairingPrompt: PairingSheetModel?
     private var awaitingPairing = false
     private var explicitPairingToken: Data?
@@ -265,6 +267,7 @@ final class ConnectionManager: ObservableObject {
 
         state = .connecting
         connectionError = nil
+        versionMismatch = nil
         signalLost = false
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
@@ -447,7 +450,9 @@ final class ConnectionManager: ObservableObject {
                 )
             }
         }
-        channel.onRejected = { [weak self] status in
+        channel.onRejected = { [weak self, weak channel] status in
+            // Read on the channel's queue, where the refusal was recorded.
+            let mismatch = channel?.lastMismatch
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 if status == .unauthorized || status == .rateLimited {
@@ -470,7 +475,8 @@ final class ConnectionManager: ObservableObject {
                 case .busy:
                     self.connectionError = "Your PC is already streaming to another device."
                 case .versionUnsupported:
-                    self.connectionError = "This app and EternalMonitor on your PC are different versions. Update both, then try again."
+                    self.versionMismatch = mismatch
+                    self.connectionError = self.versionMismatch?.message ?? VersionMismatch.unknownMessage
                 default:
                     self.connectionError = "Your PC turned down the connection."
                 }
@@ -486,8 +492,8 @@ final class ConnectionManager: ObservableObject {
                     return
                 }
                 if let receiver, receiver.legacyLookingDatagrams > 0 {
-                    self.connectionError =
-                        "The host is running v0.1.x — update EternalMonitor on the PC."
+                    self.versionMismatch = .pcLegacy
+                    self.connectionError = VersionMismatch.pcLegacy.message
                     self.record(.error, "ctrl", "Legacy v1 host detected")
                     self.disconnect()
                 } else {

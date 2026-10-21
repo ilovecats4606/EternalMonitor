@@ -22,6 +22,8 @@ final class ControlChannel {
 
     var onSessionEstablished: ((SessionInfo) -> Void)?
     var onRejected: ((HelloStatus) -> Void)?
+    /// The last refusal's version mismatch, if any. Read inside `onRejected`.
+    private(set) var lastMismatch: VersionMismatch?
     /// HELLO2 went unanswered for the whole retry budget.
     var onHandshakeTimeout: (() -> Void)?
     var onHelloAttempt: ((Int, Int) -> Void)?
@@ -228,6 +230,9 @@ final class ControlChannel {
 
         guard ack.status == .ok else {
             clientNonce = 0
+            lastMismatch = helloTemplate.flatMap {
+                VersionMismatch.classify(hostProtocol: ack.acceptedVersion, iPadMin: $0.protoMin, iPadMax: $0.protoMax)
+            }
             onRejected?(ack.status)
             return
         }

@@ -4,7 +4,7 @@ import SwiftUI
 /// Debug builds only: put the UI in a state that normally needs a live PC,
 /// for screenshots and design review. Never opens a connection.
 ///
-/// `EM_UI_PREVIEW=display|quality|connecting|error|pairing|settings|recent`.
+/// `EM_UI_PREVIEW=display|quality|connecting|error|mismatch|pairing|settings|recent`.
 /// Launch with `-allowUSB NO` so the USB listener stays off as well.
 enum UIPreview {
     static let mode = ProcessInfo.processInfo.environment["EM_UI_PREVIEW"] ?? ""
@@ -22,6 +22,9 @@ enum UIPreview {
             manager.state = .connecting
         case "error":
             manager.connectionError = "No response from 192.168.1.20:9876. Check that EternalMonitor is running on the PC and that both devices are on the same network."
+        case "mismatch":
+            manager.versionMismatch = .iPadOlder
+            manager.connectionError = VersionMismatch.iPadOlder.message
         case "pairing":
             manager.pairingPrompt = PairingSheetModel()
         case "recent":
