@@ -6,6 +6,7 @@
 //! exit. A native crash only writes a fixed record (see `record`), which the
 //! reporter or the next launch turns into the same log line, event and message.
 
+pub(crate) mod lock;
 mod process;
 mod record;
 mod reporter;

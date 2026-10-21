@@ -14,6 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use eframe::egui;
 use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup};
@@ -26,6 +27,8 @@ use crate::startup::ProcessId;
 /// Clean launches, per recorded failure, before an avoided backend is retried.
 const RETRY_AFTER: u32 = 5;
 const HISTORY_FILE: &str = "history.json";
+/// Held while one instance reads, changes and saves the history.
+const HISTORY_LOCK: &str = "history.lock";
 
 static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
 static STARTED: Mutex<Option<Marker>> = Mutex::new(None);
@@ -101,9 +104,7 @@ pub(super) fn frame_started(ctx: &egui::Context) {
         return;
     };
     if let Some(marker) = started.take() {
-        let mut history = read_history(directory);
-        record_success(&mut history, &marker);
-        write_history(directory, &history);
+        update_history(directory, |history| record_success(history, &marker));
         let _ = fs::remove_file(marker_path(directory, ProcessId::current()));
     }
 }
@@ -287,10 +288,12 @@ fn record_failure(history: &mut Vec<Failure>, marker: &Marker) {
     }
 }
 
-/// A backend that drew is cleared; others on the same GPU move toward a retry.
+/// A backend that drew is cleared; every other failure moves toward a retry,
+/// also when this launch drew on another GPU or on WARP, so a fallback never
+/// keeps the failed backend avoided for good.
 fn record_success(history: &mut Vec<Failure>, marker: &Marker) {
     history.retain(|f| !(f.gpu == marker.gpu && f.backend == marker.backend));
-    for failure in history.iter_mut().filter(|f| f.gpu == marker.gpu) {
+    for failure in history.iter_mut() {
         failure.clean_launches += 1;
     }
 }
@@ -306,9 +309,28 @@ fn read_history(directory: &Path) -> Vec<Failure> {
         .unwrap_or_default()
 }
 
+/// Read, change and save the history as one step, so instances starting
+/// together do not lose each other's updates. Returns the changed history, or
+/// what is on disk when the lock cannot be had.
+fn update_history(directory: &Path, change: impl FnOnce(&mut Vec<Failure>)) -> Vec<Failure> {
+    let lock =
+        crate::startup::lock::lock(&directory.join(HISTORY_LOCK), Duration::from_secs(2), || {});
+    if let Err(error) = &lock {
+        warn!(%error, "Could not lock the renderer history");
+        return read_history(directory);
+    }
+    let mut history = read_history(directory);
+    let before = history.clone();
+    change(&mut history);
+    if history != before {
+        write_history(directory, &history);
+    }
+    history
+}
+
 fn write_history(directory: &Path, history: &[Failure]) {
     let path = directory.join(HISTORY_FILE);
-    let temp = path.with_extension("tmp");
+    let temp = directory.join(format!("history.{}.tmp", ProcessId::current()));
     let saved = serde_json::to_vec(history)
         .map_err(std::io::Error::other)
         .and_then(|json| fs::write(&temp, json))
@@ -321,34 +343,29 @@ fn write_history(directory: &Path, history: &[Failure]) {
 /// Count markers left by exited launches as failures and remove them. Markers
 /// of running instances, including this one, are theirs to clear.
 fn sweep(directory: &Path, current: ProcessId) -> Vec<Failure> {
-    let mut history = read_history(directory);
-    let mut changed = false;
-    for entry in fs::read_dir(directory).into_iter().flatten().flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(owner) = name.strip_suffix(".start").and_then(ProcessId::from_name) else {
-            continue;
-        };
-        if owner == current || owner.is_running() {
-            continue;
+    update_history(directory, |history| {
+        for entry in fs::read_dir(directory).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(owner) = name.strip_suffix(".start").and_then(ProcessId::from_name) else {
+                continue;
+            };
+            if owner == current || owner.is_running() {
+                continue;
+            }
+            if let Some(marker) = fs::read(entry.path())
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Marker>(&bytes).ok())
+            {
+                warn!(
+                    gpu = %marker.gpu,
+                    backend = %marker.backend,
+                    "A previous launch closed before its window appeared; avoiding that renderer for now"
+                );
+                record_failure(history, &marker);
+            }
+            let _ = fs::remove_file(entry.path());
         }
-        if let Some(marker) = fs::read(entry.path())
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Marker>(&bytes).ok())
-        {
-            warn!(
-                gpu = %marker.gpu,
-                backend = %marker.backend,
-                "A previous launch closed before its window appeared; avoiding that renderer for now"
-            );
-            record_failure(&mut history, &marker);
-            changed = true;
-        }
-        let _ = fs::remove_file(entry.path());
-    }
-    if changed {
-        write_history(directory, &history);
-    }
-    history
+    })
 }
 
 #[cfg(test)]
@@ -508,6 +525,41 @@ mod tests {
         // Recorded once, and kept for the next launch.
         assert_eq!(sweep(&directory, elsewhere), history);
         assert_eq!(read_history(&directory), history);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_fallback_to_another_gpu_still_ages_the_failure() {
+        let failed = marker("8086:5917 23.20.16.5038", "vulkan");
+        let warp = marker("1414:008c 10.0.22621.1", "dx12");
+        let mut history = Vec::new();
+        record_failure(&mut history, &failed);
+        for _ in 0..RETRY_AFTER {
+            record_success(&mut history, &warp);
+        }
+        assert!(!avoided(&history, &failed.gpu, "vulkan"));
+    }
+
+    #[test]
+    fn instances_updating_together_keep_every_failure() {
+        let directory = temp_dir("renderer-race");
+        let gpu = "8086:5917 23.20.16.5038";
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let directory = directory.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        update_history(&directory, |history| {
+                            record_failure(history, &marker(gpu, "vulkan"))
+                        });
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(read_history(&directory)[0].failures, 8 * 20);
         fs::remove_dir_all(directory).unwrap();
     }
 
