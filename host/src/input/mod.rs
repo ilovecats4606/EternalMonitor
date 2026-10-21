@@ -1571,6 +1571,36 @@ mod tests {
         recorder::take();
     }
 
+    /// Windows for `inject_like_windows`: every frame gets `outcome`, and
+    /// is recorded as the injector would build it.
+    #[cfg(not(windows))]
+    struct RecordingTarget {
+        screen: VirtualScreen,
+        outcome: pen_contact::Outcome,
+        frames: Vec<pen_contact::PointerFrame>,
+    }
+
+    #[cfg(not(windows))]
+    impl pen_contact::PenTarget for RecordingTarget {
+        fn screen(&self) -> VirtualScreen {
+            self.screen
+        }
+
+        fn inject(
+            &mut self,
+            frame: PenSample,
+            _: pen_contact::PointerKind,
+        ) -> pen_contact::Outcome {
+            self.frames
+                .push(pen_contact::PointerFrame::new(frame, self.screen));
+            self.outcome
+        }
+
+        fn recreate(&mut self) {
+            panic!("no pointer to end off the screen");
+        }
+    }
+
     /// Send the relay's recorded pen batch the way `windows_inject.rs` does,
     /// without Win32: the refresh tick flushes first, as `keep_pen_alive`
     /// does, then each sample goes through `PenContact` and every frame is
@@ -1583,21 +1613,21 @@ mod tests {
         outcome: pen_contact::Outcome,
         tick: bool,
     ) -> Vec<pen_contact::PointerFrame> {
-        let mut frames = Vec::new();
-        let mut inject = |frame, _| {
-            frames.push(pen_contact::PointerFrame::new(frame, screen));
-            outcome
+        let mut target = RecordingTarget {
+            screen,
+            outcome,
+            frames: Vec::new(),
         };
         if tick {
-            contact.flush(Some(output), &mut inject);
+            contact.flush(Some(output), &mut target);
         }
         for injection in recorder::take() {
             let Injection::Pen(sample) = injection else {
                 panic!("expected only pen input, got {injection:?}");
             };
-            contact.deliver(sample, Some(output), &mut inject);
+            contact.deliver(sample, Some(output), &mut target);
         }
-        frames
+        target.frames
     }
 
     #[cfg(not(windows))]
