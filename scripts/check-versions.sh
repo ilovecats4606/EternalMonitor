@@ -74,5 +74,13 @@ for name, (have, want) in checks.items():
         fail(f"{name} is {have!r}; docs/download.html says {want!r}")
 if not re.fullmatch(r"[0-9a-f]{64}", windows["sha256"]):
     fail("SHA-256 must be 64 lowercase hex digits")
+# The download page's script must take the release from latest.json, not a
+# tag of its own, or the page could offer another version than this check saw.
+script = (root / "docs/script.js").read_text()
+if "fetch('latest.json'" not in script:
+    fail("docs/script.js must read latest.json")
+pinned = re.findall(r"releases/(?:tags|download)/v\d+\.\d+\.\d+|['\"]v\d+\.\d+\.\d+['\"]", script)
+if pinned:
+    fail(f"docs/script.js pins a release ({pinned[0]}); derive it from latest.json")
 print(f"Published update: Windows {published}, iPad {published} build {ipad['build']}")
 PY

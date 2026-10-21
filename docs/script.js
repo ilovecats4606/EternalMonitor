@@ -215,30 +215,36 @@
     return (bytes / 1048576).toFixed(1) + ' MB';
   }
 
-  // Keep the Windows download paired with the TestFlight build shown in the HTML.
-  fetch('https://api.github.com/repos/sidebandstudio/EternalMonitor/releases/tags/v0.3.1', {
-    headers: { 'Accept': 'application/vnd.github.v3+json' }
-  })
+  // docs/latest.json is the single published release; both apps read it too.
+  // The tag comes from there, so publishing a release never needs this file.
+  fetch('latest.json', { cache: 'no-cache' })
+    .then(function (res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    })
+    .then(function (latest) {
+      var windows = latest && latest.windows;
+      if (!windows || !/^\d+\.\d+\.\d+$/.test(windows.version)) throw new Error('No Windows release');
+      var tag = 'v' + windows.version;
+      var installer = 'https://github.com/sidebandstudio/EternalMonitor/releases/download/' + tag + '/EternalMonitor-Setup.exe';
+      if (windows.installer !== installer) throw new Error('Unexpected installer');
+      downloadBtn.href = installer;
+      if (versionEl) versionEl.textContent = tag;
+      if (sha256El && /^[0-9a-f]{64}$/.test(windows.sha256)) sha256El.textContent = windows.sha256;
+      return fetch('https://api.github.com/repos/sidebandstudio/EternalMonitor/releases/tags/' + tag, {
+        headers: { 'Accept': 'application/vnd.github.v3+json' }
+      });
+    })
     .then(function (res) {
       if (!res.ok) throw new Error('HTTP ' + res.status);
       return res.json();
     })
     .then(function (release) {
+      // Only the size comes from GitHub; a failure keeps the size in the HTML.
       var asset = release.assets.find(function (a) {
         return a.name === 'EternalMonitor-Setup.exe';
       });
-
-      if (!asset) throw new Error('No Windows asset found');
-
-      downloadBtn.href = asset.browser_download_url;
-      if (versionEl) versionEl.textContent = release.tag_name;
-      if (metaEl) metaEl.textContent = asset.name + ' \u00B7 ' + formatBytes(asset.size);
-
-      // Try to extract SHA256 from release body
-      if (sha256El && release.body) {
-        var match = release.body.match(/[a-fA-F0-9]{64}/);
-        if (match) sha256El.textContent = match[0];
-      }
+      if (asset && metaEl) metaEl.textContent = asset.name + ' \u00B7 ' + formatBytes(asset.size);
     })
     .catch(function () {
       // The matching download, size and checksum are already present in the HTML.
