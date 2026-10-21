@@ -81,9 +81,15 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   stroke. `host/src/input/pen_contact.rs` chooses every frame from what
   Windows last accepted, so an end of contact or hover is never sent for a
   pointer Windows does not have.
+- When a session ends or another takes over, the host drops pen samples
+  Windows never received and ends only the pointer Windows holds, where it
+  holds it. If that place is off the virtual screen after a display change,
+  Windows refuses the end, or Windows is still refusing another frame, the
+  host recreates its pen device instead, which ends the pointer.
 - After `ERROR_NOT_READY`, that sample and any behind it wait in order, and
-  the next sample or refresh tick retries the same frame first. A release
-  is never dropped for a later stroke. Each waiting sample is mapped again
+  the next sample or refresh tick retries the same frame first; later
+  positions coalesce behind it. A release is never dropped for a later
+  stroke. Each waiting sample is mapped again
   from its normalised position when it is sent, so it lands on the display
   where it is at that moment.
 - A held contact remembers its normalised position. The refresh tick remaps it
@@ -93,7 +99,9 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   the captured display and virtual screen rectangles, the pen origin, the DPI
   awareness and whether Pencil uses the native pen or the mouse fallback.
 - The injector retries `ERROR_NOT_READY` for up to 2 ms because Windows can
-  reject calls spaced less than its 0.1 ms timestamp resolution.
+  reject calls spaced less than its 0.1 ms timestamp resolution. If a frame
+  is still refused after that, Windows' input queue is stuck: later frames
+  get one attempt each until one is accepted, so the transport keeps running.
 - A held contact or hover refreshes after 50 ms without a new sample, preventing
   Windows from expiring a stationary pen. Up and cancellation stop the refresh.
 
@@ -120,8 +128,9 @@ pixels Windows reports with the expected ones. `-WithVirtualDisplay` also
 enables the Virtual Display Driver, places it left of and then above the
 primary, and draws a stroke while it moves. It records the display layout
 first and restores it at the end; `result.json` lists both layouts.
-`-PenSequences` also records which raw frame sequences Windows rejects, at the
-centre of the probe window.
+`-PenSequences` also records which raw frame sequences Windows rejects, and
+checks that destroying the pen device mid-contact ends that contact and that a
+new device then draws normally, at the centre of the probe window.
 
 Before release, verify light-to-heavy strokes, pressure-sensitive dots, tilted
 brushes, diagonals and all canvas corners on a physical iPad. Rest a palm before
