@@ -30,6 +30,8 @@ enum ConnectionProblem: Equatable {
     case pcEndedSession
     /// The PC is streaming to another device, or still to this iPad's cable.
     case pcBusy
+    /// The PC stopped the stream to install an update and restarts on it.
+    case pcUpdating
 
     enum LostReason: Equatable {
         case pcStoppedResponding
@@ -62,6 +64,7 @@ enum ConnectionProblem: Equatable {
         case .reconnectFailed: return "Couldn't reconnect to your PC"
         case .pcEndedSession: return "Your PC ended the session"
         case .pcBusy: return "Your PC is already streaming to another device"
+        case .pcUpdating: return "Your PC is updating EternalMonitor"
         }
     }
 
@@ -106,6 +109,8 @@ enum ConnectionProblem: Equatable {
             return "Check that the PC is awake and EternalMonitor is open on it, then try again."
         case .pcEndedSession:
             return "Someone clicked Stop on the PC, changed a setting that restarts the stream, or closed EternalMonitor. Try again when the PC says Ready for your iPad."
+        case .pcUpdating:
+            return "This iPad reconnects when it's back. If it doesn't, check that EternalMonitor opened again on the PC, then try again."
         case .pcBusy:
             return "Disconnect the other iPad first, then try again."
         }
@@ -151,11 +156,21 @@ enum ConnectionProblem: Equatable {
     /// never answered.
     static func afterReconnecting(lastAttempt: ConnectionProblem?) -> ConnectionProblem {
         switch lastAttempt {
-        case .localNetworkBlocked, .noNetwork, .badAddress, .usbFailed, .noPicture, .pcBusy, .pcEndedSession:
+        case .localNetworkBlocked, .noNetwork, .badAddress, .usbFailed, .noPicture, .pcBusy, .pcEndedSession, .pcUpdating:
             return lastAttempt ?? .reconnectFailed
         default:
             return .reconnectFailed
         }
+    }
+
+    /// The failure a reconnect cycle keeps after one more attempt. While the
+    /// PC updates it turns sessions away (Busy), then stops answering until
+    /// the new version starts; neither replaces the update as the reason.
+    static func kept(_ kept: ConnectionProblem?, after attempt: ConnectionProblem?) -> ConnectionProblem? {
+        if kept == .pcUpdating, [.pcBusy, .noReply(usb: false), .pcEndedSession].contains(attempt) {
+            return kept
+        }
+        return afterReconnecting(lastAttempt: attempt) != .reconnectFailed ? attempt : kept
     }
 
     /// What a link failure means for the user. The raw error stays in the

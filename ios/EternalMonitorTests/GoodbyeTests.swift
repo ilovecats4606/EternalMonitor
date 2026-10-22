@@ -105,6 +105,19 @@ final class GoodbyeTests: XCTestCase {
         XCTAssertEqual(manager.reconnectAttempt, 0)
     }
 
+    /// Stop and update on the PC: the iPad tries again while the PC turns it
+    /// away for the update, and says the PC is updating, not that it is busy.
+    func testAPCStoppingForAnUpdateSaysSo() async throws {
+        let host = FakeUDPHost()
+        let manager = try await streaming(host)
+        defer { manager.cancel() }
+        host.sendBye(.hostShuttingDown)
+        let answered = await Task.detached { (0..<6).filter { _ in host.acceptSession(status: .busy) }.count }.value
+        XCTAssertGreaterThan(answered, 0, "the iPad never tried the PC again")
+        try await until("gave up", seconds: 20) { manager.reconnectAttempt == 0 && manager.state == .disconnected }
+        XCTAssertEqual(manager.problem?.title, "Your PC is updating EternalMonitor")
+    }
+
     /// Disconnected from the PC's side: the iPad stays away.
     func testAPCDisconnectingTheIPadStaysDisconnected() async throws {
         let host = FakeUDPHost()

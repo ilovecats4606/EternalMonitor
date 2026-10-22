@@ -565,6 +565,16 @@ final class ConnectionManager: ObservableObject {
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 self.record(.info, "ctrl", "Host BYE (\(reason))")
                 switch reason {
+                case .hostShuttingDown:
+                    // Only Stop and update on the PC sends this. The PC comes
+                    // back on the new version, so reconnect as for a restart.
+                    if self.reconnectCycleID != nil {
+                        self.disconnect()
+                        self.reconnectFailure = .pcUpdating
+                        self.problem = .pcUpdating
+                    } else {
+                        self.beginReconnect(.pcStoppedResponding, failure: .pcUpdating)
+                    }
                 case .userDisconnect, .superseded:
                     // Disconnected from the PC, or another device took over:
                     // stay away until the user connects again.
@@ -855,9 +865,7 @@ final class ConnectionManager: ObservableObject {
                     try? await Task.sleep(for: .milliseconds(250))
                 }
                 guard self.reconnectCycleID == cycleID else { return }
-                if ConnectionProblem.afterReconnecting(lastAttempt: self.problem) != .reconnectFailed {
-                    self.reconnectFailure = self.problem
-                }
+                self.reconnectFailure = ConnectionProblem.kept(self.reconnectFailure, after: self.problem)
             }
             guard let self, self.reconnectCycleID == cycleID else { return }
             let kept = self.reconnectFailure

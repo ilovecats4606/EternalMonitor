@@ -101,7 +101,7 @@ final class ConnectionProblemTests: XCTestCase {
             .noReply(usb: false), .noReply(usb: true), .noPicture, .receiverNotReady, .badAddress("pc"),
             .noNetwork, .localNetworkBlocked, .couldNotConnect, .usbFailed, .lost(.pcStoppedResponding), .lost(.cableUnplugged),
             .lost(.usbTurnedOff), .reconnecting(attempt: 2, of: 6), .reconnectFailed, .pcEndedSession,
-            .pcBusy, .pairingCodeAsAddress, .routerAddress,
+            .pcBusy, .pairingCodeAsAddress, .routerAddress, .pcUpdating,
         ]
         for problem in all {
             XCTAssertFalse(problem.title.isEmpty)
@@ -115,6 +115,20 @@ final class ConnectionProblemTests: XCTestCase {
         XCTAssertEqual(ConnectionProblem.lost(.cableUnplugged).actions, [])
         XCTAssertTrue(ConnectionProblem.noReply(usb: false).detail.contains("Firewall"))
         XCTAssertTrue(ConnectionProblem.noReply(usb: true).detail.contains("Apple Devices"))
+    }
+
+    func testAnUpdateStaysTheReasonWhileThePCRestarts() {
+        // Busy during the handoff and silence while Setup runs are the update.
+        for attempt: ConnectionProblem in [.pcBusy, .noReply(usb: false), .pcEndedSession] {
+            XCTAssertEqual(ConnectionProblem.kept(.pcUpdating, after: attempt), .pcUpdating, "\(attempt)")
+        }
+        // Something the user must fix replaces it.
+        XCTAssertEqual(ConnectionProblem.kept(.pcUpdating, after: .localNetworkBlocked), .localNetworkBlocked)
+        // Unchanged rules otherwise.
+        XCTAssertEqual(ConnectionProblem.kept(nil, after: .pcBusy), .pcBusy)
+        XCTAssertEqual(ConnectionProblem.kept(.usbFailed, after: .noReply(usb: false)), .usbFailed)
+        XCTAssertEqual(ConnectionProblem.afterReconnecting(lastAttempt: .pcUpdating), .pcUpdating)
+        XCTAssertEqual(ConnectionProblem.pcUpdating.actions, [.retry])
     }
 
     func testUSBCardTextIsPlain() {
