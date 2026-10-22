@@ -89,7 +89,8 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   (the device is then recreated to end its pointer), or native input is
   stuck (below). The waiting samples and
   the rest of that stroke follow it, pressing the mouse at the first. Native
-  input resumes at the next pen down or hover once the mouse holds nothing.
+  input resumes where the next stroke or hover starts once the mouse holds
+  nothing.
   The fallback is an ordered queue for `SendInput`: input Windows refuses,
   for example under UIPI, waits and is retried first at the next sample,
   refresh tick or reset, so a refused release always comes before the next
@@ -109,8 +110,9 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   the device then cancels the stroke being drawn. The host then recreates
   the pen device once; if the new one accepts nothing within 200 ms, the
   waiting samples and the strokes that follow go to the mouse, and the host
-  logs it once. It tries a new device at a later pen down or hover once the
-  mouse is idle, at most once a second, and gives that device 200 ms too. Recovery is logged when Windows accepts
+  logs it once. It tries a new device where a later stroke or hover starts
+  once the mouse is idle, at most once a second, and gives that device
+  200 ms too; a hover that carries on does not ask again. Recovery is logged when Windows accepts
   a frame again. An up waiting alone never counts as stuck.
 - When a session ends or another takes over, the host drops pen samples
   Windows never received and ends only the pointer Windows holds, where it
@@ -119,7 +121,8 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   host recreates its pen device instead, which ends the pointer.
 - If Windows refuses to recreate the pen device after the transport started
   with one, Pencil samples become mouse input, without pressure or tilt. The
-  host asks again at the next pen down or hover, at most once a second, and
+  host asks again where the next stroke or hover starts, at most once a
+  second, and
   logs the first refusal and the recovery once each. Sessions are still
   offered native pen input meanwhile, so Drawing mode keeps sending Pencil
   samples that can recover the device. If the device could not be created

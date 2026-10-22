@@ -43,6 +43,8 @@ pub struct PenDevice<A: PenApi> {
     /// What Windows believes about the pen; chooses every frame.
     contact: PenContact,
     mouse: Mouse,
+    /// The last sample was a hover, so a hover now does not start one.
+    hovering: bool,
 }
 
 /// A fallback mouse event.
@@ -204,6 +206,7 @@ impl<A: PenApi> PenDevice<A> {
             slot,
             contact: PenContact::default(),
             mouse: Mouse::default(),
+            hovering: false,
         }
     }
 
@@ -211,9 +214,8 @@ impl<A: PenApi> PenDevice<A> {
         self.slot.handle.is_some()
     }
 
-    /// Where no stroke is in progress (a pen down or a hover), ask again for
-    /// a device Windows refused or native input that was stuck, at most once
-    /// per `RETRY_INTERVAL`. After a stuck streak the new device must accept
+    /// Where a stroke or hover starts, ask again for a device Windows refused
+    /// or native input that was stuck, at most once per `RETRY_INTERVAL`. After a stuck streak the new device must accept
     /// a frame within `STUCK_TRIAL`, so a stroke it cannot carry soon goes
     /// to the mouse.
     pub fn revive(&mut self, now: Instant) {
@@ -253,10 +255,16 @@ impl<A: PenApi> PenDevice<A> {
         now: Instant,
     ) {
         self.pump(now);
+        let starts = match sample.phase {
+            PenPhase::Down => true,
+            PenPhase::Hover => !self.hovering,
+            _ => false,
+        };
+        self.hovering = sample.phase == PenPhase::Hover;
         if self.mouse_busy() {
             return self.mouse_for(sample, now, now);
         }
-        if matches!(sample.phase, PenPhase::Down | PenPhase::Hover) {
+        if starts {
             self.revive(now);
         }
         if !self.available() {
@@ -277,6 +285,7 @@ impl<A: PenApi> PenDevice<A> {
     /// native samples Windows never received, keeping a release owed while
     /// Windows holds the button.
     pub fn reset(&mut self, now: Instant) {
+        self.hovering = false;
         if self.available() {
             let mut target = Target {
                 screen: self.slot.api.screen(),
@@ -2179,6 +2188,40 @@ mod tests {
     }
 
     #[test]
+    fn hovering_over_stuck_native_input_tries_one_device() {
+        // Claude's case: eight seconds of hover while native input stays not
+        // ready. Once it is given up, the hover carries on on the mouse; it
+        // does not start again, so no device is asked for, and the cursor
+        // never freezes for a device's trial.
+        let mut device = PenDevice::new(FakeApi::new(&[]));
+        device.slot.api.answer = Outcome::NotReady;
+        let start = Instant::now();
+        let frame = Duration::from_millis(16);
+        let (mut now, mut x) = (start, 10);
+        while now < start + Duration::from_secs(8) {
+            deliver_one(&mut device, pen_xy(PenPhase::Hover, x, 1), now);
+            now += frame;
+            x = 10 + (x + 1) % 1000;
+        }
+        // The first device and the one recreated when native input seemed
+        // stuck.
+        assert_eq!(device.slot.api.created, 2);
+        assert_eq!(device.slot.reported, ["stuck"]);
+        let moves = device
+            .slot
+            .api
+            .mouse
+            .iter()
+            .filter(|input| matches!(input, Injection::MoveAbs { .. }))
+            .count();
+        assert!(moves > 400, "{moves}");
+        // A new hover may try again.
+        deliver_one(&mut device, pen_xy(PenPhase::Leave, x, 1), now);
+        deliver_one(&mut device, pen_xy(PenPhase::Hover, x, 1), now);
+        assert_eq!(device.slot.api.created, 3);
+    }
+
+    #[test]
     fn mouse_fallback_draws_pen_strokes_where_the_pen_would() {
         // Restored guard: the fallback's events, converted when sent, land
         // on the pen's desktop pixel at the far corner of a monitor left of
@@ -2229,7 +2272,8 @@ mod tests {
         // answers every one ERROR_NOT_READY for good, while SendInput works.
         // Strokes of random length and spacing, with hovers or refresh
         // ticks between them every 16 ms: every stroke starting two seconds
-        // or more after Windows first refused a frame is drawn on the mouse.
+        // or more after Windows first refused a frame is drawn on the mouse,
+        // and a long hover does not keep asking for devices.
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
         let frame = Duration::from_millis(16);
         let mut checked = 0;
@@ -2240,14 +2284,27 @@ mod tests {
             let mut now = start;
             let mut refused_at = None;
             let mut began = Vec::new();
+            // Devices created while a hover carries on.
+            let (mut hovering, mut created_mid_hover) = (false, 0);
             let mut call = |device: &mut PenDevice<FakeApi>, sample: Option<Injection>, now| {
                 if now >= stuck_at {
                     device.slot.api.answer = Outcome::NotReady;
                 }
-                let attempts = device.slot.api.frames.len();
+                let (attempts, created) = (device.slot.api.frames.len(), device.slot.api.created);
+                let phase = sample.map(|sample| {
+                    let Injection::Pen(sample) = sample else {
+                        unreachable!()
+                    };
+                    sample.phase
+                });
+                let carries_on = phase == Some(PenPhase::Hover) && hovering;
+                hovering = phase == Some(PenPhase::Hover);
                 match sample {
                     Some(sample) => deliver_one(device, sample, now),
                     None => flush_one(device, now),
+                }
+                if carries_on {
+                    created_mid_hover += device.slot.api.created - created;
                 }
                 if now >= stuck_at && device.slot.api.frames.len() > attempts {
                     refused_at.get_or_insert(now);
@@ -2255,7 +2312,7 @@ mod tests {
             };
             for stroke in 1..=40 {
                 let hovering = rng.below(2) == 0;
-                for _ in 0..rng.below(100) {
+                for _ in 0..rng.below(200) {
                     now += frame;
                     let hover = hovering.then(|| pen_xy(PenPhase::Hover, 1000, 0));
                     call(&mut device, hover, now);
@@ -2288,6 +2345,13 @@ mod tests {
                     _ => None,
                 })
                 .collect();
+            // However long a hover carries on, it asks for no device; the
+            // one recreated when native input first seemed stuck may land
+            // in a hover.
+            assert!(
+                created_mid_hover <= 1,
+                "stream {stream}: {created_mid_hover} devices created mid-hover"
+            );
             let Some(refused_at) = refused_at else {
                 continue;
             };
