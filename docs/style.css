@@ -12,7 +12,9 @@
   --border-strong: rgba(255, 255, 255, 0.14);
   --text: #f4f4f5;
   --muted: #a1a1aa;
-  --faint: #71717a;
+  /* 4.5:1 or more on every background it sits on, including the card
+     spotlight under the pointer (#323426 at its brightest). */
+  --faint: #9a9aa3;
   --accent: #e8ff47;
   --accent-rgb: 232, 255, 71;
   --on-accent: #0c0d04;
