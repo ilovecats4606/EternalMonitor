@@ -32,6 +32,55 @@ use eternal_wire::v2::{classify, Classified};
 /// Tests share process-global env (ETERNAL_*); run them one at a time.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Holds [`ENV_LOCK`] for one test and, when dropped (also while the test
+/// panics), puts the ETERNAL_* variables back as they were. A failed test
+/// then neither poisons the lock for the rest of the binary nor leaves
+/// settings such as ETERNAL_DROP behind for the next test.
+struct TestEnv {
+    before: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+fn test_env() -> TestEnv {
+    let lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    TestEnv {
+        before: eternal_vars(),
+        _lock: lock,
+    }
+}
+
+fn eternal_vars() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    std::env::vars_os()
+        .filter(|(name, _)| name.to_string_lossy().starts_with("ETERNAL_"))
+        .collect()
+}
+
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        for (name, _) in eternal_vars() {
+            std::env::remove_var(name);
+        }
+        for (name, value) in &self.before {
+            std::env::set_var(name, value);
+        }
+    }
+}
+
+#[test]
+fn a_failed_test_neither_poisons_the_env_lock_nor_leaks_its_settings() {
+    let leaked = std::thread::spawn(|| {
+        let _env = test_env();
+        std::env::set_var("ETERNAL_TEST_LEAK", "1");
+        panic!("a test that fails while it holds the env");
+    })
+    .join();
+    assert!(leaked.is_err());
+    let _env = test_env();
+    assert!(std::env::var_os("ETERNAL_TEST_LEAK").is_none());
+}
+
 /// Surface the host's tracing in test output (best effort, once per process).
 ///
 /// No thread under test may block on a log sink, as in production. A redirected
@@ -84,7 +133,7 @@ fn usb_framed_stream_end_to_end() {
     use eternal_wire::v2::control::HOSTCAP_USB;
     use std::sync::atomic::Ordering;
 
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _env = test_env();
     init_test_tracing();
     ffmpeg_next::init().unwrap();
     std::env::set_var("ETERNAL_CAPTURE", "synthetic");
@@ -448,7 +497,7 @@ fn audio_stream_end_to_end() {
     use eternal_wire::v2::audio::AudioHeader;
     use eternal_wire::v2::control::{FEATURE_WANTS_AUDIO, HOSTCAP_AUDIO};
     use std::sync::atomic::Ordering;
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _env = test_env();
     init_test_tracing();
     ffmpeg_next::init().unwrap();
     std::env::set_var("ETERNAL_CAPTURE", "synthetic");
@@ -618,7 +667,7 @@ fn wasapi_connect_first_second_audio() {
     use eternal_wire::v2::audio::AudioHeader;
     use eternal_wire::v2::control::FEATURE_WANTS_AUDIO;
     use std::sync::atomic::Ordering;
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _env = test_env();
     init_test_tracing();
     ffmpeg_next::init().unwrap();
     std::env::set_var("ETERNAL_CAPTURE", "synthetic");
@@ -697,7 +746,7 @@ fn wasapi_connect_first_second_audio() {
 
 #[test]
 fn synthetic_stream_end_to_end_v2() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _env = test_env();
     init_test_tracing();
     let _ = ffmpeg_next::init();
 
@@ -894,7 +943,7 @@ fn synthetic_stream_end_to_end_v2() {
 /// Repair is negotiated and exercised through the real encoder and transport.
 #[test]
 fn lossy_stream_recovers_and_adapts() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _env = test_env();
     init_test_tracing();
     let _ = ffmpeg_next::init();
     std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
@@ -1152,7 +1201,7 @@ fn lossy_stream_recovers_and_adapts() {
 /// down from its 15 Mbps start.
 #[test]
 fn lossy_legacy_stream_uses_keyframe_recovery() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _env = test_env();
     init_test_tracing();
     let _ = ffmpeg_next::init();
 
@@ -1298,7 +1347,7 @@ fn lossy_legacy_stream_uses_keyframe_recovery() {
 fn hevc_stream_negotiates_and_decodes() {
     use eternal_wire::v2::control::{CAP_DECODE_HEVC, CODEC_HEVC};
 
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _env = test_env();
     init_test_tracing();
     let _ = ffmpeg_next::init();
 
@@ -1449,7 +1498,7 @@ fn input_relay_maps_touches_end_to_end() {
     };
     use eternal_wire::v2::control::{InputEvent, FEATURE_WANTS_INPUT};
 
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _env = test_env();
     init_test_tracing();
     let _ = ffmpeg_next::init();
 
@@ -1715,7 +1764,7 @@ fn input_relay_maps_touches_end_to_end() {
 /// (the client never re-handshakes; its assembler resets on the epoch bump).
 #[test]
 fn encoder_crash_auto_restarts_and_stream_recovers() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _env = test_env();
     init_test_tracing();
     let _ = ffmpeg_next::init();
 
@@ -1844,7 +1893,7 @@ fn encoder_crash_auto_restarts_and_stream_recovers() {
 
 #[test]
 fn pairing_flow_end_to_end() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _env = test_env();
     init_test_tracing();
     ffmpeg_next::init().unwrap();
     std::env::set_var("ETERNAL_CAPTURE", "synthetic");
@@ -2012,7 +2061,7 @@ fn pairing_flow_end_to_end() {
 #[test]
 fn preferred_fps_caps_the_host() {
     use std::sync::atomic::Ordering;
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _env = test_env();
     init_test_tracing();
     ffmpeg_next::init().unwrap();
     std::env::set_var("ETERNAL_CAPTURE", "synthetic");
@@ -2111,7 +2160,7 @@ fn preferred_fps_caps_the_host() {
 fn quiet_clients_keep_their_session_until_they_go_silent() {
     use eternal_host::transport::session::LIVENESS_TIMEOUT;
 
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _env = test_env();
     init_test_tracing();
     let _ = ffmpeg_next::init();
     std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
