@@ -45,6 +45,12 @@ Windows changes.
   running and the banner links to the website.
 - Windows Settings has **Check for updates automatically** and **Check now**.
   **Later** hides the banner for that version for a day.
+- Opening EternalMonitor on the PC while it is already running brings its
+  window to the front instead of starting a second copy.
+- After **Stop and update** on the PC, the iPad says the PC is updating
+  EternalMonitor. With Auto-reconnect on it connects again once the new
+  version is running; otherwise, or if the PC takes longer, it says to try
+  again once EternalMonitor has opened on the PC.
 - The iPad connect screen and Settings say when a newer build is ready in
   TestFlight, with an **Open TestFlight** button.
 - When the PC and iPad cannot connect because one is older, both apps say which
@@ -91,6 +97,8 @@ Windows changes.
   current desktop.
 - PC audio no longer turns off for the rest of a session after a single large
   sound packet.
+- PC audio starts cleanly when the iPad connects, without a short burst of
+  stale sound or a gap in the first second.
 - The installer also allows display traffic on domain (work or school)
   networks.
 - A log line repeated many times in a row is written once, followed by a
