@@ -169,10 +169,9 @@ impl CaptureSession {
                 + block.samples.len() as u64 / u64::from(block.format.channels) * 1_000_000
                     / u64::from(block.format.rate),
         );
-        {
-            let mut stats = PIPELINE_STATS.lock();
-            stats.audio.device = self.source.name().into();
-            stats.audio.status = "Streaming".into();
+        if let Some(audio) = PIPELINE_STATS.lock().audio.of_stream(self.stream) {
+            audio.device = self.source.name().into();
+            audio.status = "Streaming".into();
         }
         let started_us = self.started_us.unwrap_or(0);
         for frame in self.resampler.as_mut().unwrap().push(&block)? {
@@ -208,6 +207,49 @@ impl CaptureSession {
     }
 }
 
+/// Replace the published audio stats with a new capture's, unless a newer
+/// generation has started, and return the stats it replaced. The audio
+/// thread is detached, so a stale stage can run after its successor. The
+/// check and the replacement share the stats lock; otherwise a stale stage
+/// descheduled between them could replace a newer capture's stats, and the
+/// transport would then discard every live packet as retired.
+fn publish(
+    target: &parking_lot::Mutex<crate::stats::PipelineStats>,
+    stats: AudioStats,
+    is_current: impl FnOnce() -> bool,
+) -> Option<AudioStats> {
+    let mut pipeline = target.lock();
+    is_current().then(|| std::mem::replace(&mut pipeline.audio, stats))
+}
+
+/// Apply `change` to the published audio stats if this generation is current.
+fn update_current(generation: u64, change: impl FnOnce(&mut AudioStats)) {
+    let mut stats = PIPELINE_STATS.lock();
+    if generation_is_current(generation) {
+        change(&mut stats.audio);
+    }
+}
+
+fn log_stats(stats: &AudioStats) {
+    tracing::info!(device = %stats.device, kbps = stats.kbps,
+        packets_per_sec = stats.packets_per_sec, quiet_packets = stats.quiet_packets,
+        dropped = stats.dropped, capture_queue_dropped = stats.capture_queue_dropped,
+        stale_dropped = stats.stale_dropped, oversized_dropped = stats.oversized_dropped,
+        send_failed = stats.send_failed, late_seqs = %stats.late_seqs,
+        failed_seqs = %stats.failed_seqs, audio_stream = stats.stream,
+        wire_stream = %stats.wire, "Audio stream stats");
+}
+
+/// Log a capture's final stats when it ends, so drops after its last
+/// periodic line still reach the log.
+fn log_final(session: Option<CaptureSession>) {
+    let Some(session) = session else { return };
+    let stats = PIPELINE_STATS.lock().audio.clone();
+    if stats.stream == session.stream {
+        log_stats(&stats);
+    }
+}
+
 /// An endpoint is opened only after both peers opt in. A failed capture
 /// attempt stays disabled for that session; reconnecting or toggling the
 /// host audio setting off and on retries without restarting video.
@@ -226,22 +268,20 @@ pub fn run_audio_stage(
     {
         let wanted = wanted_session(&shared);
         if wanted.is_none() {
-            active = None;
+            log_final(active.take());
             if !shared.audio_enabled.load(Ordering::SeqCst) {
                 failed_session = None;
             }
-            let mut stats = PIPELINE_STATS.lock();
-            stats
-                .audio
-                .stopped(if shared.audio_enabled.load(Ordering::SeqCst) {
+            update_current(generation, |audio| {
+                audio.stopped(if shared.audio_enabled.load(Ordering::SeqCst) {
                     "Waiting for client"
                 } else {
                     "Off"
                 });
-            if failed_session.is_none() {
-                stats.audio.error = None;
-            }
-            drop(stats);
+                if failed_session.is_none() {
+                    audio.error = None;
+                }
+            });
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
@@ -257,12 +297,20 @@ pub fn run_audio_stage(
             {
                 active = None;
                 let mut session = CaptureSession::new(session_id)?;
-                if !generation_is_current(generation) || !shared.running.load(Ordering::SeqCst) {
+                if !shared.running.load(Ordering::SeqCst) {
                     return Ok(false);
                 }
                 let stats = AudioStats::started(session.source.name());
                 session.stream = stats.stream;
-                PIPELINE_STATS.lock().audio = stats;
+                let Some(replaced) =
+                    publish(&PIPELINE_STATS, stats, || generation_is_current(generation))
+                else {
+                    return Ok(false);
+                };
+                if replaced.stream != 0 {
+                    // Drops charged since its last periodic line end up here.
+                    log_stats(&replaced);
+                }
                 tracing::info!(
                     session_id,
                     device = session.source.name(),
@@ -280,32 +328,30 @@ pub fn run_audio_stage(
             Ok(true) => {}
             Ok(false) => break,
             Err(error) => {
-                active = None;
+                log_final(active.take());
                 failed_session = Some(session_id);
                 let reason = error.to_string();
-                let mut stats = PIPELINE_STATS.lock();
-                stats.audio.stopped("Unavailable");
-                stats.audio.error = Some(reason.clone());
-                drop(stats);
+                update_current(generation, |audio| {
+                    audio.stopped("Unavailable");
+                    audio.error = Some(reason.clone());
+                });
                 reporter.stage_exited(Stage::Audio, StageOutcome::Failed(reason));
             }
         }
         if Instant::now() >= next_log {
             next_log = Instant::now() + Duration::from_secs(1);
             let stats = PIPELINE_STATS.lock().audio.clone();
-            tracing::info!(device = %stats.device, kbps = stats.kbps,
-                packets_per_sec = stats.packets_per_sec, quiet_packets = stats.quiet_packets,
-                dropped = stats.dropped, capture_queue_dropped = stats.capture_queue_dropped,
-                stale_dropped = stats.stale_dropped, oversized_dropped = stats.oversized_dropped,
-                send_failed = stats.send_failed, late_seqs = %stats.late_seqs,
-                failed_seqs = %stats.failed_seqs, audio_stream = stats.stream,
-                wire_stream = %stats.wire, "Audio stream stats");
+            // Log only this stage's capture, never a successor's stats.
+            if active
+                .as_ref()
+                .is_none_or(|session| session.stream == stats.stream)
+            {
+                log_stats(&stats);
+            }
         }
     }
-    drop(active);
-    if generation_is_current(generation) {
-        PIPELINE_STATS.lock().audio.stopped("Stopped");
-    }
+    log_final(active.take());
+    update_current(generation, |audio| audio.stopped("Stopped"));
     reporter.stage_exited(Stage::Audio, StageOutcome::Completed);
 }
 
@@ -448,6 +494,54 @@ mod tests {
                 START - first.capture_ts_us
             );
         }
+    }
+
+    #[test]
+    fn a_stale_generation_never_replaces_a_newer_capture() {
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        let target = parking_lot::Mutex::new(crate::stats::PipelineStats::default());
+        let generation = AtomicU64::new(1);
+        let newer = AudioStats::started("generation 2");
+        let newer_stream = newer.stream;
+        let mut pending = Some(newer);
+        // Generation 1's detached stage checks that it is current. Right
+        // then generation 2 starts, and its stage publishes as soon as it
+        // can get the stats lock.
+        let published = publish(&target, AudioStats::started("generation 1"), || {
+            let current = generation.load(SeqCst) == 1;
+            generation.store(2, SeqCst);
+            if !target.is_locked() {
+                let newer = pending.take().unwrap();
+                publish(&target, newer, || generation.load(SeqCst) == 2).unwrap();
+            }
+            current
+        });
+        if let Some(newer) = pending.take() {
+            assert!(publish(&target, newer, || generation.load(SeqCst) == 2).is_some());
+        }
+        assert!(
+            published.is_some(),
+            "generation 1 was current when it checked"
+        );
+        assert_eq!(
+            target.lock().audio.stream,
+            newer_stream,
+            "a stale generation replaced the newer capture's stats"
+        );
+    }
+
+    #[test]
+    fn a_replaced_capture_hands_back_its_final_stats() {
+        let target = parking_lot::Mutex::new(crate::stats::PipelineStats::default());
+        let mut first = AudioStats::started("A");
+        first.late_seqs.record(41);
+        assert_eq!(publish(&target, first, || true).unwrap().stream, 0);
+        // A drop charged after A's last periodic stats line.
+        target.lock().audio.late_seqs.record(42);
+        let replaced = publish(&target, AudioStats::started("B"), || true).unwrap();
+        assert_eq!(replaced.late_seqs.to_string(), "41-42");
+        assert!(publish(&target, AudioStats::started("C"), || false).is_none());
+        assert_eq!(target.lock().audio.device, "B");
     }
 
     /// Native check of the same startup path with the PC's real loopback.

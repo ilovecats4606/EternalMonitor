@@ -34,20 +34,19 @@ impl AudioSender {
             }
             session.peer()?
         };
-        if PIPELINE_STATS.lock().audio.stream != queued.stream {
+        {
+            let mut stats = PIPELINE_STATS.lock();
             // Audio restarted after this packet was queued; its capture's
             // numbering is over, so it belongs to no live stream.
-            return None;
-        }
-        if now_us.saturating_sub(queued.packet.capture_ts_us) > crate::audio::SEND_DEADLINE_US {
-            self.reset_pending = true;
-            if let Some(audio) = PIPELINE_STATS.lock().audio.of_stream(queued.stream) {
+            let audio = stats.audio.of_stream(queued.stream)?;
+            if now_us.saturating_sub(queued.packet.capture_ts_us) > crate::audio::SEND_DEADLINE_US {
+                self.reset_pending = true;
                 audio.dropped += 1;
                 audio.stale_dropped += 1;
                 audio.late_seqs.record(queued.packet.seq);
                 audio.note_wire(queued.session_id, epoch);
+                return None;
             }
-            return None;
         }
         let stream = (queued.session_id, epoch);
         let header = AudioHeader {
