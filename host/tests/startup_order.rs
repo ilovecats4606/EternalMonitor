@@ -1,7 +1,8 @@
 //! The order of `main`'s first steps matters and is easy to break in a merge:
 //! a helper process must be dispatched before the single-instance check, and
-//! a second launch must exit before it can reset the virtual display that the
-//! running host is streaming, or start a failure reporter of its own.
+//! a second launch must exit before it can rotate the running host's session
+//! log, start a second uploader, reset the virtual display that host is
+//! streaming, or start a failure reporter of its own.
 
 #[test]
 fn helpers_then_single_instance_then_the_display_reset() {
@@ -13,6 +14,10 @@ fn helpers_then_single_instance_then_the_display_reset() {
     let steps = [
         "eternal_host::startup::run_reporter_if_requested();",
         "eternal_host::single_instance::acquire()",
+        // A launch that loses the instance check must not rotate the running
+        // host's session log or start a second uploader on its outbox.
+        "logging::MemoryLogWriter::start()",
+        "eternal_host::telemetry::UploadGuard::start()",
         "vdd::disable();",
         "eternal_host::startup::install_failure_hooks();",
     ];

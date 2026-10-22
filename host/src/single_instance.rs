@@ -29,6 +29,9 @@ pub fn mutex_name(exe: &Path, app_data: &Path) -> String {
 pub struct Guard {
     #[cfg(windows)]
     _handle: windows::Win32::Foundation::HANDLE,
+    /// Why the check could not be made, if it could not. Taken before
+    /// logging starts, so the host logs it once its log is open.
+    pub problem: Option<String>,
 }
 
 /// `None` when another host from this installation is already running.
@@ -87,6 +90,7 @@ impl Guard {
         Self {
             #[cfg(windows)]
             _handle: windows::Win32::Foundation::HANDLE::default(),
+            problem: None,
         }
     }
 }
@@ -103,12 +107,15 @@ pub fn acquire_named(name: &str) -> Option<Guard> {
             }
             None
         }
-        Ok(handle) => Some(Guard { _handle: handle }),
+        Ok(handle) => Some(Guard {
+            _handle: handle,
+            problem: None,
+        }),
         // Never refuse to start because the check itself failed.
-        Err(error) => {
-            tracing::warn!(%error, "Could not check for another EternalMonitor");
-            Some(Guard::none())
-        }
+        Err(error) => Some(Guard {
+            problem: Some(error.to_string()),
+            ..Guard::none()
+        }),
     }
 }
 
@@ -186,16 +193,12 @@ pub fn show_existing() {
                 SW_SHOW
             },
         );
+        // This launch has no log of its own: it must not touch the running
+        // host's session log.
         if SetForegroundWindow(hwnd).as_bool() {
-            tracing::info!(
-                pid,
-                "Brought the running EternalMonitor window to the front"
-            );
+            eprintln!("Brought the running EternalMonitor window (process {pid}) to the front");
         } else {
-            tracing::info!(
-                pid,
-                "Windows kept another window in front of EternalMonitor"
-            );
+            eprintln!("Windows kept another window in front of EternalMonitor (process {pid})");
         }
         false.into()
     }

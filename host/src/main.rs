@@ -21,6 +21,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(windows)]
     eternal_host::input::windows_inject::become_per_monitor_dpi_aware();
 
+    // One host per installation; a second launch shows the first one and
+    // exits. Checked after helper-mode dispatch and before anything a host
+    // owns: opening the session log rotates it and the uploader drains the
+    // shared outbox, so a launch that loses here must not reach either, and
+    // must not reset the virtual display the first host is streaming.
+    let Some(instance) = eternal_host::single_instance::acquire() else {
+        eprintln!("EternalMonitor is already running; showing its window");
+        eternal_host::single_instance::show_existing();
+        return Ok(());
+    };
+
     // Anchor the process-wide media clock before anything else runs.
     clock::init();
 
@@ -50,15 +61,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         path = %logging::session_log_path().display(),
         "Session log file initialized"
     );
-
-    // One host per installation; a second launch shows the first one. Checked
-    // after any helper-mode dispatch above and before the virtual display
-    // reset below, which would cut the first host's stream.
-    let Some(_instance) = eternal_host::single_instance::acquire() else {
-        info!("EternalMonitor is already running; showing its window");
-        eternal_host::single_instance::show_existing();
-        return Ok(());
-    };
+    if let Some(problem) = &instance.problem {
+        tracing::warn!(%problem, "Could not check for another EternalMonitor");
+    }
 
     // Never leave a virtual display attached across runs. If a previous run crashed or was
     // force-killed while streaming the virtual extended display, the VDD device is still enabled
