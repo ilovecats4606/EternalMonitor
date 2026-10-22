@@ -182,20 +182,6 @@ pub fn desktop_pixel_to_pointer_location(x: i32, y: i32, screen: VirtualScreen) 
     (x.saturating_sub(screen.left), y.saturating_sub(screen.top))
 }
 
-/// Mouse equivalent of a pen sample, used only when Windows has no native
-/// pen device for us (Windows 10 before 1809, or creation failed).
-pub fn pen_to_mouse(sample: PenSample, screen: VirtualScreen) -> Vec<Injection> {
-    let (x, y) = desktop_pixel_to_abs(sample.x, sample.y, screen);
-    match sample.phase {
-        PenPhase::Down => vec![Injection::MoveAbs { x, y }, Injection::LeftDown { x, y }],
-        PenPhase::Move | PenPhase::Hover => vec![Injection::MoveAbs { x, y }],
-        PenPhase::Up | PenPhase::Cancel => {
-            vec![Injection::MoveAbs { x, y }, Injection::LeftUp { x, y }]
-        }
-        PenPhase::Leave => Vec::new(),
-    }
-}
-
 /// Where Pencil samples go on this host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PenPath {
@@ -1381,42 +1367,6 @@ mod tests {
     }
 
     #[test]
-    fn mouse_fallback_draws_pen_strokes_where_the_pen_would() {
-        let output = rect(-2360, 0, 2360, 1640);
-        let screen = bounding(&[output, rect(0, 0, 2560, 1440)]);
-        let sample = |phase| PenSample {
-            phase,
-            x: -2360,
-            y: 1639,
-            x_norm: 0,
-            y_norm: 65_535,
-            pressure: 512,
-            tilt_x: 0,
-            tilt_y: 0,
-        };
-        let abs = desktop_pixel_to_abs(-2360, 1639, screen);
-        let (x, y) = abs;
-        assert_eq!(windows_mouse_landing(abs, screen), (-2360, 1639));
-        assert_eq!(
-            pen_to_mouse(sample(PenPhase::Down), screen),
-            vec![Injection::MoveAbs { x, y }, Injection::LeftDown { x, y }]
-        );
-        for phase in [PenPhase::Move, PenPhase::Hover] {
-            assert_eq!(
-                pen_to_mouse(sample(phase), screen),
-                vec![Injection::MoveAbs { x, y }]
-            );
-        }
-        for phase in [PenPhase::Up, PenPhase::Cancel] {
-            assert_eq!(
-                pen_to_mouse(sample(phase), screen),
-                vec![Injection::MoveAbs { x, y }, Injection::LeftUp { x, y }]
-            );
-        }
-        assert!(pen_to_mouse(sample(PenPhase::Leave), screen).is_empty());
-    }
-
-    #[test]
     fn abs_round_trip_is_exact_on_every_representable_desktop_width() {
         // Exhaustive over each width, against the truncating landing model
         // documented on desktop_pixel_to_abs, with negative origins.
@@ -1634,13 +1584,13 @@ mod tests {
             recreated: 0,
         };
         if tick {
-            contact.flush(Some(output), &mut target);
+            contact.flush(Some(output), std::time::Instant::now(), &mut target);
         }
         for injection in recorder::take() {
             let Injection::Pen(sample) = injection else {
                 panic!("expected only pen input, got {injection:?}");
             };
-            contact.deliver(sample, Some(output), &mut target);
+            contact.deliver(sample, Some(output), std::time::Instant::now(), &mut target);
         }
         assert_eq!(target.recreated, 0);
         target.frames

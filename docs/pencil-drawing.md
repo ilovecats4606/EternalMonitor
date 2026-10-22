@@ -92,9 +92,15 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   The fallback is an ordered queue for `SendInput`: input Windows refuses,
   for example under UIPI, waits and is retried first at the next sample,
   refresh tick or reset, so a refused release always comes before the next
-  press. Ink that has waited a second is dropped rather than replayed late,
-  but a release stays owed while Windows holds the button, and native input
+  press. Each event is placed on the virtual screen as it is when sent, so a
+  display change while input waits moves it with the desktop. Native input
   waits until the mouse is idle.
+- Each sample is timed from when the host receives it, and keeps that time
+  in the native queue and on the mouse. Once the oldest waiting sample is a
+  second old, everything waiting on that path is dropped rather than drawn
+  late: natively, the pen device is recreated, which ends any pointer Windows
+  holds; on the mouse, a release stays owed while Windows holds the button.
+  The next sample starts a new stroke cleanly.
 - When a session ends or another takes over, the host drops pen samples
   Windows never received and ends only the pointer Windows holds, where it
   holds it. If that place is off the virtual screen after a display change,
@@ -111,8 +117,8 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   Pencil outside Drawing mode works as a mouse.
 - After `ERROR_NOT_READY`, that sample and any behind it wait in order, and
   the next sample or refresh tick retries the same frame first; later
-  positions coalesce behind it. No other sample is dropped. Each waiting
-  sample is mapped again
+  positions coalesce behind it. No other sample is dropped unless waiting
+  makes it stale, as above. Each waiting sample is mapped again
   from its normalised position when it is sent, so it lands on the display
   where it is at that moment.
 - A held contact remembers its normalised position. The refresh tick remaps it
