@@ -231,6 +231,8 @@ impl Drop for Uploader {
         }
         // The thread is inside a request and holds no lock; keep what it has
         // not written yet and let the process exit without it.
+        #[cfg(test)]
+        tests::GAVE_UP.with(|gave_up| gave_up.set(true));
         let Ok(receiver) = self.receiver.lock() else {
             return;
         };
@@ -609,14 +611,23 @@ mod tests {
             ["warning", "error", "info"]
         );
     }
-    /// Serves each upload after `delay`, acknowledging its batch.
-    fn slow_server(delay: Duration) -> String {
+    thread_local! {
+        /// Set on the thread whose `Uploader` drop stopped waiting for its thread.
+        pub(super) static GAVE_UP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Serves each upload after `delay`, acknowledging its batch. The counter
+    /// says how many requests have arrived.
+    fn slow_server(delay: Duration) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let arrived = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = arrived.clone();
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { return };
+                let counter = counter.clone();
                 std::thread::spawn(move || {
                     let mut bytes = Vec::new();
                     let mut buffer = [0; 4096];
@@ -641,6 +652,7 @@ mod tests {
                             break bytes[end + 4..end + 4 + size].to_vec();
                         }
                     };
+                    counter.fetch_add(1, Ordering::SeqCst);
                     std::thread::sleep(delay);
                     let batch: serde_json::Value = serde_json::from_slice(&body).unwrap();
                     let reply =
@@ -653,7 +665,7 @@ mod tests {
                 });
             }
         });
-        format!("http://{address}/v1/events")
+        (format!("http://{address}/v1/events"), arrived)
     }
 
     fn outbox_with_batches(count: usize) -> PathBuf {
@@ -665,25 +677,33 @@ mod tests {
         directory
     }
 
-    fn quit_waits(delay: Duration) -> (Duration, PathBuf) {
+    /// Quit as main does while the first upload is in flight. Returns how long
+    /// the quit took and whether it stopped waiting for the upload thread.
+    fn quit_waits(delay: Duration) -> (Duration, PathBuf, bool) {
         let directory = outbox_with_batches(8);
+        let (endpoint, arrived) = slow_server(delay);
         let config = Config {
-            endpoint: slow_server(delay),
+            endpoint,
             ingest_key: "write-only".into(),
             enabled: true,
             allow_http: true,
         };
         let (sender, uploader) = Uploader::spawn(config, directory.clone());
-        // Let the first request start, then quit as main does.
-        std::thread::sleep(Duration::from_millis(300));
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while arrived.load(Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "no upload started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         sender
             .send(Queued::Line(
                 "2026-10-21T17:11:31Z  INFO EternalMonitor shutting down".into(),
             ))
             .unwrap();
+        GAVE_UP.with(|gave_up| gave_up.set(false));
         let started = std::time::Instant::now();
         drop(uploader);
-        (started.elapsed(), directory)
+        let waited = started.elapsed();
+        (waited, directory, GAVE_UP.with(|gave_up| gave_up.get()))
     }
 
     fn outbox_messages(directory: &Path) -> Vec<String> {
@@ -702,7 +722,7 @@ mod tests {
 
     #[test]
     fn quitting_stops_between_slow_uploads_and_keeps_the_rest() {
-        let (waited, directory) = quit_waits(Duration::from_millis(1500));
+        let (waited, directory, _) = quit_waits(Duration::from_millis(1500));
         assert!(
             waited < Duration::from_millis(2500),
             "quit waited {waited:?}"
@@ -732,7 +752,7 @@ mod tests {
     fn quitting_near_the_deadline_keeps_every_drained_event() {
         let directory = outbox_with_batches(1);
         let config = Config {
-            endpoint: slow_server(Duration::from_millis(1700)),
+            endpoint: slow_server(Duration::from_millis(1700)).0,
             ingest_key: "write-only".into(),
             enabled: true,
             allow_http: true,
@@ -809,11 +829,15 @@ mod tests {
 
     #[test]
     fn quitting_during_a_stalled_upload_is_bounded_and_keeps_the_last_lines() {
-        let (waited, directory) = quit_waits(Duration::from_secs(30));
-        assert!(
-            waited < SHUTDOWN_WAIT + Duration::from_millis(600),
-            "quit waited {waited:?}"
-        );
+        let (waited, directory, gave_up) = quit_waits(Duration::from_secs(30));
+        // What bounds the quit: it stops waiting for the stalled upload
+        // thread after SHUTDOWN_WAIT instead of joining it. Waiting for the
+        // request to time out (5 s) or for the thread would fail this.
+        assert!(gave_up, "quit waited for the stalled upload, {waited:?}");
+        // The elapsed time is only a backstop for a hang: on a loaded PC
+        // the outbox writes after the wait took 2.7 s. The quits this guards
+        // against took 12.9 s and 30 s.
+        assert!(waited < Duration::from_secs(10), "quit waited {waited:?}");
         let messages = outbox_messages(&directory);
         assert!(messages
             .iter()
