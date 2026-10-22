@@ -175,16 +175,19 @@ pub fn show_existing() {
         )
         .is_ok()
             && same_file(&String::from_utf16_lossy(&path[..size as usize]), exe);
-        let _ = CloseHandle(process);
         if !same {
+            let _ = CloseHandle(process);
             return true.into();
         }
         // The window's own thread restores it and asks to be activated, so
         // the running host needs the right to come to the front. Windows
         // gives it to the launch the user just started; pass it on. Without
         // that right (a launch from a background task) the window is only
-        // restored and its taskbar button flashes.
+        // restored and its taskbar button flashes. The handle stays open
+        // through the grant: an open handle keeps the verified process's id
+        // from being reused by another process meanwhile.
         let _ = AllowSetForegroundWindow(pid);
+        let _ = CloseHandle(process);
         let _ = ShowWindow(
             hwnd,
             if IsIconic(hwnd).as_bool() {
