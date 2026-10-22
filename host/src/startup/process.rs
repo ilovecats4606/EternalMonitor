@@ -195,7 +195,9 @@ pub(crate) mod tests {
     #[test]
     fn a_detached_child_inherits_no_handles() {
         use windows::core::HSTRING;
-        use windows::Win32::Foundation::{CloseHandle, CompareObjectHandles, HANDLE};
+        use windows::Win32::Foundation::{
+            CloseHandle, CompareObjectHandles, GetHandleInformation, HANDLE,
+        };
         use windows::Win32::Security::SECURITY_ATTRIBUTES;
         use windows::Win32::System::Threading::{
             CreateEventW, OpenEventW, SYNCHRONIZATION_SYNCHRONIZE,
@@ -207,11 +209,16 @@ pub(crate) mod tests {
             let value: usize = parts.next().unwrap().parse().unwrap();
             let name = parts.next().unwrap();
             let result = parts.next().unwrap();
-            let ours =
-                unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(name)) }
-                    .unwrap();
-            let inherited =
-                unsafe { CompareObjectHandles(HANDLE(value as *mut _), ours) }.as_bool();
+            // Look for the value before opening a handle of our own, which
+            // could otherwise get the same value and compare equal to itself.
+            let mut flags = 0;
+            let open = unsafe { GetHandleInformation(HANDLE(value as *mut _), &mut flags) }.is_ok();
+            let inherited = open && {
+                let ours =
+                    unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(name)) }
+                        .unwrap();
+                unsafe { CompareObjectHandles(HANDLE(value as *mut _), ours) }.as_bool()
+            };
             let partial = format!("{result}.part");
             std::fs::write(
                 &partial,
