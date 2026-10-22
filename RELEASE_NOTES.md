@@ -1,11 +1,25 @@
 ## EternalMonitor (unreleased)
 
-Plain-language setup and problem messages in both apps, in-app updates, and
-Windows reliability and startup fixes from 0.3.1 support diagnostics. iPads on
-0.3.1 work with the Windows changes.
+Apple Pencil placement on PCs with more than one monitor, plain-language setup
+and problem messages in both apps, in-app updates, and Windows reliability and
+startup fixes from 0.3.1 support diagnostics. iPads on 0.3.1 work with the
+Windows changes.
 
 ### What changed
 
+- Apple Pencil lands under the tip when another monitor sits to the left of or
+  above the main display, including an extended iPad display placed there.
+  Previously the pen moved left or up by that monitor's size, and strokes near
+  the far edge stopped with "Windows rejected native pen input".
+- After Windows cancels a pen contact, for example when a display changes mode,
+  the stroke continues from the same Pencil sample instead of being dropped
+  until the Pencil lifts. A Pencil held still follows a display that moves.
+- The Windows host uses physical pixels from startup on scaled displays, and
+  touch clicks land on the exact pixel on every monitor layout, including very
+  wide desktops.
+- If Windows cannot create its pen device, Pencil outside Drawing mode works as
+  a mouse instead of doing nothing.
+- The host log records the input mapping geometry for each session.
 - The Windows Stream page asks **Use the iPad as** with **Mirror my screen**
   and **Second screen** at the top, above the fold. A change applies straight
   away: a running stream restarts and the iPad reconnects by itself. The iPad
@@ -98,6 +112,12 @@ Install the previous version on Windows, then click **Update now** when the
 banner appears. Approve the Windows prompt and check that EternalMonitor opens
 again on the new version. Try it once while streaming. On the iPad, tap
 **Open TestFlight** from the banner.
+
+With two monitors, place the second one to the left of the main display in
+Windows Display settings. Mirror the main display, then touch each corner and
+the centre of the iPad picture with Apple Pencil; the pointer should appear
+under the tip each time. Repeat with the extended iPad display placed to the
+left of and above the main display, and with display scaling at 125%.
 
 ## EternalMonitor v0.3.1
 

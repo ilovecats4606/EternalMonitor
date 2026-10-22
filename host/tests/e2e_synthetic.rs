@@ -1493,10 +1493,20 @@ fn hevc_stream_negotiates_and_decodes() {
 #[test]
 fn input_relay_maps_touches_end_to_end() {
     use eternal_host::input::{
-        recorder, Injection, KIND_HOVER, KIND_KEY, KIND_MOUSE_ABS, KIND_SCROLL, KIND_TEXT,
-        KIND_TOUCH,
+        desktop_pixel_to_abs, recorder, Injection, VirtualScreen, KIND_HOVER, KIND_KEY,
+        KIND_MOUSE_ABS, KIND_SCROLL, KIND_TEXT, KIND_TOUCH,
     };
     use eternal_wire::v2::control::{InputEvent, FEATURE_WANTS_INPUT};
+    // Off Windows the synthetic output is the whole virtual screen. Absolute
+    // coordinates aim at pixel centres.
+    let screen = VirtualScreen {
+        left: 0,
+        top: 0,
+        width: SYNTH_W,
+        height: SYNTH_H,
+    };
+    let (x0, y0) = desktop_pixel_to_abs(0, 0, screen);
+    let (x1, y1) = desktop_pixel_to_abs(SYNTH_W as i32 - 1, SYNTH_H as i32 - 1, screen);
 
     let _env = test_env();
     init_test_tracing();
@@ -1645,21 +1655,15 @@ fn input_relay_maps_touches_end_to_end() {
     assert_eq!(
         &recorded[..4],
         &[
-            Injection::MoveAbs { x: 0, y: 0 },
-            Injection::LeftDown { x: 0, y: 0 },
-            Injection::MoveAbs { x: 0, y: 0 },
-            Injection::LeftUp { x: 0, y: 0 },
+            Injection::MoveAbs { x: x0, y: y0 },
+            Injection::LeftDown { x: x0, y: y0 },
+            Injection::MoveAbs { x: x0, y: y0 },
+            Injection::LeftUp { x: x0, y: y0 },
         ],
         "tap must inject exactly one click (recorded: {recorded:?})"
     );
-    // Drag to the far corner maps to the absolute-space maximum.
-    assert_eq!(
-        recorded[4],
-        Injection::MoveAbs {
-            x: 65_535,
-            y: 65_535
-        }
-    );
+    // Drag to the far corner maps to the last pixel's centre.
+    assert_eq!(recorded[4], Injection::MoveAbs { x: x1, y: y1 });
     // Scroll: pointer placed at ~center, then a wheel tick down.
     let Injection::MoveAbs { x, y } = recorded[5] else {
         panic!("expected scroll pointer move, got {:?}", recorded[5]);
@@ -1679,11 +1683,11 @@ fn input_relay_maps_touches_end_to_end() {
                 extended: true
             },
             Injection::Unicode(72),
-            Injection::MoveAbs { x: 0, y: 0 },
-            Injection::MoveAbs { x: 0, y: 0 },
-            Injection::MiddleDown { x: 0, y: 0 },
-            Injection::MoveAbs { x: 0, y: 0 },
-            Injection::MiddleUp { x: 0, y: 0 },
+            Injection::MoveAbs { x: x0, y: y0 },
+            Injection::MoveAbs { x: x0, y: y0 },
+            Injection::MiddleDown { x: x0, y: y0 },
+            Injection::MoveAbs { x: x0, y: y0 },
+            Injection::MiddleUp { x: x0, y: y0 },
         ]
     );
     assert_eq!(recorded.len(), 15, "no extra injections: {recorded:?}");
@@ -1724,6 +1728,8 @@ fn input_relay_maps_touches_end_to_end() {
         phase: PenPhase::Down,
         x: 0,
         y: 0,
+        x_norm: 0,
+        y_norm: 0,
         pressure: 256,
         tilt_x: -40,
         tilt_y: 30,

@@ -7,6 +7,12 @@ use windows::Win32::UI::Controls::{
     CreateSyntheticPointerDevice, DestroySyntheticPointerDevice, HSYNTHETICPOINTERDEVICE,
     POINTER_FEEDBACK_NONE, POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
 };
+use windows::Win32::UI::HiDpi::{
+    AreDpiAwarenessContextsEqual, GetAwarenessFromDpiAwarenessContext,
+    GetThreadDpiAwarenessContext, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, DPI_AWARENESS_PER_MONITOR_AWARE,
+    DPI_AWARENESS_SYSTEM_AWARE, DPI_AWARENESS_UNAWARE,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
@@ -15,7 +21,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Input::Pointer::{
-    InjectSyntheticPointerInput, POINTER_FLAG_CANCELED, POINTER_FLAG_DOWN,
+    InjectSyntheticPointerInput, POINTER_FLAGS, POINTER_FLAG_CANCELED, POINTER_FLAG_DOWN,
     POINTER_FLAG_FIRSTBUTTON, POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE, POINTER_FLAG_PRIMARY,
     POINTER_FLAG_UP, POINTER_FLAG_UPDATE, POINTER_INFO, POINTER_PEN_INFO,
 };
@@ -25,118 +31,186 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
-use super::{Injection, PenPhase, PenSample, VirtualScreen};
+use super::pen_contact::{pointer_flag, NotReadyRetry, Outcome, PointerFrame, PointerKind};
+use super::pen_device::PenApi;
+use super::{CaptureGeometry, Injection, PenSample, VirtualScreen};
 
-/// One device per relay, retained across samples and destroyed at shutdown.
-#[derive(Debug)]
-pub struct PenDevice {
-    handle: Option<HSYNTHETICPOINTERDEVICE>,
-    warned: bool,
+// Frames are built, and tested, without the SDK.
+const _: () = {
+    assert!(POINTER_FLAG_INRANGE.0 == pointer_flag::INRANGE);
+    assert!(POINTER_FLAG_INCONTACT.0 == pointer_flag::INCONTACT);
+    assert!(POINTER_FLAG_FIRSTBUTTON.0 == pointer_flag::FIRSTBUTTON);
+    assert!(POINTER_FLAG_PRIMARY.0 == pointer_flag::PRIMARY);
+    assert!(POINTER_FLAG_CANCELED.0 == pointer_flag::CANCELED);
+    assert!(POINTER_FLAG_DOWN.0 == pointer_flag::DOWN);
+    assert!(POINTER_FLAG_UPDATE.0 == pointer_flag::UPDATE);
+    assert!(POINTER_FLAG_UP.0 == pointer_flag::UP);
+};
+
+/// The Win32 calls behind the native pen device.
+#[derive(Debug, Default)]
+pub(crate) struct Win32Pen {
+    /// Error codes already logged, so a repeated refusal logs once.
+    warned: Vec<windows::core::HRESULT>,
+    retry: NotReadyRetry,
 }
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Win32Handle(HSYNTHETICPOINTERDEVICE);
 
 // This is a process-owned User32 handle, not a pointer we dereference. Tokio
 // may move the relay between threads; &mut self serializes every API call.
-unsafe impl Send for PenDevice {}
+unsafe impl Send for Win32Handle {}
+
+impl PenApi for Win32Pen {
+    type Handle = Win32Handle;
+    type Error = windows::core::Error;
+
+    fn create(&mut self) -> Result<Win32Handle, windows::core::Error> {
+        unsafe { CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_NONE) }.map(Win32Handle)
+    }
+
+    fn destroy(&mut self, handle: Win32Handle) {
+        unsafe { DestroySyntheticPointerDevice(handle.0) };
+    }
+
+    fn screen(&self) -> VirtualScreen {
+        virtual_screen()
+    }
+
+    fn inject(
+        &mut self,
+        handle: Win32Handle,
+        frame: PenSample,
+        from: PointerKind,
+        screen: VirtualScreen,
+        output: Option<CaptureGeometry>,
+    ) -> Outcome {
+        let context = FrameContext { screen, output };
+        inject_frame(
+            handle.0,
+            frame,
+            from,
+            context,
+            &mut self.warned,
+            &mut self.retry,
+        )
+    }
+
+    fn send_mouse(&mut self, injections: &[Injection]) -> usize {
+        let mut inputs = Vec::with_capacity(injections.len());
+        for &injection in injections {
+            push_input(&mut inputs, injection);
+        }
+        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) } as usize;
+        if sent == inputs.len() {
+            super::log_injections(injections);
+        } else {
+            // UIPI or a desktop switch; PenDevice tries a refused release again.
+            debug!(
+                sent,
+                requested = inputs.len(),
+                "SendInput inserted fewer pen fallback events than requested"
+            );
+        }
+        sent
+    }
+}
+
+pub(crate) type PenDevice = super::pen_device::PenDevice<Win32Pen>;
 
 impl Default for PenDevice {
     fn default() -> Self {
-        let handle = match unsafe { CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_NONE) }
-        {
-            Ok(handle) => Some(handle),
-            Err(error) => {
-                warn!(%error, "Native Windows pen input unavailable");
-                None
-            }
-        };
-        Self {
-            handle,
-            warned: false,
-        }
+        Self::new(Win32Pen::default())
     }
 }
 
-impl PenDevice {
-    pub fn available(&self) -> bool {
-        self.handle.is_some()
-    }
+/// Where a frame was aimed, for the once-per-error warning.
+#[derive(Clone, Copy)]
+struct FrameContext {
+    screen: VirtualScreen,
+    output: Option<CaptureGeometry>,
+}
 
-    fn inject(&mut self, sample: PenSample) {
-        let Some(handle) = self.handle else {
-            return;
-        };
-        let flags = match sample.phase {
-            PenPhase::Down => {
-                POINTER_FLAG_DOWN
-                    | POINTER_FLAG_INRANGE
-                    | POINTER_FLAG_INCONTACT
-                    | POINTER_FLAG_FIRSTBUTTON
-            }
-            PenPhase::Move => {
-                POINTER_FLAG_UPDATE
-                    | POINTER_FLAG_INRANGE
-                    | POINTER_FLAG_INCONTACT
-                    | POINTER_FLAG_FIRSTBUTTON
-            }
-            // Finish contact completely. Supported UIKit hover starts a new
-            // in-range update; unsupported devices must not leave ghost hover.
-            PenPhase::Up => POINTER_FLAG_UP,
-            PenPhase::Cancel => POINTER_FLAG_UP | POINTER_FLAG_CANCELED,
-            PenPhase::Hover => POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE,
-            PenPhase::Leave => POINTER_FLAG_UPDATE,
-        };
-        let info = POINTER_TYPE_INFO {
-            r#type: PT_PEN,
-            Anonymous: POINTER_TYPE_INFO_0 {
-                penInfo: POINTER_PEN_INFO {
-                    pointerInfo: POINTER_INFO {
-                        pointerType: PT_PEN,
-                        pointerId: 1,
-                        pointerFlags: flags | POINTER_FLAG_PRIMARY,
-                        ptPixelLocation: POINT {
-                            x: sample.x,
-                            y: sample.y,
-                        },
-                        ..Default::default()
-                    },
-                    penMask: PEN_MASK_PRESSURE | PEN_MASK_TILT_X | PEN_MASK_TILT_Y,
-                    pressure: sample.pressure,
-                    tiltX: sample.tilt_x,
-                    tiltY: sample.tilt_y,
+fn inject_frame(
+    handle: HSYNTHETICPOINTERDEVICE,
+    frame: PenSample,
+    from: PointerKind,
+    context: FrameContext,
+    warned: &mut Vec<windows::core::HRESULT>,
+    retry: &mut NotReadyRetry,
+) -> Outcome {
+    let screen = context.screen;
+    let pointer = PointerFrame::new(frame, screen);
+    let (x, y) = pointer.location;
+    let info = POINTER_TYPE_INFO {
+        r#type: PT_PEN,
+        Anonymous: POINTER_TYPE_INFO_0 {
+            penInfo: POINTER_PEN_INFO {
+                pointerInfo: POINTER_INFO {
+                    pointerType: PT_PEN,
+                    pointerId: 1,
+                    pointerFlags: POINTER_FLAGS(pointer.flags),
+                    ptPixelLocation: POINT { x, y },
                     ..Default::default()
                 },
+                penMask: PEN_MASK_PRESSURE | PEN_MASK_TILT_X | PEN_MASK_TILT_Y,
+                pressure: pointer.pressure,
+                tiltX: pointer.tilt_x,
+                tiltY: pointer.tilt_y,
+                ..Default::default()
             },
-        };
-        // Windows timestamps injection at 0.1 ms resolution. Coalesced UIKit
-        // samples can arrive together; retry that same sample if the OS clock
-        // has not advanced, instead of silently losing a stroke point or up.
-        let started = std::time::Instant::now();
-        let result = loop {
-            let result = unsafe { InjectSyntheticPointerInput(handle, &[info]) };
-            if result.as_ref().is_err_and(|error| {
-                error.code() == windows::core::HRESULT::from_win32(ERROR_NOT_READY.0)
-            }) && started.elapsed() < std::time::Duration::from_millis(2)
-            {
-                std::thread::yield_now();
-                continue;
-            }
-            break result;
-        };
-        match result {
-            Ok(()) => super::log_injections(&[Injection::Pen(sample)]),
-            Err(error) if !self.warned => {
-                self.warned = true;
-                warn!(%error, "Windows rejected native pen input");
-            }
-            Err(_) => {}
+        },
+    };
+    // Past the retry window, PenContact keeps the frame for the next tick.
+    let not_ready = windows::core::HRESULT::from_win32(ERROR_NOT_READY.0);
+    let result = retry.call(
+        || unsafe { InjectSyntheticPointerInput(handle, &[info]) },
+        |error| error.code() == not_ready,
+    );
+    let error = match result {
+        Ok(()) => {
+            super::log_injections(&[Injection::Pen(frame)]);
+            return Outcome::Injected;
         }
+        Err(error) => error,
+    };
+    if !warned.contains(&error.code()) {
+        warned.push(error.code());
+        // E_ACCESSDENIED: the secure desktop or an elevated window has focus;
+        // SendInput is blocked there too, so there is no useful fallback.
+        // Other codes point at the frame, its starting state or the geometry.
+        let output = context.output.unwrap_or(CaptureGeometry {
+            left: 0,
+            top: 0,
+            width: 0,
+            height: 0,
+        });
+        warn!(
+            %error,
+            phase = ?frame.phase,
+            from = ?from,
+            pressure = frame.pressure,
+            desktop_x = frame.x,
+            desktop_y = frame.y,
+            location_x = x,
+            location_y = y,
+            virtual_left = screen.left,
+            virtual_top = screen.top,
+            virtual_width = screen.width,
+            virtual_height = screen.height,
+            output_left = output.left,
+            output_top = output.top,
+            output_width = output.width,
+            output_height = output.height,
+            dpi_awareness = dpi_awareness(),
+            "Windows rejected native pen input"
+        );
     }
-}
-
-impl Drop for PenDevice {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            unsafe { DestroySyntheticPointerDevice(handle) };
-        }
+    if error.code() == not_ready {
+        Outcome::NotReady
+    } else {
+        Outcome::Rejected
     }
 }
 
@@ -189,84 +263,57 @@ fn mouse_input(
     }
 }
 
-/// Execute a resolved injection batch.
-pub fn inject(injections: &[Injection], pen: &mut PenDevice) {
+/// The injecting thread's DPI awareness. Anything other than per-monitor
+/// means Windows rescales the coordinates we pass.
+pub fn dpi_awareness() -> &'static str {
+    unsafe {
+        let context = GetThreadDpiAwarenessContext();
+        if AreDpiAwarenessContextsEqual(context, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+            .as_bool()
+        {
+            return "per_monitor_v2";
+        }
+        match GetAwarenessFromDpiAwarenessContext(context) {
+            DPI_AWARENESS_PER_MONITOR_AWARE => "per_monitor",
+            DPI_AWARENESS_SYSTEM_AWARE => "system",
+            DPI_AWARENESS_UNAWARE => "unaware",
+            _ => "unknown",
+        }
+    }
+}
+
+/// Desktop duplication, monitor rects, the virtual screen and every injected
+/// coordinate must share one physical pixel space. Call before any window,
+/// DXGI factory or GUI exists; a manifest or an earlier call wins otherwise.
+pub fn become_per_monitor_dpi_aware() {
+    let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+}
+
+/// Execute a resolved injection batch. `output` is the captured display the
+/// batch was mapped onto, for diagnostics.
+pub(crate) fn inject(
+    injections: &[Injection],
+    pen: &mut PenDevice,
+    output: Option<CaptureGeometry>,
+) {
     if !probe_guard_allows(injections) {
         warn!("Input probe guard rejected an injection batch");
         return;
     }
+    let screen = virtual_screen();
+    let now = std::time::Instant::now();
     let mut inputs: Vec<INPUT> = Vec::with_capacity(injections.len() * 2);
-    for injection in injections {
-        let input = match *injection {
-            Injection::Pen(sample) => {
-                // Flush keyboard releases first when a session is cancelled.
-                if !inputs.is_empty() {
-                    unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-                    inputs.clear();
-                }
-                pen.inject(sample);
-                continue;
-            }
-            Injection::KeyDown { scan, extended } | Injection::KeyUp { scan, extended } => {
-                let mut flags = KEYEVENTF_SCANCODE;
-                if extended {
-                    flags |= KEYEVENTF_EXTENDEDKEY;
-                }
-                if matches!(injection, Injection::KeyUp { .. }) {
-                    flags |= KEYEVENTF_KEYUP;
-                }
-                keyboard_input(scan, flags)
-            }
-            Injection::Unicode(unit) => {
-                inputs.push(keyboard_input(unit, KEYEVENTF_UNICODE));
-                keyboard_input(unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)
-            }
-            Injection::MoveAbs { x, y } => mouse_input(
-                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                i32::from(x),
-                i32::from(y),
-                0,
-            ),
-            Injection::LeftDown { x, y } => mouse_input(
-                MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                i32::from(x),
-                i32::from(y),
-                0,
-            ),
-            Injection::LeftUp { x, y } => mouse_input(
-                MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                i32::from(x),
-                i32::from(y),
-                0,
-            ),
-            Injection::RightDown { x, y } => mouse_input(
-                MOUSEEVENTF_RIGHTDOWN | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                i32::from(x),
-                i32::from(y),
-                0,
-            ),
-            Injection::RightUp { x, y } => mouse_input(
-                MOUSEEVENTF_RIGHTUP | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                i32::from(x),
-                i32::from(y),
-                0,
-            ),
-            Injection::Wheel { delta } => mouse_input(MOUSEEVENTF_WHEEL, 0, 0, delta),
-            Injection::MiddleDown { x, y } => mouse_input(
-                MOUSEEVENTF_MIDDLEDOWN | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                i32::from(x),
-                i32::from(y),
-                0,
-            ),
-            Injection::MiddleUp { x, y } => mouse_input(
-                MOUSEEVENTF_MIDDLEUP | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                i32::from(x),
-                i32::from(y),
-                0,
-            ),
-            Injection::HWheel { delta } => mouse_input(MOUSEEVENTF_HWHEEL, 0, 0, delta),
+    for &injection in injections {
+        let Injection::Pen(sample) = injection else {
+            push_input(&mut inputs, injection);
+            continue;
         };
-        inputs.push(input);
+        // Flush keyboard releases first when a session is cancelled.
+        if !inputs.is_empty() {
+            unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+            inputs.clear();
+        }
+        pen.deliver(sample, screen, output, now);
     }
     if inputs.is_empty() {
         return;
@@ -281,6 +328,71 @@ pub fn inject(injections: &[Injection], pen: &mut PenDevice) {
             "SendInput injected fewer events than requested"
         );
     }
+}
+
+fn push_input(inputs: &mut Vec<INPUT>, injection: Injection) {
+    let input = match injection {
+        Injection::Pen(_) => unreachable!("pen samples go through PenDevice::deliver"),
+        Injection::KeyDown { scan, extended } | Injection::KeyUp { scan, extended } => {
+            let mut flags = KEYEVENTF_SCANCODE;
+            if extended {
+                flags |= KEYEVENTF_EXTENDEDKEY;
+            }
+            if matches!(injection, Injection::KeyUp { .. }) {
+                flags |= KEYEVENTF_KEYUP;
+            }
+            keyboard_input(scan, flags)
+        }
+        Injection::Unicode(unit) => {
+            inputs.push(keyboard_input(unit, KEYEVENTF_UNICODE));
+            keyboard_input(unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)
+        }
+        Injection::MoveAbs { x, y } => mouse_input(
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            i32::from(x),
+            i32::from(y),
+            0,
+        ),
+        Injection::LeftDown { x, y } => mouse_input(
+            MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            i32::from(x),
+            i32::from(y),
+            0,
+        ),
+        Injection::LeftUp { x, y } => mouse_input(
+            MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            i32::from(x),
+            i32::from(y),
+            0,
+        ),
+        Injection::RightDown { x, y } => mouse_input(
+            MOUSEEVENTF_RIGHTDOWN | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            i32::from(x),
+            i32::from(y),
+            0,
+        ),
+        Injection::RightUp { x, y } => mouse_input(
+            MOUSEEVENTF_RIGHTUP | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            i32::from(x),
+            i32::from(y),
+            0,
+        ),
+        Injection::Wheel { delta } => mouse_input(MOUSEEVENTF_WHEEL, 0, 0, delta),
+        Injection::MiddleDown { x, y } => mouse_input(
+            MOUSEEVENTF_MIDDLEDOWN | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            i32::from(x),
+            i32::from(y),
+            0,
+        ),
+        Injection::MiddleUp { x, y } => mouse_input(
+            MOUSEEVENTF_MIDDLEUP | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            i32::from(x),
+            i32::from(y),
+            0,
+        ),
+        Injection::HWheel { delta } => mouse_input(MOUSEEVENTF_HWHEEL, 0, 0, delta),
+    };
+    inputs.push(input);
 }
 
 fn probe_guard_allows(injections: &[Injection]) -> bool {

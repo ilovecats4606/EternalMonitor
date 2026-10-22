@@ -15,6 +15,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // open the session log or touch the virtual display the way a host does.
     eternal_host::startup::run_reporter_if_requested();
 
+    // Before any DXGI query or window: monitor rects and injected input must
+    // be physical pixels from the start, not only once the GUI's event loop
+    // opts in. Unaware, a 125% monitor reports 2048x1152 instead of 2560x1440.
+    #[cfg(windows)]
+    eternal_host::input::windows_inject::become_per_monitor_dpi_aware();
+
     // Anchor the process-wide media clock before anything else runs.
     clock::init();
 
