@@ -215,9 +215,9 @@ impl<A: PenApi> PenDevice<A> {
     }
 
     /// Where a stroke or hover starts, ask again for a device Windows refused
-    /// or native input that was stuck, at most once per `RETRY_INTERVAL`. After a stuck streak the new device must accept
-    /// a frame within `STUCK_TRIAL`, so a stroke it cannot carry soon goes
-    /// to the mouse.
+    /// or native input that was stuck, at most once per `RETRY_INTERVAL`.
+    /// After a stuck streak the new device has `STUCK_TRIAL` to accept a
+    /// frame.
     pub fn revive(&mut self, now: Instant) {
         let waiting = self
             .slot
@@ -240,13 +240,13 @@ impl<A: PenApi> PenDevice<A> {
     /// Each sample goes to exactly one of the two, once and in order. A
     /// stroke or hover belongs to one path at a time. It moves to the mouse
     /// when native input cannot carry it (the device is gone, Windows
-    /// rejects a frame, or Windows stays not ready for a whole queue or, even
-    /// on a new device, for `INPUT_STALE`):
-    /// `PenContact` then hands over the sample and every one waiting behind
-    /// it. A stroke on the mouse stays there until it ends, and native input
-    /// resumes only where a stroke or hover starts with the mouse idle:
-    /// nothing waiting and no button held. That is also where a missing
-    /// device is asked for again.
+    /// rejects a frame, Windows stays not ready for a whole queue, or native
+    /// input is stuck as `PenContact::flush` describes): `PenContact` then
+    /// hands over the sample and every one waiting behind it. A stroke on
+    /// the mouse stays there until it ends, and native input resumes only
+    /// where a stroke or hover starts with the mouse idle: nothing waiting
+    /// and no button held. That is also where a missing device is asked for
+    /// again.
     pub fn deliver(
         &mut self,
         sample: PenSample,
@@ -2185,6 +2185,52 @@ mod tests {
         assert!(frames.iter().all(|&(handle, _)| handle == 1));
         assert!(device.slot.api.destroyed.is_empty());
         assert!(device.slot.api.mouse.is_empty());
+    }
+
+    #[test]
+    fn a_session_reset_ends_a_hover_so_the_next_one_asks_for_a_device() {
+        // Windows refuses the device. A hover asks again once, where it
+        // starts; the session resets while it carries on, so the next
+        // hover starts afresh and asks again.
+        let mut device = PenDevice::new(FakeApi::new(&[false, false]));
+        let start = Instant::now();
+        let hover = |device: &mut PenDevice<FakeApi>, at: Duration| {
+            deliver_one(device, pen_xy(PenPhase::Hover, 100, 1), start + at);
+        };
+        hover(&mut device, Duration::from_secs(2));
+        hover(&mut device, Duration::from_secs(4));
+        assert_eq!(device.slot.api.created, 2);
+        reset_one(&mut device, start + Duration::from_secs(4));
+        hover(&mut device, Duration::from_millis(4100));
+        assert_eq!(device.slot.api.created, 3);
+        assert!(device.available());
+    }
+
+    #[test]
+    fn without_a_held_contact_native_input_is_stuck_after_a_second() {
+        // Windows is not ready for a stroke's down, so it holds no contact:
+        // the device is recreated a second after the first refusal, with no
+        // grace for a contact to keep.
+        let mut device = PenDevice::new(FakeApi::new(&[]));
+        device.slot.api.answer = Outcome::NotReady;
+        let start = Instant::now();
+        deliver_one(&mut device, pen_xy(PenPhase::Down, 10, 1), start);
+        for x in 11..=72 {
+            let at = start + Duration::from_millis(16) * (x - 10);
+            deliver_one(&mut device, pen_xy(PenPhase::Move, x as i32, 1), at);
+        }
+        deliver_one(
+            &mut device,
+            pen_xy(PenPhase::Move, 74, 1),
+            start + INPUT_STALE - Duration::from_millis(1),
+        );
+        assert_eq!(device.slot.api.created, 1);
+        deliver_one(
+            &mut device,
+            pen_xy(PenPhase::Move, 75, 1),
+            start + INPUT_STALE,
+        );
+        assert_eq!(device.slot.api.created, 2);
     }
 
     #[test]

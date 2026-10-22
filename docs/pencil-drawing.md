@@ -87,10 +87,9 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   it: Windows rejects a down or up, or still rejects a fresh start, the pen
   device is lost, or Windows stays not ready for a whole queue of samples
   (the device is then recreated to end its pointer), or native input is
-  stuck (below). The waiting samples and
-  the rest of that stroke follow it, pressing the mouse at the first. Native
-  input resumes where the next stroke or hover starts once the mouse holds
-  nothing.
+  stuck (below). The waiting samples and the rest of that stroke follow it,
+  pressing the mouse at the first. Native input resumes where the next
+  stroke or hover starts once the mouse holds nothing.
   The fallback is an ordered queue for `SendInput`: input Windows refuses,
   for example under UIPI, waits and is retried first at the next sample,
   refresh tick or reset, so a refused release always comes before the next
@@ -105,15 +104,14 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   once Windows takes it (or, if that is off the virtual screen after a
   display change, ends the contact where Windows has it), and a mouse release
   stays owed while Windows holds the button.
-- Native input is stuck when Windows has accepted no frame for a second and
-  ink is waiting, or for 1.2 s while it holds a contact, since recreating
-  the device then cancels the stroke being drawn. The host then recreates
-  the pen device once; if the new one accepts nothing within 200 ms, the
-  waiting samples and the strokes that follow go to the mouse, and the host
-  logs it once. It tries a new device where a later stroke or hover starts
-  once the mouse is idle, at most once a second, and gives that device
-  200 ms too; a hover that carries on does not ask again. Recovery is logged when Windows accepts
-  a frame again. An up waiting alone never counts as stuck.
+- Native input is stuck when Windows has accepted no frame for a second
+  while ink waits, or 1.2 s while it holds a contact. The host then
+  recreates the pen device once; if the new one accepts nothing within
+  200 ms, the waiting samples and the strokes that follow go to the mouse,
+  and the host logs it once. It tries a new device where a later stroke or
+  hover starts, with the mouse idle and at most once a second, giving it
+  200 ms too. Recovery is logged when Windows accepts a frame again. An up
+  waiting alone never counts as stuck.
 - When a session ends or another takes over, the host drops pen samples
   Windows never received and ends only the pointer Windows holds, where it
   holds it. If that place is off the virtual screen after a display change,
