@@ -398,8 +398,8 @@ final class USBLinkFailureTests: XCTestCase {
         XCTAssertEqual(manager.problem?.actions, [.retry])
     }
 
-    /// The PC says it is shutting down during the fallback (its stream
-    /// restarting) and comes back.
+    /// The PC says it is shutting down during the fallback (Stop and update
+    /// on the PC) and comes back on the new version.
     func testAPCRestartingDuringTheFallbackIsRetried() async throws {
         let wifi = FakeUDPHost()
         enableWiFiFallback(to: wifi)
@@ -411,7 +411,7 @@ final class USBLinkFailureTests: XCTestCase {
         try await until("handshake") { manager.hostInfo != nil }
         wifi.sendBye(.hostShuttingDown)
         try await until("the goodbye ends that attempt") { manager.state == .disconnected }
-        XCTAssertEqual(manager.problem, .pcEndedSession)
+        XCTAssertEqual(manager.problem, .pcUpdating)
         XCTAssertEqual(manager.reconnectAttempt, 1, "a restarting PC keeps the automatic cycle")
         try await finishConnecting(manager, to: wifi)
     }
