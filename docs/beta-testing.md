@@ -130,6 +130,23 @@ shell. Neither path switches the developer account used by this workspace.
    review status beside it accurate. The current link is
    `https://testflight.apple.com/join/ppc9QfXc`.
 
+### Publish the update after Apple approves the build
+
+Both apps learn about updates from `docs/latest.json`
+(https://eternalmonitor.dev/latest.json). Bump it in the same pull request
+that publishes the matching downloads on `docs/download.html`, and only after
+Apple approves the TestFlight build. Bumping it earlier makes every PC ask to
+update before the matching iPad build can be installed.
+
+1. Copy the Windows version, installer URL and SHA-256 from the GitHub release,
+   and the TestFlight build number, into both `docs/download.html` and
+   `docs/latest.json`.
+2. Run `scripts/check-versions.sh`. It fails when the two files disagree, and CI
+   runs it on every pull request.
+3. After the merge, Windows hosts see the update within a day and iPads within
+   four hours. A host refuses to install when `latest.json` and the release body
+   disagree on the SHA-256, so keep the release body as the workflow wrote it.
+
 Internal testers skip review entirely and get builds immediately, but they
 must be users on your App Store Connect team, so that route only makes sense
 for people you want inside the developer account.

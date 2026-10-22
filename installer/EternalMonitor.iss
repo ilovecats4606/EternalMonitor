@@ -60,6 +60,8 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 
 [Files]
 Source: "{#StagingDir}\EternalMonitor-host.exe"; DestDir: "{app}"; Flags: ignoreversion
+; In-app updates run a copy of this helper from the user's update folder.
+Source: "{#StagingDir}\EternalMonitor-updater.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StagingDir}\*.dll";                   DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StagingDir}\ffmpeg.exe";              DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#StagingDir}\README.md";               DestDir: "{app}"; Flags: ignoreversion isreadme skipifsourcedoesntexist

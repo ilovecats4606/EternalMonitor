@@ -9,9 +9,10 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Keep this first. A copy started as the failure reporter outlives the
-    // host it watches: it must not take the single-instance lock, open the
-    // session log or touch the virtual display the way a host does.
+    // Helper modes are dispatched first, before logging and before the
+    // single-instance check below: a `--failure-reporter` copy outlives the
+    // host it watches and must never be turned away as a second instance,
+    // open the session log or touch the virtual display the way a host does.
     eternal_host::startup::run_reporter_if_requested();
 
     // Anchor the process-wide media clock before anything else runs.
@@ -43,6 +44,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         path = %logging::session_log_path().display(),
         "Session log file initialized"
     );
+
+    // One host per installation; a second launch shows the first one. Checked
+    // after any helper-mode dispatch above and before the virtual display
+    // reset below, which would cut the first host's stream.
+    let Some(_instance) = eternal_host::single_instance::acquire() else {
+        info!("EternalMonitor is already running; showing its window");
+        eternal_host::single_instance::show_existing();
+        return Ok(());
+    };
 
     // Never leave a virtual display attached across runs. If a previous run crashed or was
     // force-killed while streaming the virtual extended display, the VDD device is still enabled

@@ -1,8 +1,8 @@
 ## EternalMonitor (unreleased)
 
-Plain-language setup and problem messages in both apps, and Windows reliability
-and startup fixes from 0.3.1 support diagnostics. iPads on 0.3.1 work with the
-Windows changes.
+Plain-language setup and problem messages in both apps, in-app updates, and
+Windows reliability and startup fixes from 0.3.1 support diagnostics. iPads on
+0.3.1 work with the Windows changes.
 
 ### What changed
 
@@ -22,6 +22,22 @@ Windows changes.
   quality limit moved under **Advanced** in Settings.
 - Drawing mode is explained in one sentence, and **Reconnect now to apply**
   appears when it changes mid-session.
+- Windows shows a banner on every page and one notification when a new
+  version is ready. **Update now** downloads the installer, checks it against
+  the SHA-256 published with the release, installs it with only the Windows
+  permission prompt and a progress window, and restarts EternalMonitor. If an
+  iPad is streaming, the update waits until streaming stops, or until you
+  click **Stop and update**. If anything fails, the current version keeps
+  running and the banner links to the website.
+- Windows Settings has **Check for updates automatically** and **Check now**.
+  **Later** hides the banner for that version for a day.
+- The iPad connect screen and Settings say when a newer build is ready in
+  TestFlight, with an **Open TestFlight** button.
+- When the PC and iPad cannot connect because one is older, both apps say which
+  one to update and how.
+- Both apps read https://eternalmonitor.dev/latest.json, which is published
+  only after Apple approves the matching iPad build. Requests carry no
+  identifiers.
 - The Windows Stream page says why the picture stopped while Windows keeps
   the screen from EternalMonitor: the lock screen or a permission prompt, a
   display change, another app recording the screen, a disconnected Remote
@@ -77,6 +93,11 @@ On a PC where EternalMonitor 0.3.1 opened a console window that closed after a
 few seconds, install this build and open EternalMonitor. The window should
 appear. If it does not, a message names the error and the log file; send that
 file with the time you opened the app.
+
+Install the previous version on Windows, then click **Update now** when the
+banner appears. Approve the Windows prompt and check that EternalMonitor opens
+again on the new version. Try it once while streaming. On the iPad, tap
+**Open TestFlight** from the banner.
 
 ## EternalMonitor v0.3.1
 

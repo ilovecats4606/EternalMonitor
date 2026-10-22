@@ -485,6 +485,12 @@ pub async fn start_sender(
         }
     }
 
+    // Every way out of the loop comes here, before the links close: an update
+    // that just stopped the stream must still tell the iPad.
+    let goodbye = shared.session.lock().take_goodbye();
+    if let Some(goodbye) = goodbye {
+        say_goodbye(&links, goodbye).await;
+    }
     info!("NAL channel closed, transport sender shutting down");
     Ok(())
 }
@@ -512,6 +518,40 @@ fn first_frame_gate(
         FirstFrame::SkipAndRequestKeyframe
     } else {
         FirstFrame::Send
+    }
+}
+
+/// How long a goodbye over USB may hold up the exit while it is written.
+const GOODBYE_FLUSH: Duration = Duration::from_millis(250);
+/// Copies of a goodbye over UDP, where any one can be lost, and the pause
+/// between them so a single burst of Wi-Fi loss can't take them all.
+const GOODBYE_COPIES: usize = 3;
+const GOODBYE_GAP: Duration = Duration::from_millis(5);
+
+/// Tells the iPad that an update stopped its stream, and returns once the
+/// message has left. Over UDP that is a short burst, all sent before this
+/// returns and the socket closes; the iPad acts on the first. Over USB one
+/// copy is queued for the link's writer, which dropping the link would abort,
+/// so wait for it to be written.
+async fn say_goodbye(links: &TransportLinks, (peer, datagram): (PeerId, Vec<u8>)) {
+    let sent = if peer.link == LinkId::Udp {
+        let mut sent = Ok(());
+        for copy in 0..GOODBYE_COPIES {
+            if copy > 0 {
+                tokio::time::sleep(GOODBYE_GAP).await;
+            }
+            sent = links.send_to(&datagram, peer).await;
+        }
+        sent
+    } else {
+        match links.send_to(&datagram, peer).await {
+            Ok(()) => links.flush(peer, GOODBYE_FLUSH).await,
+            Err(error) => Err(error),
+        }
+    };
+    match sent {
+        Ok(()) => info!(%peer, "Told the iPad the stream stopped for an update"),
+        Err(error) => warn!(%peer, %error, "Could not tell the iPad the stream stopped"),
     }
 }
 
@@ -633,6 +673,10 @@ async fn execute_actions(
                 warn!(error = %error, "Failed to request pipeline restart for the virtual display");
             }
         }
+    }
+
+    if let Some(goodbye) = actions.goodbye {
+        say_goodbye(links, goodbye).await;
     }
 
     if actions.force_idr {

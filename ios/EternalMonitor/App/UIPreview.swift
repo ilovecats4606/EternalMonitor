@@ -4,7 +4,7 @@ import SwiftUI
 /// Debug builds only: put the UI in a state that normally needs a live PC,
 /// for screenshots and design review. Never opens a connection.
 ///
-/// `EM_UI_PREVIEW=display|quality|connecting|error|error-no-picture|error-pairing-code|error-router|pairing|settings|recent`.
+/// `EM_UI_PREVIEW=display|quality|connecting|error|error-no-picture|error-pairing-code|error-router|mismatch|pairing|settings|recent`.
 /// Launch with `-allowUSB NO` so the USB listener stays off as well.
 enum UIPreview {
     static let mode = ProcessInfo.processInfo.environment["EM_UI_PREVIEW"] ?? ""
@@ -28,6 +28,9 @@ enum UIPreview {
             manager.problem = .pairingCodeAsAddress
         case "error-router":
             manager.problem = .routerAddress
+        case "mismatch":
+            manager.versionMismatch = .iPadOlder
+            manager.connectionError = VersionMismatch.iPadOlder.message
         case "pairing":
             manager.pairingPrompt = PairingSheetModel()
         case "recent":

@@ -69,9 +69,19 @@ fn fixture() -> (std::path::PathBuf, SharedControl) {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
+    let latest = serde_json::json!({
+        "checked_at": checked_at,
+        "latest": {
+            "version": "99.0.0",
+            "installer": "https://github.com/sidebandstudio/EternalMonitor/releases/download/v99.0.0/EternalMonitor-Setup.exe",
+            "sha256": "0".repeat(64),
+        },
+        // Already announced, so the test never shows a Windows notification.
+        "notified": "99.0.0",
+    });
     std::fs::write(
-        dir.join("EternalMonitor/release-check.json"),
-        format!(r#"{{"checked_at":{checked_at},"tag":"v99.0.0"}}"#),
+        dir.join("EternalMonitor/update-state.json"),
+        latest.to_string(),
     )
     .unwrap();
 
@@ -301,24 +311,22 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
 
     // General sits below the fold of the Settings page.
     harness
-        .get_by_label("Check for updates daily")
+        .get_by_label("Automatic update checks")
         .scroll_to_me();
     harness.run_steps(4);
-    harness.get_by_label("Check for updates daily").click();
+    assert!(harness.query_by_label("Update now").is_none());
+    harness.get_by_label("Automatic update checks").click();
     harness.run_steps(4);
+    // The banner sits above every page, Settings included.
+    harness.get_by_label("EternalMonitor 99.0.0 is available");
+    harness.get_by_label("Version 99.0.0 is ready to install.");
     nav(&mut harness, "Stream");
-    for _ in 0..30 {
-        harness.run_steps(4);
-        if harness.query_by_label("Dismiss").is_some() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    harness.get_by_label("EternalMonitor v99.0.0 is available");
+    harness.get_by_label("EternalMonitor 99.0.0 is available");
+    harness.get_by_role_and_label(Role::Button, "Update now");
     snapshot(&mut harness, &shared, "update-banner");
-    harness.get_by_label("Dismiss").click();
+    harness.get_by_label("Later").click();
     harness.run_steps(4);
-    assert!(harness.query_by_label("Dismiss").is_none());
+    assert!(harness.query_by_label("Later").is_none());
 
     harness.get_by_label("Restart now").click();
     harness.run_steps(4);

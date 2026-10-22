@@ -42,7 +42,7 @@ Write-Host "[setup] ISCC: $iscc"
 
 # --- Build the release binary ----------------------------------------------------
 Write-Host "[1/5] Building release binary..."
-cargo build --release --locked -p eternal-host
+cargo build --release --locked -p eternal-host -p eternal-updater
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 
 # --- Stage the payload -----------------------------------------------------------
@@ -52,6 +52,8 @@ New-Item -ItemType Directory -Path $staging | Out-Null
 New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 
 Copy-Item "target\release\eternal-host.exe" (Join-Path $staging "EternalMonitor-host.exe")
+# Installs updates in place; see updater/src/lib.rs.
+Copy-Item "target\release\eternal-updater.exe" (Join-Path $staging "EternalMonitor-updater.exe")
 
 # FFmpeg runtime DLLs + utility. FFMPEG_DIR (the same env var the build uses)
 # wins; .cargo\config.toml is the fallback for developer machines that pin it there.

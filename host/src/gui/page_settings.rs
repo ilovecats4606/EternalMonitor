@@ -149,19 +149,7 @@ impl AnalyzerApp {
                 }
                 widgets::divider(ui);
             }
-            let mut updates = self.settings_check_updates;
-            widgets::setting_row(
-                ui,
-                "Check for updates",
-                "Looks for a new release on GitHub once a day.",
-                64.0,
-                |ui| {
-                    widgets::toggle(ui, &mut updates, "Check for updates daily");
-                },
-            );
-            if updates != self.settings_check_updates {
-                self.set_check_updates(updates);
-            }
+            self.update_settings(ui);
         });
         ui.add_space(GAP - 6.0);
 

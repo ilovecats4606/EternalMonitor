@@ -97,6 +97,14 @@ jobs:
           }
           .\scripts\build-installer.ps1
 
+      - name: Check the update helper's imports
+        shell: pwsh
+        run: |
+          # The shipped helper runs from the user's update folder: only system
+          # DLLs, resolved from System32 (updater/tests/imports.rs).
+          $env:EM_UPDATER_EXE = (Resolve-Path "target\release\eternal-updater.exe").Path
+          cargo test -p eternal-updater --test imports --locked
+
       - name: Compute SHA-256
         id: hash
         shell: pwsh
@@ -124,6 +132,8 @@ jobs:
           # /releases/latest — which the website reads — keeps pointing at the
           # newest stable build instead of advertising an RC to everyone.
           $isPrerelease = $tag -match "-"
+          # The in-app updater (host/src/updates.rs) reads the hash after the
+          # "SHA-256" label below and refuses an installer that differs.
           $lines = @(
               "EternalMonitor $tag — see [RELEASE_NOTES.md](https://github.com/sidebandstudio/EternalMonitor/blob/main/RELEASE_NOTES.md) for what's new.",
               "",
