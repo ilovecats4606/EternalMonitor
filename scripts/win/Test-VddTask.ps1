@@ -93,3 +93,7 @@ if ($case.Code -ne 1 -or $case.Output -notmatch '0x80070002' -or $case.Output -m
     throw "A missing requested task was not reported: $($case.Output)"
 }
 Write-Output 'VDD task checks passed: waits for the other direction, earlier runs, hung Enable bound, no -After, missing tasks'
+# Some cases end their child with exit code 1 on purpose. Without this the
+# last one stays in $LASTEXITCODE, and a CI step that ends with it fails.
+# Every failure above throws, which exits 1.
+exit 0
