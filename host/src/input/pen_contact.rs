@@ -179,6 +179,10 @@ pub struct PenContact {
     /// Samples that cannot be delivered natively, oldest first, for the
     /// mouse; see `take_abandoned`.
     abandoned: Vec<PenSample>,
+    /// Samples dropped by design, with why, so tests can tell them from
+    /// samples lost by mistake.
+    #[cfg(test)]
+    dropped: Vec<(PenSample, &'static str)>,
 }
 
 /// What became of one sample.
@@ -248,6 +252,11 @@ impl PenContact {
         std::mem::take(&mut self.abandoned)
     }
 
+    #[cfg(test)]
+    pub fn take_dropped(&mut self) -> Vec<(PenSample, &'static str)> {
+        std::mem::take(&mut self.dropped)
+    }
+
     fn abandon(&mut self, output: Option<CaptureGeometry>) {
         let waiting = self.queue.drain(..).map(|sample| mapped(sample, output));
         self.abandoned.extend(waiting);
@@ -264,6 +273,9 @@ impl PenContact {
     /// send it a different one.
     pub fn reset(&mut self, target: &mut impl PenTarget) {
         if !self.queue.is_empty() {
+            #[cfg(test)]
+            self.dropped
+                .extend(self.queue.iter().map(|&s| (s, "reset")));
             self.queue.clear();
             target.recreate();
             self.state = PointerState::Out;
@@ -298,10 +310,13 @@ impl PenContact {
 
     fn enqueue(&mut self, sample: PenSample) {
         if self.coalesces(&sample) {
-            *self
+            let last = self
                 .queue
                 .back_mut()
-                .expect("coalesces only behind the first") = sample;
+                .expect("coalesces only behind the first");
+            #[cfg(test)]
+            self.dropped.push((*last, "coalesced"));
+            *last = sample;
         } else {
             self.queue.push_back(sample);
         }

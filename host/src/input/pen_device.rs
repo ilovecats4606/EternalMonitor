@@ -3,6 +3,7 @@
 //! after Windows refused to create one. Portable, so tests can make Windows
 //! refuse; `windows_inject.rs` supplies the Win32 calls.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
@@ -12,6 +13,13 @@ use super::{pen_to_mouse, CaptureGeometry, Injection, PenPhase, PenSample, Virtu
 
 /// After Windows refuses a device, ask again at most this often.
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long fallback ink may wait for `SendInput` before it is dropped.
+/// Waiting that long means UIPI against an elevated window, or the secure
+/// desktop: the ink is stale by the time input works again. This also
+/// bounds the queue to about a second of samples, so moves need not
+/// coalesce, and every fallback event otherwise reaches Windows once.
+const MOUSE_STALE: Duration = Duration::from_secs(1);
 
 /// The calls `PenDevice` makes into Windows.
 pub trait PenApi {
@@ -44,17 +52,27 @@ pub struct PenDevice<A: PenApi> {
     mouse: Mouse,
 }
 
-/// The mouse fallback, as far as Windows inserted its input.
+/// The mouse fallback: an ordered queue of input for `SendInput`, like the
+/// native queue for ERROR_NOT_READY.
 #[derive(Debug, Default)]
 struct Mouse {
-    /// Windows holds the left button for the fallback.
+    /// Events Windows has not inserted, oldest first, with when each was
+    /// queued. They go before any newer input, so a refused release always
+    /// precedes the next press.
+    waiting: VecDeque<(Injection, Instant)>,
+    /// Windows holds the left button: from inserted events only.
     pressed: bool,
-    /// A stroke on the mouse wants the button held: its samples stay on the
-    /// mouse until it ends. Pressed but not wanted is a release Windows
-    /// refused, still owed.
+    /// Whether Windows will hold the button once `waiting` is inserted; new
+    /// input is planned from here.
+    planned: bool,
+    /// A stroke on the mouse: its samples stay on the mouse until it ends.
     wanted: bool,
-    /// Where the fallback last moved the pointer, for an owed release.
+    /// Where Windows last moved the pointer, for a release kept owed when
+    /// stale input is dropped.
     at: (u16, u16),
+    /// Waiting input dropped by design, with why, for tests.
+    #[cfg(test)]
+    dropped: Vec<(Injection, &'static str)>,
 }
 
 #[derive(Debug)]
@@ -179,8 +197,9 @@ impl<A: PenApi> PenDevice<A> {
     /// rejects a frame, or Windows stays not ready for a whole queue):
     /// `PenContact` then hands over the sample and every one waiting behind
     /// it. A stroke on the mouse stays there until it ends, and native input
-    /// resumes only where a stroke or hover starts with the mouse holding
-    /// nothing, which is also where a missing device is asked for again.
+    /// resumes only where a stroke or hover starts with the mouse idle:
+    /// nothing waiting and no button held. That is also where a missing
+    /// device is asked for again.
     pub fn deliver(
         &mut self,
         sample: PenSample,
@@ -188,15 +207,15 @@ impl<A: PenApi> PenDevice<A> {
         output: Option<CaptureGeometry>,
         now: Instant,
     ) {
-        self.settle();
-        if self.mouse.wanted || self.mouse.pressed {
-            return self.mouse_for(sample, screen);
+        self.pump(now);
+        if self.mouse_busy() {
+            return self.mouse_for(sample, screen, now);
         }
         if matches!(sample.phase, PenPhase::Down | PenPhase::Hover) {
             self.revive(now);
         }
         if !self.available() {
-            return self.mouse_for(sample, screen);
+            return self.mouse_for(sample, screen, now);
         }
         let mut target = Target {
             slot: &mut self.slot,
@@ -204,13 +223,14 @@ impl<A: PenApi> PenDevice<A> {
             output,
         };
         self.contact.deliver(sample, output, &mut target);
-        self.hand_over(screen);
+        self.hand_over(screen, now);
     }
 
     /// The session ended or was taken over. Native input ends as
-    /// `PenContact::reset` describes; a stroke on the mouse ends with a
-    /// release, owed until Windows inserts it.
-    pub fn reset(&mut self) {
+    /// `PenContact::reset` describes. Waiting mouse input is dropped like
+    /// native samples Windows never received, keeping a release owed while
+    /// Windows holds the button.
+    pub fn reset(&mut self, now: Instant) {
         if self.available() {
             let mut target = Target {
                 screen: self.slot.api.screen(),
@@ -219,15 +239,15 @@ impl<A: PenApi> PenDevice<A> {
             };
             self.contact.reset(&mut target);
         }
-        self.mouse.wanted = false;
-        self.settle();
+        self.drop_mouse_input("reset", now);
+        self.pump(now);
     }
 
-    /// Called on every refresh tick: retry a release Windows refused, and
+    /// Called on every refresh tick: retry mouse input Windows refused, and
     /// deliver samples Windows was not ready for, mapped onto `output`, the
     /// current capture rect.
-    pub fn flush(&mut self, output: Option<CaptureGeometry>) {
-        self.settle();
+    pub fn flush(&mut self, output: Option<CaptureGeometry>, now: Instant) {
+        self.pump(now);
         if !self.available() || self.contact.pending().is_none() {
             return;
         }
@@ -238,72 +258,103 @@ impl<A: PenApi> PenDevice<A> {
             output,
         };
         self.contact.flush(output, &mut target);
-        self.hand_over(screen);
+        self.hand_over(screen, now);
     }
 
-    /// Whether the refresh tick has work even without a device: a release
+    /// Whether the refresh tick has work even without a device: mouse input
     /// Windows refused.
-    pub fn owes_release(&self) -> bool {
-        self.mouse.pressed && !self.mouse.wanted
+    pub fn mouse_waiting(&self) -> bool {
+        !self.mouse.waiting.is_empty()
+    }
+
+    fn mouse_busy(&self) -> bool {
+        self.mouse.wanted || self.mouse.pressed || self.mouse_waiting()
     }
 
     /// Send the samples `PenContact` gave up on to the mouse, oldest first.
-    fn hand_over(&mut self, screen: VirtualScreen) {
+    fn hand_over(&mut self, screen: VirtualScreen, now: Instant) {
         for sample in self.contact.take_abandoned() {
-            self.mouse_for(sample, screen);
+            self.mouse_for(sample, screen, now);
         }
     }
 
-    /// Mouse input for `sample`. The button is pressed for a down or move
-    /// whenever Windows does not hold it, so a stroke that left native
-    /// input is pressed at its first sample on the mouse, and released for
-    /// anything else only if Windows holds it. The state follows what
-    /// Windows inserted, so the mouse is never pressed twice or released
-    /// without a press, and a refused press or release is tried again.
-    fn mouse_for(&mut self, sample: PenSample, screen: VirtualScreen) {
+    /// Queue mouse input for `sample`, planned from the button state the
+    /// waiting input leaves: a down or move presses unless the button will
+    /// be held, so a stroke that left native input is pressed at its first
+    /// sample on the mouse; anything else releases a button that will be
+    /// held. The mouse is therefore never pressed twice or released without
+    /// a press, and a new stroke's press follows the last stroke's release.
+    fn mouse_for(&mut self, sample: PenSample, screen: VirtualScreen, now: Instant) {
         let want = matches!(sample.phase, PenPhase::Down | PenPhase::Move);
-        // A release still owed for an earlier stroke goes first, in the
-        // same batch, so a new stroke gets its own press.
-        let owed = self.owes_release();
-        let mut inputs = Vec::new();
-        if owed {
-            let (x, y) = self.mouse.at;
-            inputs.push(Injection::LeftUp { x, y });
-        }
-        let phase = match (want, self.mouse.pressed && !owed) {
-            (true, false) => Some(PenPhase::Down),
-            (true, true) => Some(PenPhase::Move),
-            (false, true) => Some(PenPhase::Up),
-            (false, false) if sample.phase == PenPhase::Hover => Some(PenPhase::Hover),
-            (false, false) => None,
-        };
-        if let Some(phase) = phase {
-            inputs.extend(pen_to_mouse(PenSample { phase, ..sample }, screen));
-        }
         self.mouse.wanted = want;
-        if !inputs.is_empty() {
-            self.send_mouse(&inputs);
-        }
+        let phase = match (want, self.mouse.planned) {
+            (true, false) => PenPhase::Down,
+            (true, true) => PenPhase::Move,
+            (false, true) => PenPhase::Up,
+            (false, false) if sample.phase == PenPhase::Hover => PenPhase::Hover,
+            (false, false) => return self.pump(now),
+        };
+        self.mouse.planned = want;
+        let inputs = pen_to_mouse(PenSample { phase, ..sample }, screen);
+        self.mouse
+            .waiting
+            .extend(inputs.into_iter().map(|input| (input, now)));
+        self.pump(now);
     }
 
-    /// Release a button Windows still holds for a stroke that has ended.
-    fn settle(&mut self) {
-        if self.owes_release() {
-            let (x, y) = self.mouse.at;
-            self.send_mouse(&[Injection::LeftUp { x, y }]);
+    /// Offer Windows the waiting input, oldest first. What it inserts
+    /// leaves the queue and sets the button state; the rest waits for the
+    /// next sample, tick or reset. Ink that has waited `MOUSE_STALE` is
+    /// dropped; a waiting release alone is never stale.
+    fn pump(&mut self, now: Instant) {
+        if self.mouse.waiting.is_empty() {
+            return;
         }
-    }
-
-    fn send_mouse(&mut self, inputs: &[Injection]) {
-        let inserted = self.slot.api.send_mouse(inputs).min(inputs.len());
-        for input in &inputs[..inserted] {
-            match *input {
+        let inputs: Vec<_> = self.mouse.waiting.iter().map(|&(input, _)| input).collect();
+        let inserted = self.slot.api.send_mouse(&inputs).min(inputs.len());
+        for (input, _) in self.mouse.waiting.drain(..inserted) {
+            match input {
                 Injection::MoveAbs { x, y } => self.mouse.at = (x, y),
                 Injection::LeftDown { .. } => self.mouse.pressed = true,
                 Injection::LeftUp { .. } => self.mouse.pressed = false,
                 _ => {}
             }
         }
+        let oldest_ink = self
+            .mouse
+            .waiting
+            .iter()
+            .find(|(input, _)| !matches!(input, Injection::LeftUp { .. }));
+        if oldest_ink
+            .is_some_and(|&(_, queued)| now.saturating_duration_since(queued) >= MOUSE_STALE)
+        {
+            self.drop_mouse_input("stale", now);
+        }
+    }
+
+    /// Drop waiting mouse input and end any stroke on the mouse, keeping a
+    /// release owed while Windows holds the button, so input that works
+    /// again neither replays old ink nor leaves the button held.
+    #[cfg_attr(not(test), allow(unused_variables))]
+    fn drop_mouse_input(&mut self, why: &'static str, now: Instant) {
+        #[cfg(test)]
+        self.mouse
+            .dropped
+            .extend(self.mouse.waiting.iter().map(|&(input, _)| (input, why)));
+        self.mouse.waiting.clear();
+        self.mouse.wanted = false;
+        self.mouse.planned = false;
+        if self.mouse.pressed {
+            let (x, y) = self.mouse.at;
+            self.mouse
+                .waiting
+                .push_back((Injection::LeftUp { x, y }, now));
+        }
+    }
+
+    #[cfg(test)]
+    fn take_dropped_mouse_input(&mut self) -> Vec<(Injection, &'static str)> {
+        std::mem::take(&mut self.mouse.dropped)
     }
 }
 
@@ -461,8 +512,13 @@ mod tests {
     }
 
     /// A refresh tick, as `keep_pen_alive` does.
-    fn flush_one<A: PenApi + FakeSendInput>(device: &mut PenDevice<A>) {
-        device.flush(None);
+    fn flush_one<A: PenApi + FakeSendInput>(device: &mut PenDevice<A>, now: Instant) {
+        device.flush(None, now);
+    }
+
+    /// A session reset, as `InputRelay::reset` does.
+    fn reset_one<A: PenApi + FakeSendInput>(device: &mut PenDevice<A>, now: Instant) {
+        device.reset(now);
     }
 
     /// Deliver a batch; returns the mouse input Windows inserted for it.
@@ -475,7 +531,7 @@ mod tests {
 
     /// A refresh tick; returns the mouse input Windows inserted for it.
     fn tick(device: &mut PenDevice<FakeApi>) -> Vec<Injection> {
-        flush_one(device);
+        flush_one(device, Instant::now());
         std::mem::take(&mut device.slot.api.mouse)
     }
 
@@ -485,7 +541,7 @@ mod tests {
         send(device, &[PenPhase::Down], Instant::now());
         device.slot.api.answer = Outcome::NotReady;
         send(device, &[PenPhase::Move], Instant::now());
-        device.reset();
+        reset_one(device, Instant::now());
         device.slot.api.answer = Outcome::Injected;
         assert!(!device.available());
     }
@@ -502,7 +558,7 @@ mod tests {
         // lost device ended.
         for _ in 0..100 {
             assert!(tick(&mut device).is_empty());
-            device.reset();
+            reset_one(&mut device, Instant::now());
         }
         let (x, y) = super::super::desktop_pixel_to_abs(100, 100, SCREEN);
         assert_eq!(
@@ -654,7 +710,7 @@ mod tests {
         // A new session starts while the device is missing; its reset does
         // not ask Windows. Its first stroke, within a second of the refusal,
         // is injected as mouse input.
-        device.reset();
+        reset_one(&mut device, Instant::now());
         let first = stroke(2, 1);
         assert!(matches!(
             first.as_slice(),
@@ -797,7 +853,7 @@ mod tests {
             deliver_one(&mut device, pen_at(PenPhase::Up, stroke), now);
         }
         device.slot.api.answer = Outcome::Rejected;
-        flush_one(&mut device);
+        flush_one(&mut device, now);
         let mouse = std::mem::take(&mut device.slot.api.mouse);
         assert_eq!(
             presses(&mouse),
@@ -846,50 +902,207 @@ mod tests {
         assert!(!device.slot.api.button);
     }
 
+    fn pen_xy(phase: PenPhase, x: i32, y: i32) -> Injection {
+        let Injection::Pen(sample) = pen_at(phase, y) else {
+            unreachable!()
+        };
+        Injection::Pen(PenSample { x, ..sample })
+    }
+
+    fn abs(x: i32, y: i32) -> (u16, u16) {
+        super::super::desktop_pixel_to_abs(x, y, SCREEN)
+    }
+
     #[test]
-    fn a_refused_release_is_owed_until_windows_takes_it() {
-        // Windows refuses the device, so strokes use the mouse; then
-        // SendInput refuses the release (UIPI or a desktop switch).
+    fn a_refused_release_comes_before_the_next_strokes_press() {
+        // Sol's case: SendInput refuses stroke 1's release, its retry and
+        // stroke 2's press, then takes stroke 2's move. Stroke 1 must be
+        // released before stroke 2 is pressed, not joined to it.
+        let mut device = PenDevice::new(FakeApi::new(&[false]));
+        let now = Instant::now();
+        deliver_one(&mut device, pen_xy(PenPhase::Down, 10, 1), now);
+        device.slot.api.mouse_limit = 0;
+        deliver_one(&mut device, pen_xy(PenPhase::Up, 11, 1), now);
+        flush_one(&mut device, now);
+        deliver_one(&mut device, pen_xy(PenPhase::Down, 20, 2), now);
+        device.slot.api.mouse_limit = usize::MAX;
+        deliver_one(&mut device, pen_xy(PenPhase::Move, 21, 2), now);
+        deliver_one(&mut device, pen_xy(PenPhase::Up, 22, 2), now);
+        let at = |x, y| {
+            let (x, y) = abs(x, y);
+            (Injection::MoveAbs { x, y }, x, y)
+        };
+        let (m10, x10, y10) = at(10, 1);
+        let (m11, x11, y11) = at(11, 1);
+        let (m20, x20, y20) = at(20, 2);
+        let (m21, _, _) = at(21, 2);
+        let (m22, x22, y22) = at(22, 2);
+        assert_eq!(
+            device.slot.api.mouse,
+            [
+                m10,
+                Injection::LeftDown { x: x10, y: y10 },
+                m11,
+                Injection::LeftUp { x: x11, y: y11 },
+                m20,
+                Injection::LeftDown { x: x20, y: y20 },
+                m21,
+                m22,
+                Injection::LeftUp { x: x22, y: y22 },
+            ]
+        );
+        assert!(!device.slot.api.button);
+    }
+
+    #[test]
+    fn a_tap_whose_press_was_refused_is_pressed_before_its_release() {
+        // Sol's case: SendInput inserts only the move of a tap's down, then
+        // recovers before the up.
+        let mut device = PenDevice::new(FakeApi::new(&[false]));
+        let now = Instant::now();
+        device.slot.api.mouse_limit = 1;
+        deliver_one(&mut device, pen_xy(PenPhase::Down, 10, 1), now);
+        device.slot.api.mouse_limit = usize::MAX;
+        deliver_one(&mut device, pen_xy(PenPhase::Up, 10, 1), now);
+        let (x, y) = abs(10, 1);
+        assert_eq!(
+            device.slot.api.mouse,
+            [
+                Injection::MoveAbs { x, y },
+                Injection::LeftDown { x, y },
+                Injection::MoveAbs { x, y },
+                Injection::LeftUp { x, y },
+            ]
+        );
+        assert!(!device.slot.api.button);
+    }
+
+    #[test]
+    fn a_refused_move_in_a_stroke_is_retried_in_order() {
+        // Sol's case: SendInput refuses a move between a down and an up it
+        // takes.
+        let mut device = PenDevice::new(FakeApi::new(&[false]));
+        let now = Instant::now();
+        deliver_one(&mut device, pen_xy(PenPhase::Down, 10, 1), now);
+        device.slot.api.mouse_limit = 0;
+        deliver_one(&mut device, pen_xy(PenPhase::Move, 15, 1), now);
+        device.slot.api.mouse_limit = usize::MAX;
+        deliver_one(&mut device, pen_xy(PenPhase::Up, 20, 1), now);
+        let moves: Vec<_> = device
+            .slot
+            .api
+            .mouse
+            .iter()
+            .filter_map(|input| match *input {
+                Injection::MoveAbs { x, y } => Some((x, y)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(moves, [abs(10, 1), abs(15, 1), abs(20, 1)]);
+        assert_eq!(presses(&device.slot.api.mouse), [(true, 1), (false, 1)]);
+    }
+
+    #[test]
+    fn native_input_waits_for_a_refused_release() {
+        // Windows refused the device, so a stroke uses the mouse, and then
+        // SendInput refuses its release. A stroke that could start natively
+        // must wait on the mouse until the release is inserted.
         let mut device = PenDevice::new(FakeApi::new(&[false]));
         let start = Instant::now();
         send(&mut device, &[PenPhase::Down], start);
         device.slot.api.mouse_limit = 0;
         send(&mut device, &[PenPhase::Up], start);
-        assert!(device.slot.api.button, "Windows still holds the button");
-        // Still refused at a tick; and a stroke that could start natively
-        // must not while Windows holds the button.
-        tick(&mut device);
-        let later = start + RETRY_INTERVAL * 2;
+        assert!(device.slot.api.button);
+        let later = start + RETRY_INTERVAL;
         send(&mut device, &[PenPhase::Down, PenPhase::Up], later);
         assert!(device.slot.api.frames.is_empty());
         assert_eq!(device.slot.api.created, 1);
-        // The next tick releases it once Windows takes input again.
         device.slot.api.mouse_limit = usize::MAX;
-        let (x, y) = super::super::desktop_pixel_to_abs(100, 100, SCREEN);
-        assert_eq!(tick(&mut device), [Injection::LeftUp { x, y }]);
-        assert!(!device.slot.api.button);
-        // Then native input resumes at the next stroke.
+        let mouse = tick(&mut device);
+        assert_eq!(presses(&mouse), [(false, 100), (true, 100), (false, 100)]);
+        // With the mouse idle, the next stroke gets a device again.
+        let later = start + RETRY_INTERVAL * 2;
         assert!(send(&mut device, &[PenPhase::Down, PenPhase::Up], later).is_empty());
         assert_eq!(
             device.slot.api.frames,
             [(2, PenPhase::Down), (2, PenPhase::Up)]
         );
-        // A reset retries an owed release too.
+    }
+
+    #[test]
+    fn stale_mouse_input_is_dropped_but_the_release_stays_owed() {
+        // SendInput refuses everything for over a second, as under UIPI or
+        // on the secure desktop, while a stroke on the mouse ends.
         let mut device = PenDevice::new(FakeApi::new(&[false]));
-        send(&mut device, &[PenPhase::Down], start);
-        device.slot.api.mouse_limit = 1;
-        send(&mut device, &[PenPhase::Up], start);
-        assert!(device.slot.api.button, "only the move was inserted");
+        let start = Instant::now();
+        deliver_one(&mut device, pen_xy(PenPhase::Down, 10, 1), start);
+        device.slot.api.mouse_limit = 0;
+        deliver_one(&mut device, pen_xy(PenPhase::Move, 11, 1), start);
+        let half = start + MOUSE_STALE / 2;
+        deliver_one(&mut device, pen_xy(PenPhase::Up, 12, 1), half);
+        // Past the limit the old stroke's ink is dropped; the release is not.
+        let stale = start + MOUSE_STALE;
+        flush_one(&mut device, stale);
+        let dropped = device.take_dropped_mouse_input();
+        let (x11, y11) = abs(11, 1);
+        let (x12, y12) = abs(12, 1);
+        assert_eq!(
+            dropped,
+            [
+                (Injection::MoveAbs { x: x11, y: y11 }, "stale"),
+                (Injection::MoveAbs { x: x12, y: y12 }, "stale"),
+                (Injection::LeftUp { x: x12, y: y12 }, "stale"),
+            ]
+        );
+        // A release left waiting alone is never dropped.
+        for second in 2..5 {
+            flush_one(&mut device, start + MOUSE_STALE * second);
+        }
+        assert!(device.take_dropped_mouse_input().is_empty());
+        // A new stroke waits behind it, and input that works again releases
+        // first, without replaying the old stroke.
+        deliver_one(
+            &mut device,
+            pen_xy(PenPhase::Down, 20, 2),
+            start + MOUSE_STALE * 5,
+        );
         device.slot.api.mouse_limit = usize::MAX;
-        device.reset();
+        flush_one(&mut device, start + MOUSE_STALE * 5);
+        let (x10, y10) = abs(10, 1);
+        let (x20, y20) = abs(20, 2);
+        assert_eq!(
+            device.slot.api.mouse,
+            [
+                Injection::MoveAbs { x: x10, y: y10 },
+                Injection::LeftDown { x: x10, y: y10 },
+                Injection::LeftUp { x: x10, y: y10 },
+                Injection::MoveAbs { x: x20, y: y20 },
+                Injection::LeftDown { x: x20, y: y20 },
+            ]
+        );
+        // A reset drops waiting input the same way.
+        device.slot.api.mouse_limit = 0;
+        deliver_one(
+            &mut device,
+            pen_xy(PenPhase::Up, 21, 2),
+            start + MOUSE_STALE * 5,
+        );
+        reset_one(&mut device, start + MOUSE_STALE * 5);
+        assert!(device
+            .take_dropped_mouse_input()
+            .iter()
+            .all(|&(_, why)| why == "reset"));
+        device.slot.api.mouse_limit = usize::MAX;
+        flush_one(&mut device, start + MOUSE_STALE * 5);
         assert!(!device.slot.api.button);
     }
 
     /// What reached Windows, in order, for the random streams.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Seen {
-        /// A native frame Windows accepted, and the stroke it belongs to.
-        Native(PenPhase, i32),
+        /// A native frame Windows accepted: phase, then the sample's x and
+        /// y, its number and its stroke's.
+        Native(PenPhase, i32, i32),
         /// A native frame Windows rejected, which ends its contact.
         Refused(PenPhase),
         /// The device was destroyed, ending its contact.
@@ -917,22 +1130,29 @@ mod tests {
         devices_refused: usize,
         devices_granted: usize,
         mouse_refused: usize,
-        mouse_partial: usize,
+        /// Batches SendInput cut short, by how many events it inserted.
+        mouse_partial_after: std::collections::BTreeMap<usize, usize>,
         overflows: usize,
         streams_overflowed: usize,
         streams_losing_device: usize,
+        streams_mouse_blocked: usize,
         resets: usize,
-        presses_all_refused: usize,
+        dropped: std::collections::BTreeMap<&'static str, usize>,
+        samples_checked: usize,
     }
 
     /// Windows for the random streams, until `ready`: not ready for a
     /// quarter of the frames, or all of them while `stuck`; rejecting a
     /// tenth of the frames of every kind; refusing half the devices; and
-    /// inserting all of a mouse batch, none, or only its first events.
+    /// inserting all of a mouse batch, none (a tenth), or only its first
+    /// events (a fifth), or none at all while `blocked`.
     struct RandomApi {
         rng: Rng,
         ready: bool,
         stuck: bool,
+        blocked: bool,
+        /// The time of the call in progress.
+        now: Instant,
         seen: Vec<Seen>,
         coverage: Coverage,
     }
@@ -987,7 +1207,7 @@ mod tests {
                     Outcome::Rejected
                 }
                 _ => {
-                    self.seen.push(Seen::Native(frame.phase, frame.y));
+                    self.seen.push(Seen::Native(frame.phase, frame.x, frame.y));
                     Outcome::Injected
                 }
             }
@@ -1003,16 +1223,22 @@ mod tests {
             if inputs.is_empty() {
                 return 0;
             }
-            let inserted = match (self.ready, self.rng.below(10)) {
-                (true, _) | (false, 2..) => inputs.len(),
-                (false, 0) => {
+            let inserted = match (self.ready, self.blocked, self.rng.below(10)) {
+                (true, ..) => inputs.len(),
+                (false, true, _) | (false, false, 0) => {
                     self.coverage.mouse_refused += 1;
                     0
                 }
-                (false, 1) => {
-                    self.coverage.mouse_partial += 1;
-                    self.rng.below(inputs.len() as u64) as usize
+                (false, false, 1..=2) if inputs.len() > 1 => {
+                    let inserted = 1 + self.rng.below(inputs.len() as u64 - 1) as usize;
+                    *self
+                        .coverage
+                        .mouse_partial_after
+                        .entry(inserted)
+                        .or_default() += 1;
+                    inserted
                 }
+                _ => inputs.len(),
             };
             for (index, &input) in inputs.iter().enumerate() {
                 self.seen.push(Seen::Mouse(input, index < inserted));
@@ -1026,183 +1252,296 @@ mod tests {
         // Relay-shaped streams (a lost up shows as the relay's cancel before
         // the next down) against Windows rejecting frames of every kind,
         // staying not ready long enough to fill the queue, refusing or
-        // granting devices, and inserting none or part of a mouse batch;
-        // with refresh ticks, and session resets after which a stroke
-        // carries on. Each sample's y is its stroke number; hovers use 0.
-        let abs_y: Vec<u16> = (0..=60)
-            .map(|y| super::super::desktop_pixel_to_abs(0, y, SCREEN).1)
-            .collect();
-        let stroke_of = |abs: u16| abs_y.iter().position(|&y| y == abs).unwrap() as i32;
+        // granting devices, and SendInput inserting none or part of a batch
+        // or refusing everything for a while; with refresh ticks, and
+        // session resets after which a stroke carries on.
+        //
+        // Every sample has its own x (its number) and its stroke's y, so
+        // each native frame and mouse event names the sample it came from.
+        // Replaying what Windows took must give each sample's input once,
+        // in sample order, on one path, except for samples dropped by
+        // design: positions coalesced behind a native retry, and input
+        // waiting when a reset or the staleness limit dropped it.
+        let to_pixel = |count: i32, axis: fn((u16, u16)) -> u16| {
+            (0..count)
+                .map(|p| (axis(abs(p, p.min(1079))), p))
+                .collect::<std::collections::HashMap<u16, i32>>()
+        };
+        let pixel_x = to_pixel(1920, |a| a.0);
+        let pixel_y = to_pixel(1080, |a| a.1);
         let mut rng = Rng(0x2545_f491_4f6c_dd1d);
         let mut coverage = Coverage::default();
         for stream in 0..3000 {
+            let start = Instant::now();
             let mut device = PenDevice::new(RandomApi {
                 rng: Rng(rng.below(u64::MAX) | 1),
                 ready: false,
                 stuck: false,
+                blocked: false,
+                now: start,
                 seen: Vec::new(),
                 coverage: Coverage::default(),
             });
-            let mut now = Instant::now();
+            let mut now = start;
             let (mut stroke, mut in_contact, mut hovering) = (0, false, false);
-            let mut strokes = Vec::new();
+            let mut samples: Vec<PenSample> = Vec::new();
+            // When each sample was delivered, by its number less one.
+            let mut times: Vec<Instant> = Vec::new();
+            let mut exempt = std::collections::BTreeSet::new();
             let (mut overflowed, mut lost) = (false, false);
-            // Strokes a reset may have dropped samples of, by design.
-            let mut reset_before = 0;
-            let length = rng.below(80);
-            // A third of the streams has Windows stuck for a stretch.
-            let stuck_from = if rng.below(3) == 0 {
-                rng.below(40)
-            } else {
-                u64::MAX
-            };
-            let stuck_until = stuck_from.saturating_add(15 + rng.below(30));
-            let sample = |phase, stroke: i32, rng: &mut Rng| PenSample {
-                phase,
-                x: rng.below(1920) as i32,
-                y: stroke,
-                x_norm: 0,
-                y_norm: 0,
-                pressure: if matches!(phase, PenPhase::Down | PenPhase::Move) {
-                    512
+            let length = rng.below(100);
+            // Some streams have Windows stuck, or SendInput refusing
+            // everything, for a stretch.
+            let stretch = |rng: &mut Rng, one_in| {
+                if rng.below(one_in) == 0 {
+                    let from = rng.below(60);
+                    from..from + 5 + rng.below(25)
                 } else {
-                    0
-                },
-                tilt_x: 0,
-                tilt_y: 0,
+                    u64::MAX..u64::MAX
+                }
+            };
+            let stuck = stretch(&mut rng, 2);
+            let blocked = stretch(&mut rng, 3);
+            coverage.streams_mouse_blocked += usize::from(blocked.start < length);
+            // Record what one call dropped by design, checking why.
+            let note_drops = |device: &mut PenDevice<RandomApi>,
+                              resetting: bool,
+                              times: &[Instant],
+                              exempt: &mut std::collections::BTreeSet<i32>,
+                              coverage: &mut Coverage| {
+                let api_now = device.slot.api.now;
+                for (sample, why) in device.contact.take_dropped() {
+                    match why {
+                        "coalesced" => assert!(
+                            matches!(sample.phase, PenPhase::Move | PenPhase::Hover),
+                            "stream {stream}: coalesced {sample:?}"
+                        ),
+                        "reset" => {
+                            assert!(resetting, "stream {stream}: reset drop outside a reset")
+                        }
+                        _ => panic!("stream {stream}: dropped {sample:?} for {why}"),
+                    }
+                    *coverage.dropped.entry(why).or_default() += 1;
+                    exempt.insert(sample.x);
+                }
+                // A drop takes all waiting input once its oldest ink is stale.
+                let mut oldest_stale = None;
+                for (input, why) in device.take_dropped_mouse_input() {
+                    match why {
+                        "reset" => {
+                            assert!(resetting, "stream {stream}: reset drop outside a reset")
+                        }
+                        "stale" => assert!(!resetting, "stream {stream}: stale drop in a reset"),
+                        _ => panic!("stream {stream}: dropped {input:?} for {why}"),
+                    }
+                    *coverage.dropped.entry(why).or_default() += 1;
+                    let (Injection::MoveAbs { x, .. }
+                    | Injection::LeftDown { x, .. }
+                    | Injection::LeftUp { x, .. }) = input
+                    else {
+                        unreachable!()
+                    };
+                    let id = pixel_x[&x];
+                    if why == "stale" && !matches!(input, Injection::LeftUp { .. }) {
+                        let waited = api_now.saturating_duration_since(times[id as usize - 1]);
+                        oldest_stale = oldest_stale.max(Some(waited));
+                    }
+                    exempt.insert(id);
+                }
+                if let Some(waited) = oldest_stale {
+                    assert!(
+                        waited >= MOUSE_STALE,
+                        "stream {stream}: stale after {waited:?}"
+                    );
+                }
             };
             for step in 0..length {
-                device.slot.api.stuck = (stuck_from..stuck_until).contains(&step);
-                let mut batch = Vec::new();
+                device.slot.api.stuck = stuck.contains(&step);
+                device.slot.api.blocked = blocked.contains(&step);
+                let mut phases = Vec::new();
                 match (in_contact, rng.below(10)) {
-                    (false, 0..=5) if stroke < 60 => {
+                    (false, 0..=5) if stroke < 1000 => {
                         stroke += 1;
-                        strokes.push(stroke);
-                        batch.push(sample(PenPhase::Down, stroke, &mut rng));
+                        phases.push((PenPhase::Down, stroke));
                         (in_contact, hovering) = (true, false);
                     }
                     (false, 0..=7) => {
-                        batch.push(sample(PenPhase::Hover, 0, &mut rng));
+                        phases.push((PenPhase::Hover, 0));
                         hovering = true;
                     }
                     (false, _) if hovering => {
-                        batch.push(sample(PenPhase::Leave, 0, &mut rng));
+                        phases.push((PenPhase::Leave, 0));
                         hovering = false;
                     }
                     (false, _) => {}
-                    (true, 0..=3) => batch.push(sample(PenPhase::Move, stroke, &mut rng)),
+                    (true, 0..=3) => phases.push((PenPhase::Move, stroke)),
                     (true, 4..=7) => {
-                        batch.push(sample(PenPhase::Up, stroke, &mut rng));
+                        phases.push((PenPhase::Up, stroke));
                         in_contact = false;
                     }
-                    (true, 8) if stroke < 60 => {
+                    (true, 8) if stroke < 1000 => {
                         // The up was lost: the relay cancels before the next down.
-                        batch.push(sample(PenPhase::Cancel, stroke, &mut rng));
+                        phases.push((PenPhase::Cancel, stroke));
                         stroke += 1;
-                        strokes.push(stroke);
-                        batch.push(sample(PenPhase::Down, stroke, &mut rng));
+                        phases.push((PenPhase::Down, stroke));
                     }
                     (true, _) => {
-                        batch.push(sample(PenPhase::Cancel, stroke, &mut rng));
+                        phases.push((PenPhase::Cancel, stroke));
                         in_contact = false;
                     }
                 }
                 now += Duration::from_millis(rng.below(400));
-                for sample in batch {
-                    let edge = !matches!(sample.phase, PenPhase::Move | PenPhase::Hover);
+                device.slot.api.now = now;
+                for (phase, stroke) in phases {
+                    let id = samples.len() as i32 + 1;
+                    let Injection::Pen(sample) = pen_xy(phase, id, stroke) else {
+                        unreachable!()
+                    };
+                    samples.push(sample);
+                    times.push(now);
+                    let edge = !matches!(phase, PenPhase::Move | PenPhase::Hover);
                     if edge && device.contact.waiting() >= super::super::pen_contact::QUEUE_LIMIT {
                         coverage.overflows += 1;
                         overflowed = true;
                     }
                     deliver_one(&mut device, Injection::Pen(sample), now);
+                    note_drops(&mut device, false, &times, &mut exempt, &mut coverage);
                     lost |= !device.available();
                 }
                 if rng.below(2) == 0 {
-                    flush_one(&mut device);
+                    flush_one(&mut device, now);
+                    note_drops(&mut device, false, &times, &mut exempt, &mut coverage);
                     lost |= !device.available();
                 }
                 if rng.below(25) == 0 {
                     // The session resets; the stroke in progress carries on.
-                    device.reset();
+                    reset_one(&mut device, now);
+                    note_drops(&mut device, true, &times, &mut exempt, &mut coverage);
                     coverage.resets += 1;
                     lost |= !device.available();
-                    reset_before = stroke;
                 }
             }
-            // Windows becomes ready; the next tick delivers what waits and
-            // releases what is owed.
+            // Everything works again; the next tick delivers what waits.
             device.slot.api.ready = true;
-            flush_one(&mut device);
+            device.slot.api.now = now;
+            flush_one(&mut device, now);
+            note_drops(&mut device, false, &times, &mut exempt, &mut coverage);
             coverage.streams_overflowed += usize::from(overflowed);
             coverage.streams_losing_device += usize::from(lost);
-            // Replay what reached Windows, as Windows holds it.
-            let (mut native, mut mouse) = (None, None);
-            let mut drawn = std::collections::BTreeSet::new();
-            let mut presses = std::collections::BTreeMap::<i32, (usize, usize)>::new();
+
+            // Replay what Windows took, in order.
             let output = std::mem::take(&mut device.slot.api.seen);
+            let (mut native, mut mouse) = (None, None);
+            let mut last_sample = 0;
+            let mut taken = std::collections::BTreeMap::<(i32, &'static str), usize>::new();
+            let mut take = |id: i32, kind: &'static str| {
+                assert!(
+                    id >= last_sample,
+                    "stream {stream}: sample {id} {kind} after sample {last_sample}: {output:?}"
+                );
+                last_sample = id;
+                *taken.entry((id, kind)).or_default() += 1;
+            };
             for seen in &output {
                 match *seen {
-                    Seen::Native(PenPhase::Down, s) => {
-                        assert_eq!(
-                            mouse, None,
-                            "stream {stream}: native and mouse together: {output:?}"
-                        );
-                        native = Some(s);
-                        drawn.insert(s);
-                    }
-                    Seen::Native(PenPhase::Move, _) => {
-                        assert_eq!(
-                            mouse, None,
-                            "stream {stream}: native and mouse together: {output:?}"
-                        );
-                    }
-                    Seen::Native(PenPhase::Up | PenPhase::Cancel, s) => {
-                        assert_eq!(
-                            native,
-                            Some(s),
-                            "stream {stream}: native up without its down: {output:?}"
-                        );
-                        native = None;
-                    }
-                    Seen::Native(..) => {}
-                    Seen::Refused(_) | Seen::Destroyed => native = None,
-                    Seen::Mouse(Injection::LeftDown { y, .. }, inserted) => {
-                        let attempts = presses.entry(stroke_of(y)).or_default();
-                        attempts.0 += 1;
-                        if inserted {
+                    Seen::Native(phase, x, y) => {
+                        if matches!(phase, PenPhase::Down | PenPhase::Move) {
                             assert_eq!(
                                 mouse, None,
-                                "stream {stream}: mouse pressed twice: {output:?}"
-                            );
-                            assert_eq!(
-                                native, None,
                                 "stream {stream}: native and mouse together: {output:?}"
                             );
-                            mouse = Some(stroke_of(y));
-                            drawn.insert(stroke_of(y));
-                        } else {
-                            attempts.1 += 1;
+                        }
+                        match phase {
+                            PenPhase::Down => native = Some(y),
+                            PenPhase::Up | PenPhase::Cancel => {
+                                assert_eq!(
+                                    native,
+                                    Some(y),
+                                    "stream {stream}: native up without its down: {output:?}"
+                                );
+                                native = None;
+                            }
+                            _ => {}
+                        }
+                        // A cancel or leave ends the pointer where Windows
+                        // last saw it, an earlier sample's place.
+                        match phase {
+                            PenPhase::Down => take(x, "down"),
+                            PenPhase::Move => take(x, "move"),
+                            PenPhase::Up => take(x, "up"),
+                            PenPhase::Hover => take(x, "hover"),
+                            PenPhase::Cancel | PenPhase::Leave => {}
                         }
                     }
+                    Seen::Refused(_) | Seen::Destroyed => native = None,
+                    Seen::Mouse(_, false) => {}
+                    Seen::Mouse(Injection::MoveAbs { x, .. }, true) => {
+                        take(pixel_x[&x], "mouse move")
+                    }
+                    Seen::Mouse(Injection::LeftDown { x, y }, true) => {
+                        assert_eq!(
+                            mouse, None,
+                            "stream {stream}: mouse pressed twice: {output:?}"
+                        );
+                        assert_eq!(
+                            native, None,
+                            "stream {stream}: native and mouse together: {output:?}"
+                        );
+                        mouse = Some(pixel_y[&y]);
+                        take(pixel_x[&x], "mouse press");
+                    }
                     Seen::Mouse(Injection::LeftUp { .. }, true) => {
+                        // A release kept owed after a drop sits at the last
+                        // place the mouse went, an earlier sample's.
                         assert!(
                             mouse.is_some(),
                             "stream {stream}: mouse up without a down: {output:?}"
                         );
                         mouse = None;
                     }
-                    Seen::Mouse(..) => {}
+                    Seen::Mouse(..) => unreachable!(),
                 }
             }
-            // Every stroke is drawn, unless a reset cut it or SendInput
-            // refused every press it was offered.
-            for s in strokes.iter().filter(|&&s| s > reset_before) {
-                match presses.get(s) {
-                    _ if drawn.contains(s) => {}
-                    Some(&(attempts, refused)) if attempts > 0 && attempts == refused => {
-                        coverage.presses_all_refused += 1;
-                    }
-                    _ => panic!("stream {stream}: stroke {s} was dropped: {output:?}"),
+            // Exactly once, on one path, for every sample not dropped by
+            // design. An up, cancel or leave has nothing to deliver when
+            // what it ends is already gone; the replay above checks that
+            // nothing is ended twice and nothing stays held.
+            let once = |id, kind| taken.get(&(id, kind)).copied().unwrap_or(0);
+            for sample in &samples {
+                let id = sample.x;
+                let native_frames =
+                    once(id, "down") + once(id, "move") + once(id, "up") + once(id, "hover");
+                let mouse_input = once(id, "mouse move") + once(id, "mouse press");
+                for kind in ["down", "move", "up", "hover", "mouse move", "mouse press"] {
+                    assert!(
+                        once(id, kind) <= 1,
+                        "stream {stream}: sample {id} {kind} twice: {output:?}"
+                    );
+                }
+                assert!(
+                    native_frames == 0 || mouse_input == 0,
+                    "stream {stream}: sample {id} on both paths: {output:?}"
+                );
+                if exempt.contains(&id)
+                    || !matches!(
+                        sample.phase,
+                        PenPhase::Down | PenPhase::Move | PenPhase::Hover
+                    )
+                {
+                    continue;
+                }
+                coverage.samples_checked += 1;
+                assert!(
+                    native_frames + mouse_input > 0,
+                    "stream {stream}: sample {id} {:?} was lost: {output:?}",
+                    sample.phase
+                );
+                if sample.phase == PenPhase::Down && mouse_input > 0 {
+                    assert_eq!(
+                        once(id, "mouse press"),
+                        1,
+                        "stream {stream}: down {id} not pressed: {output:?}"
+                    );
                 }
             }
             if !in_contact {
@@ -1216,11 +1555,13 @@ mod tests {
             for (phase, count) in &api.rejected {
                 *coverage.rejected.entry(phase.clone()).or_default() += count;
             }
+            for (inserted, count) in &api.mouse_partial_after {
+                *coverage.mouse_partial_after.entry(*inserted).or_default() += count;
+            }
             coverage.not_ready += api.not_ready;
             coverage.devices_refused += api.devices_refused;
             coverage.devices_granted += api.devices_granted;
             coverage.mouse_refused += api.mouse_refused;
-            coverage.mouse_partial += api.mouse_partial;
         }
         eprintln!("COVERAGE {coverage:#?}");
         for phase in ["Down", "Move", "Up", "Cancel", "Hover", "Leave"] {
@@ -1229,10 +1570,20 @@ mod tests {
                 "{coverage:#?}"
             );
         }
+        for why in ["coalesced", "reset", "stale"] {
+            assert!(
+                coverage.dropped.get(why).is_some_and(|&n| n > 50),
+                "{coverage:#?}"
+            );
+        }
         assert!(coverage.streams_overflowed > 300, "{coverage:#?}");
         assert!(coverage.streams_losing_device > 300, "{coverage:#?}");
+        assert!(coverage.mouse_refused > 300, "{coverage:#?}");
         assert!(
-            coverage.mouse_refused > 300 && coverage.mouse_partial > 300,
+            (1..=3).all(|k| coverage
+                .mouse_partial_after
+                .get(&k)
+                .is_some_and(|&n| n > 20)),
             "{coverage:#?}"
         );
     }

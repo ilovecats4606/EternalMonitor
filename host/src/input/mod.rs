@@ -512,11 +512,11 @@ impl InputRelay {
     }
 
     /// Whether the transport's refresh tick has pen work: a native device to
-    /// keep alive, or a mouse fallback release Windows refused.
+    /// keep alive, or mouse fallback input Windows refused.
     pub fn pen_tick_needed(&self) -> bool {
         #[cfg(windows)]
         {
-            self.pen_device.available() || self.pen_device.owes_release()
+            self.pen_device.available() || self.pen_device.mouse_waiting()
         }
         #[cfg(not(windows))]
         {
@@ -554,7 +554,7 @@ impl InputRelay {
         // which a release would queue behind.
         #[cfg(windows)]
         let releases: Vec<_> = {
-            self.pen_device.reset();
+            self.pen_device.reset(std::time::Instant::now());
             releases
                 .into_iter()
                 .filter(|injection| !matches!(injection, Injection::Pen(_)))
@@ -608,7 +608,8 @@ impl InputRelay {
     /// display moved or changed mode since the Pencil last moved.
     pub fn keep_pen_alive(&mut self, output: Option<CaptureGeometry>) {
         #[cfg(windows)]
-        self.pen_device.flush(output.or(self.output));
+        self.pen_device
+            .flush(output.or(self.output), std::time::Instant::now());
         let Some(output) = output else {
             return;
         };
