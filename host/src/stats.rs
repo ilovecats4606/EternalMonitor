@@ -127,25 +127,18 @@ impl PipelineStats {
         }
     }
 
-    pub fn reset_for_restart(&mut self) {
-        let gpu_name = self.gpu_name.clone();
-        let capture_display = self.capture_display.clone();
-        let listen_addr = self.listen_addr.clone();
-        let target_addr = self.target_addr.clone();
-        let bitrate_bps = self.bitrate_bps;
-        let codec_name = self.codec_name.clone();
-        let using_software_fallback = self.using_software_fallback;
-        let mdns_active = self.mdns_active;
-
-        *self = Self::new();
-        self.gpu_name = gpu_name;
-        self.capture_display = capture_display;
-        self.listen_addr = listen_addr;
-        self.target_addr = target_addr;
-        self.bitrate_bps = bitrate_bps;
-        self.codec_name = codec_name;
-        self.using_software_fallback = using_software_fallback;
-        self.mdns_active = mdns_active;
+    /// Returns the audio stats it replaced, for their final log line.
+    pub fn reset_for_restart(&mut self) -> crate::audio::AudioStats {
+        let previous = std::mem::take(self);
+        self.gpu_name = previous.gpu_name;
+        self.capture_display = previous.capture_display;
+        self.listen_addr = previous.listen_addr;
+        self.target_addr = previous.target_addr;
+        self.bitrate_bps = previous.bitrate_bps;
+        self.codec_name = previous.codec_name;
+        self.using_software_fallback = previous.using_software_fallback;
+        self.mdns_active = previous.mdns_active;
+        previous.audio
     }
 
     /// Clear transport counters and the bandwidth window without touching uptime,

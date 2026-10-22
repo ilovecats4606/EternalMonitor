@@ -250,12 +250,37 @@ fn log_stats(stats: &AudioStats) {
 }
 
 /// Log a capture's final stats when it ends, so drops after its last
-/// periodic line still reach the log.
+/// periodic line still reach the log. Stats already replaced were logged by
+/// whatever replaced them: a newer capture or a restart.
 fn log_final(session: Option<CaptureSession>) {
-    let Some(session) = session else { return };
-    let stats = PIPELINE_STATS.lock().audio.clone();
-    if stats.stream == session.stream {
+    if let Some(session) = session {
+        log_final_of(&PIPELINE_STATS, session.stream);
+    }
+}
+
+fn log_final_of(target: &parking_lot::Mutex<crate::stats::PipelineStats>, stream: u64) {
+    let stats = target.lock().audio.clone();
+    if stats.stream == stream {
         log_stats(&stats);
+    }
+}
+
+/// Reset the stats for a new generation, with `configure` under the same
+/// lock, and log the audio capture they held. The old generation's audio
+/// thread is detached and may reach its final line only after this replaced
+/// its stats, so the reset hands them back here, as `publish` does.
+pub(crate) fn restart_stats(
+    target: &parking_lot::Mutex<crate::stats::PipelineStats>,
+    configure: impl FnOnce(&mut crate::stats::PipelineStats),
+) {
+    let retired = {
+        let mut stats = target.lock();
+        let retired = stats.reset_for_restart();
+        configure(&mut stats);
+        retired
+    };
+    if retired.stream != 0 {
+        log_stats(&retired);
     }
 }
 
@@ -571,6 +596,56 @@ mod tests {
         assert_eq!(replaced.late_seqs.to_string(), "41-42");
         assert!(publish(&target, AudioStats::started("C"), || false).is_none());
         assert_eq!(target.lock().audio.device, "B");
+    }
+
+    /// Log lines `run` writes on this thread.
+    fn logged(run: impl FnOnce()) -> String {
+        let buffer = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || Captured(writer.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        let text = String::from_utf8_lossy(&buffer.lock()).into_owned();
+        text
+    }
+
+    struct Captured(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_restart_logs_the_final_stats_of_a_capture_whose_thread_ends_later() {
+        let target = parking_lot::Mutex::new(crate::stats::PipelineStats::default());
+        let capture = AudioStats::started("A");
+        let stream = capture.stream;
+        publish(&target, capture, || true).unwrap();
+        // A drop charged after the capture's last periodic stats line.
+        target.lock().audio.late_seqs.record(42);
+        let lines = logged(|| {
+            // The supervisor resets the stats for the next generation...
+            restart_stats(&target, |stats| stats.set_bitrate(5_000_000));
+            // ...before the old generation's detached thread logs its end.
+            log_final_of(&target, stream);
+        });
+        let finals: Vec<_> = lines
+            .lines()
+            .filter(|line| line.contains(&format!("audio_stream={stream} ")))
+            .collect();
+        assert_eq!(finals.len(), 1, "{lines}");
+        assert!(finals[0].contains("late_seqs=42"), "{lines}");
+        assert_eq!(target.lock().audio.stream, 0);
+        assert_eq!(target.lock().bitrate_bps, 5_000_000);
+        // An idle restart, with no capture, logs nothing.
+        assert_eq!(logged(|| restart_stats(&target, |_| {})), "");
     }
 
     /// Native check of the same startup path with the PC's real loopback.

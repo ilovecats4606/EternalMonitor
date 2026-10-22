@@ -6,6 +6,7 @@ pub mod resample;
 mod stage;
 pub mod synthetic;
 
+pub(crate) use stage::restart_stats;
 pub use stage::run_audio_stage;
 
 use std::collections::VecDeque;
