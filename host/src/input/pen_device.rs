@@ -305,8 +305,19 @@ impl<A: PenApi> PenDevice<A> {
     /// Offer Windows the waiting input, oldest first. What it inserts
     /// leaves the queue and sets the button state; the rest waits for the
     /// next sample, tick or reset. Ink that has waited `MOUSE_STALE` is
-    /// dropped; a waiting release alone is never stale.
+    /// dropped first, so a late call never inserts it; a waiting release
+    /// alone is never stale.
     fn pump(&mut self, now: Instant) {
+        let oldest_ink = self
+            .mouse
+            .waiting
+            .iter()
+            .find(|(input, _)| !matches!(input, Injection::LeftUp { .. }));
+        if oldest_ink
+            .is_some_and(|&(_, queued)| now.saturating_duration_since(queued) >= MOUSE_STALE)
+        {
+            self.drop_mouse_input("stale", now);
+        }
         if self.mouse.waiting.is_empty() {
             return;
         }
@@ -319,16 +330,6 @@ impl<A: PenApi> PenDevice<A> {
                 Injection::LeftUp { .. } => self.mouse.pressed = false,
                 _ => {}
             }
-        }
-        let oldest_ink = self
-            .mouse
-            .waiting
-            .iter()
-            .find(|(input, _)| !matches!(input, Injection::LeftUp { .. }));
-        if oldest_ink
-            .is_some_and(|&(_, queued)| now.saturating_duration_since(queued) >= MOUSE_STALE)
-        {
-            self.drop_mouse_input("stale", now);
         }
     }
 
@@ -1586,5 +1587,34 @@ mod tests {
                 .is_some_and(|&n| n > 20)),
             "{coverage:#?}"
         );
+    }
+
+    #[test]
+    fn expired_input_is_never_inserted_when_insertion_recovers() {
+        // Sol's case: SendInput refuses a stroke, then the next tick comes
+        // two seconds later (sleep or load) with insertion working again.
+        // Only a release owed for a button Windows holds may be inserted.
+        let (x, y) = abs(10, 1);
+        for press_inserted in [false, true] {
+            let mut device = PenDevice::new(FakeApi::new(&[false]));
+            let start = Instant::now();
+            device.slot.api.mouse_limit = if press_inserted { 2 } else { 0 };
+            deliver_one(&mut device, pen_xy(PenPhase::Down, 10, 1), start);
+            device.slot.api.mouse_limit = 0;
+            deliver_one(&mut device, pen_xy(PenPhase::Up, 12, 1), start);
+            let inserted_before = std::mem::take(&mut device.slot.api.mouse);
+            device.slot.api.mouse_limit = usize::MAX;
+            flush_one(&mut device, start + MOUSE_STALE * 2);
+            let owed: &[Injection] = if press_inserted {
+                &[Injection::LeftUp { x, y }]
+            } else {
+                &[]
+            };
+            assert_eq!(
+                device.slot.api.mouse, owed,
+                "press inserted: {press_inserted}, before: {inserted_before:?}"
+            );
+            assert!(!device.slot.api.button);
+        }
     }
 }
