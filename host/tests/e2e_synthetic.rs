@@ -33,6 +33,11 @@ use eternal_wire::v2::{classify, Classified};
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Surface the host's tracing in test output (best effort, once per process).
+///
+/// No thread under test may block on a log sink, as in production. A redirected
+/// stderr on a busy disk stalled FFmpeg's decode-error logging inside the fake
+/// iPad's packet loop for 4-32 s, past the host's 3 s liveness window. FFmpeg
+/// therefore logs through tracing, and live output is bounded and lossy.
 fn init_test_tracing() {
     // Never let a synthetic test claim a physically connected iPad. The USB
     // test replaces this unreachable endpoint with its own loopback listener.
@@ -48,12 +53,23 @@ fn init_test_tracing() {
         assert_eq!(unsafe { pthread_set_qos_class_self_np(0x21, 0) }, 0);
     }
     use tracing_subscriber::EnvFilter;
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_test_writer()
-        .try_init();
+    static LIVE_OUTPUT: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
+        std::sync::OnceLock::new();
+    let subscriber = tracing_subscriber::fmt().with_env_filter(
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+    );
+    // Captured output is an in-memory buffer; --nocapture writes to the real stdout.
+    let nocapture = std::env::args().any(|arg| arg == "--nocapture" || arg == "--no-capture")
+        || std::env::var("RUST_TEST_NOCAPTURE").is_ok_and(|value| value != "0");
+    if nocapture {
+        let (writer, guard) = eternal_host::logging::non_blocking_output(std::io::stdout());
+        if subscriber.with_writer(writer).try_init().is_ok() {
+            let _ = LIVE_OUTPUT.set(guard);
+        }
+    } else {
+        let _ = subscriber.with_test_writer().try_init();
+    }
+    eternal_host::diagnostics::install_ffmpeg_logging();
 }
 
 const SYNTH_W: u32 = 640;
