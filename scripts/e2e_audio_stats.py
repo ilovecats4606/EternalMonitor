@@ -98,12 +98,26 @@ def attribute(samples, host_lines, scheduling_gate, errors, notes):
     if after_last < first:
         errors.append(f'the iPad sequence range {first}-{after_last} wraps; attribution does not support it')
         return None
-    host = stream_stats(host_lines, int(last['session_id']), int(last['epoch']), errors)
-    if host is None:
-        return None
     lost = int(last['lost'])
     if int(last['decoded']) + lost != after_last - first:
         errors.append(f'iPad counters do not cover sequences {first}-{after_last - 1}')
+        return None
+    session, epoch = int(last['session_id']), int(last['epoch'])
+    if len(captures(host_lines, session, epoch)) > 1:
+        # Several captures numbered under this session and epoch (audio was
+        # toggled), and nothing ties the frozen timeline to one of them. Each
+        # numbers from 0, so a clean timeline from 0 is the only safe pass.
+        restarted = f'host restarted audio numbering within session {session} epoch {epoch}'
+        if lost:
+            errors.append(f'{lost} audio packets lost but not attributable: {restarted}')
+        elif first:
+            errors.append(f'{first} audio packets before the iPad\'s first sequence {first} are missing '
+                          f'but not attributable: {restarted}')
+        else:
+            notes.append(f'{restarted}; no loss to attribute')
+        return None
+    host = stream_stats(host_lines, session, epoch, errors)
+    if host is None:
         return None
     if host['truncated']:
         errors.append('host audio drop list was truncated')
@@ -161,22 +175,17 @@ def measure(text, host_text=None, scheduling_gate='enforce'):
     host = host_stats(host_text) if host_text is not None else None
     attributed = None
     identified = host is not None and any('stream' in line for line in host) and 'session_id' in last
-    restarted = identified and len(captures(host, int(last['session_id']), int(last['epoch']))) > 1
-    if identified and not restarted and not errors:
+    if identified:
         # The iPad counts every sequence gap as lost, including packets the
         # host discarded itself. Packets the host held past their 100 ms
         # deadline because its sender did not get the CPU measure the
         # machine, but only while the app launches.
-        attributed = attribute(samples, host, scheduling_gate, errors, notes)
+        if not errors:
+            attributed = attribute(samples, host, scheduling_gate, errors, notes)
     else:
-        # Without one identified host stream no loss can be attributed, and
-        # no drop is waived. Host numbering starts at 0, so sequences before
-        # the iPad's first packet count as lost too.
-        if restarted:
-            # Several captures numbered under this session and epoch (audio
-            # was toggled), and nothing ties the frozen timeline to one.
-            notes.append(f"host restarted audio numbering within session {last['session_id']:.0f} "
-                         f"epoch {last['epoch']:.0f}; loss not attributed")
+        # Evidence from builds without stream identity: no loss can be
+        # attributed, and no drop is waived. Host numbering starts at 0, so
+        # sequences before the iPad's first packet count as lost too.
         unattributed = lost + last.get('first_seq', 0)
         if unattributed > 2:
             errors.append(f"audio packet loss {unattributed:.0f} exceeds 2")
