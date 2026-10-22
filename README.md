@@ -13,7 +13,7 @@ and control the PC with touch, a keyboard or Apple Pencil.
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20iPadOS-e8ff47?labelColor=111)](#download)
 [![Website](https://img.shields.io/badge/website-eternalmonitor.dev-e8ff47?labelColor=111)](https://eternalmonitor.dev)
 
-[Download](#download) · [Setup guide](SETUP.md) · [Website](https://eternalmonitor.dev) · [Release notes](RELEASE_NOTES.md)
+[Download](#download) · [Setup guide](SETUP.md) · [Known issues](docs/known-issues.md) · [Website](https://eternalmonitor.dev) · [Release notes](RELEASE_NOTES.md)
 
 </div>
 
@@ -59,7 +59,7 @@ the MIT license, and needs no account.
 
 | | Requirements | Get it |
 | --- | --- | --- |
-| **Windows** | Windows 10 (version 1809 or later) or Windows 11, 64-bit, with an NVIDIA, AMD or Intel GPU | [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.1) (v0.3.1 current stable) |
+| **Windows** | Windows 10 version 1809 or later, or Windows 11, 64-bit, with NVIDIA, AMD or Intel graphics | [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.1) (v0.3.1 current stable) |
 | **iPad** | iPadOS 17 or later | [TestFlight v0.3.1, build 166](https://testflight.apple.com/join/ppc9QfXc). The public beta is open: install TestFlight, then open the link on your iPad. |
 
 Install both apps from the same version. The older v0.1 releases use a different
@@ -103,6 +103,9 @@ Known limits:
 - The Windows app is the only host. The host builds on macOS for development,
   but there it streams a test pattern instead of your screen.
 - Apple Pencil (USB-C) has no pressure sensor, so its strokes keep one width.
+
+[Known issues](docs/known-issues.md) lists every problem we know about, with what
+to do about each one.
 
 ## How it works
 
@@ -237,6 +240,7 @@ streaming system test on every pull request.
 | Document | What it covers |
 | --- | --- |
 | [SETUP.md](SETUP.md) | Step-by-step setup for anyone, including USB and drawing |
+| [docs/known-issues.md](docs/known-issues.md) | Problems we know about, and what to do about each |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | The pipeline, protocol v2 and each component |
 | [docs/decisions.md](docs/decisions.md) | Why things are the way they are, with measurements |
 | [docs/pencil-drawing.md](docs/pencil-drawing.md) | Apple Pencil, Windows Ink and Clip Studio Paint |
