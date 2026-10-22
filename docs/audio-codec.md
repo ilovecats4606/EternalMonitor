@@ -20,6 +20,13 @@ bytes, speech VAD, or undocumented FFmpeg internals are used. This is
 silence compression, rather than libopus DTX: the host still sends 50 small
 packets per second while the input remains silent.
 
+A session's audio starts at its first capture read. WASAPI buffers from
+`Start()` while the session opens its encoder, and an idle engine's first
+read is silence reaching back to `Start()`. Whole 20 ms frames that ended
+before the first read are discarded before encoding, so they take no
+sequence number. Sending them would put packets past the 100 ms send
+deadline, and the viewer would count each one as lost.
+
 The codec test decodes 4.2 seconds of a -12 dBFS 1 kHz signal, including two
 100 ms silence gaps. It verifies packet sequence/time, exact 960-sample
 decodes, sub-10-byte silence packets, the tone level before and after each
@@ -40,4 +47,4 @@ AudioToolbox was investigated on Xcode 16.4 / iOS 18.6 using a packet generated 
 
 A dedicated queue decodes bounded packets ahead of an `AVAudioSourceNode`. The stereo PCM ring starts after 60 ms, raises its target to 120 ms after two underruns within ten seconds, and returns to 60 ms after thirty clean seconds. On overflow it drops the oldest 20 ms. Sequence gaps wait 20 ms for reordering before PLC, with bounded work for large gaps. Timestamp gaps with continuous sequence numbers add silence without loss accounting; silence already rendered is credited. Epoch changes discard old audio, while a codec discontinuity in an otherwise continuous timeline preserves queued samples.
 
-`E2E_AUDIO` measures RMS and the 1 kHz Goertzel amplitude from actual rendered samples, in 100 ms windows. Packet loss and current buffered time also go into the receiver report.
+`E2E_AUDIO` measures RMS and the 1 kHz Goertzel amplitude from actual rendered samples, in 100 ms windows. Packet loss and current buffered time also go into the receiver report. The simulator test matches each lost packet to a host drop by sequence number. The iPad's `E2E_AUDIO` line reports its timeline's wire session id and epoch, and its first and next expected sequence; every number in between was decoded or counted lost. The host's `Audio stream stats` line lists the sequences it dropped after missing the 100 ms send deadline (`late_seqs`, stale or capture queue full) and those it failed to send (`failed_seqs`). It also gives the capture session's `audio_stream` number, which changes whenever numbering restarts at 0, and the `wire_stream` (session/epoch) its packets used. The checker uses only the host stream with the iPad's session and epoch, and fails if there is none. If more than one capture numbered under that pair (audio was toggled off and on), nothing ties the frozen timeline to one of them. The checker then attributes nothing and passes only a clean timeline: no loss, starting at sequence 0. The iPad's timeline identity and counter coverage are checked in every case. Only host drops below the iPad's frozen next sequence count. Every sequence before the iPad's first must be a host drop. An iPad loss without a matching host drop fails, as does any send failure and any deadline drop after the stream's first 250 sequences (5 s of nominal audio). Ranges that cross the u32 sequence wrap are not supported and fail. In CI runs, deadline drops happened only in the first 0.3-4.1 s of audio, while the launching simulator app starved the three-vCPU runner. More than two drops inside that window fail under the FPS gate's `enforce` mode and are recorded under `record` on CI. Evidence from builds without stream identity keeps the original limit of two lost packets.

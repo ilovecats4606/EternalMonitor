@@ -339,7 +339,13 @@ python3 "$ROOT/scripts/e2e_stats.py" "$MEASURED_LOG" --output "$OUT/result.json"
     "${MEASUREMENT_ARGS[@]}" \
     --max-drop-ratio "${EM_MAX_DROP_RATIO:-0.02}" --require-repairs "${EM_REQUIRE_REPAIRS:-0}"
 if [ "$AUDIO" = 1 ]; then
-    python3 "$ROOT/scripts/e2e_audio_stats.py" "$MEASURED_LOG" --output "$OUT/result.json"
+    # The FPS gate also covers startup audio deadlines: both measure whether
+    # the simulator left the host enough CPU, not packet delivery. The host log
+    # is still live; the checker bounds its drop sequences by the iPad's
+    # frozen sequence range, so later host drops are outside the measurement.
+    AUDIO_ARGS=(--scheduling-gate "$FPS_GATE")
+    if [ -z "$REMOTE_HOST" ]; then AUDIO_ARGS+=(--host-log "$HOST_LOG"); fi
+    python3 "$ROOT/scripts/e2e_audio_stats.py" "$MEASURED_LOG" --output "$OUT/result.json" "${AUDIO_ARGS[@]}"
 fi
 echo "PASS: $(grep 'E2E_STATS' "$MEASURED_LOG" | tail -1)"
 echo "      $first_frame"

@@ -34,12 +34,19 @@ impl AudioSender {
             }
             session.peer()?
         };
-        if now_us.saturating_sub(queued.packet.capture_ts_us) > 100_000 {
-            self.reset_pending = true;
+        {
             let mut stats = PIPELINE_STATS.lock();
-            stats.audio.dropped += 1;
-            stats.audio.stale_dropped += 1;
-            return None;
+            // Audio restarted after this packet was queued; its capture's
+            // numbering is over, so it belongs to no live stream.
+            let audio = stats.audio.of_stream(queued.stream)?;
+            if now_us.saturating_sub(queued.packet.capture_ts_us) > crate::audio::SEND_DEADLINE_US {
+                self.reset_pending = true;
+                audio.dropped += 1;
+                audio.stale_dropped += 1;
+                audio.late_seqs.record(queued.packet.seq);
+                audio.note_wire(queued.session_id, epoch);
+                return None;
+            }
         }
         let stream = (queued.session_id, epoch);
         let header = AudioHeader {
@@ -54,9 +61,12 @@ impl AudioSender {
         let datagram = header.encode(&queued.packet.opus).ok()?;
         if datagram.len() > shared.max_dgram.load(std::sync::atomic::Ordering::SeqCst) as usize {
             self.reset_pending = true;
-            let mut stats = PIPELINE_STATS.lock();
-            stats.audio.dropped += 1;
-            stats.audio.oversized_dropped += 1;
+            if let Some(audio) = PIPELINE_STATS.lock().audio.of_stream(queued.stream) {
+                audio.dropped += 1;
+                audio.oversized_dropped += 1;
+                audio.failed_seqs.record(queued.packet.seq);
+                audio.note_wire(queued.session_id, epoch);
+            }
             return None;
         }
         Some((peer, datagram))
@@ -70,6 +80,8 @@ impl AudioSender {
         epoch: u32,
     ) {
         let session_id = queued.session_id;
+        let stream = queued.stream;
+        let seq = queued.packet.seq;
         let payload_size = queued.packet.opus.len();
         if let Some((peer, datagram)) =
             self.prepare(queued, shared, epoch, crate::clock::host_now_us())
@@ -77,12 +89,18 @@ impl AudioSender {
             if links.send_to(&datagram, peer).await.is_ok() {
                 self.last_stream = Some((session_id, epoch));
                 self.reset_pending = false;
-                PIPELINE_STATS.lock().audio.record_sent(payload_size);
+                if let Some(audio) = PIPELINE_STATS.lock().audio.of_stream(stream) {
+                    audio.note_wire(session_id, epoch);
+                    audio.record_sent(payload_size);
+                }
             } else {
                 self.reset_pending = true;
-                let mut stats = PIPELINE_STATS.lock();
-                stats.audio.dropped += 1;
-                stats.audio.send_failed += 1;
+                if let Some(audio) = PIPELINE_STATS.lock().audio.of_stream(stream) {
+                    audio.dropped += 1;
+                    audio.send_failed += 1;
+                    audio.failed_seqs.record(seq);
+                    audio.note_wire(session_id, epoch);
+                }
             }
         }
     }
@@ -148,9 +166,13 @@ mod tests {
         (shared, id)
     }
 
+    /// Tests that replace the global audio stats run one at a time.
+    static AUDIO_STATS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     fn packet(id: u32, time: u64) -> SessionPacket {
         SessionPacket {
             session_id: id,
+            stream: PIPELINE_STATS.lock().audio.stream,
             packet: crate::audio::AudioPacket {
                 seq: 3,
                 capture_ts_us: time,
@@ -162,6 +184,7 @@ mod tests {
 
     #[test]
     fn audio_requires_both_peers_and_the_current_session_and_epoch() {
+        let _stats = AUDIO_STATS.lock();
         let mut sender = AudioSender::default();
         let (legacy, id) = session(0);
         assert!(crate::audio::wanted_session(&legacy).is_none());
@@ -203,5 +226,41 @@ mod tests {
             .0
             .discontinuity
         );
+    }
+
+    #[test]
+    fn a_retired_capture_is_never_charged_to_its_replacement() {
+        let _stats = AUDIO_STATS.lock();
+        let (shared, id) = session(FEATURE_WANTS_AUDIO);
+        let mut sender = AudioSender::default();
+        // Capture A numbers sequence 3, then audio restarts and capture B
+        // replaces the stats before the transport reaches A's packet.
+        PIPELINE_STATS.lock().audio = crate::audio::AudioStats::started("A");
+        let old_late = packet(id, 100);
+        let old_fresh = packet(id, 100_000);
+        PIPELINE_STATS.lock().audio = crate::audio::AudioStats::started("B");
+        assert!(sender.prepare(old_late, &shared, 7, 100_101).is_none());
+        {
+            let stats = PIPELINE_STATS.lock();
+            assert_eq!(
+                stats.audio.late_seqs.to_string(),
+                "none",
+                "capture A's late packet was charged to capture B"
+            );
+            assert_eq!(stats.audio.failed_seqs.to_string(), "none");
+            assert_eq!((stats.audio.dropped, stats.audio.stale_dropped), (0, 0));
+            assert_eq!(stats.audio.wire, crate::audio::WireStream::Unknown);
+        }
+        assert!(
+            sender.prepare(old_fresh, &shared, 7, 100_101).is_none(),
+            "a retired capture's packet must not enter the new stream"
+        );
+        // B's own late packet with the same sequence number is B's drop.
+        assert!(sender
+            .prepare(packet(id, 100), &shared, 7, 100_101)
+            .is_none());
+        let stats = PIPELINE_STATS.lock();
+        assert_eq!(stats.audio.late_seqs.to_string(), "3");
+        assert_eq!(stats.audio.wire, crate::audio::WireStream::Known(id, 7));
     }
 }
