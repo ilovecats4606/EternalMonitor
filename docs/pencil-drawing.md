@@ -105,11 +105,12 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   display change, ends the contact where Windows has it), and a mouse release
   stays owed while Windows holds the button.
 - Native input is stuck when Windows has accepted no frame for a second and
-  ink is waiting. The host then recreates the pen device once; if the new
-  one accepts nothing within 200 ms, the waiting samples and the strokes that
-  follow go to the mouse, and the host logs it once. It tries a new device at
-  a later pen down or hover once the mouse is idle, at most once a second,
-  and gives that device 200 ms too. Recovery is logged when Windows accepts
+  ink is waiting, or for 1.2 s while it holds a contact, since recreating
+  the device then cancels the stroke being drawn. The host then recreates
+  the pen device once; if the new one accepts nothing within 200 ms, the
+  waiting samples and the strokes that follow go to the mouse, and the host
+  logs it once. It tries a new device at a later pen down or hover once the
+  mouse is idle, at most once a second, and gives that device 200 ms too. Recovery is logged when Windows accepts
   a frame again. An up waiting alone never counts as stuck.
 - When a session ends or another takes over, the host drops pen samples
   Windows never received and ends only the pointer Windows holds, where it

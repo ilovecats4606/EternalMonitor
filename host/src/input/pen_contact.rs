@@ -30,7 +30,9 @@ pub(super) const INPUT_STALE: Duration = Duration::from_secs(1);
 pub(super) const QUEUE_LIMIT: usize = 8;
 
 /// How long a device recreated because native input seemed stuck has to
-/// accept a frame before Pencil input goes to the mouse instead.
+/// accept a frame before Pencil input goes to the mouse instead. While
+/// Windows holds a contact, native input also waits this much longer before
+/// counting as stuck.
 pub(super) const STUCK_TRIAL: Duration = Duration::from_millis(200);
 
 /// `POINTER_FLAG_*` values from winuser.h, so frames can be built and checked
@@ -268,10 +270,13 @@ impl PenContact {
     /// next Pencil sample.
     ///
     /// Native input is stuck once Windows has accepted nothing for
-    /// `INPUT_STALE` while ink waits. The device is then recreated once; if
-    /// the new one accepts nothing within `STUCK_TRIAL` either, the waiting
-    /// samples go to the mouse and the device is given up. An end waiting
-    /// alone never counts: recreating could only lose it.
+    /// `INPUT_STALE` while ink waits, or `STUCK_TRIAL` longer while it holds
+    /// a contact: recreating the device cancels that contact, so a stall
+    /// that clears on its own just after a second keeps the stroke whole.
+    /// The device is then recreated once; if the new one accepts nothing
+    /// within `STUCK_TRIAL` either, the waiting samples go to the mouse and
+    /// the device is given up. An end waiting alone never counts:
+    /// recreating could only lose it.
     pub fn flush(
         &mut self,
         output: Option<CaptureGeometry>,
@@ -296,13 +301,17 @@ impl PenContact {
             if !self.queue.iter().any(|(sample, _)| is_ink(sample)) {
                 return;
             }
+            let stuck_after = match self.state {
+                PointerState::Contact(_) => INPUT_STALE + STUCK_TRIAL,
+                _ => INPUT_STALE,
+            };
             match self.trial_until {
                 Some(until) if now >= until => {
                     target.give_up();
                     self.state = PointerState::Out;
                     return self.abandon(output);
                 }
-                None if now.saturating_duration_since(refused_since) >= INPUT_STALE => {
+                None if now.saturating_duration_since(refused_since) >= stuck_after => {
                     target.recreate();
                     self.state = PointerState::Out;
                     self.trial_until = Some(now + STUCK_TRIAL);

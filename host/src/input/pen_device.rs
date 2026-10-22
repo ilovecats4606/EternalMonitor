@@ -2052,6 +2052,132 @@ mod tests {
         assert!(device.slot.api.destroyed.is_empty());
     }
 
+    /// A native stroke drawn every 16 ms from `start` for `length`, during
+    /// which Windows answers ERROR_NOT_READY from `hitch` for `stall`.
+    fn stroke_with_hitch(
+        device: &mut PenDevice<FakeApi>,
+        start: Instant,
+        length: Duration,
+        hitch: Duration,
+        stall: Duration,
+    ) {
+        let frame = Duration::from_millis(16);
+        let (mut now, mut x) = (start, 10);
+        let answer = |now: Instant| {
+            if (start + hitch..start + hitch + stall).contains(&now) {
+                Outcome::NotReady
+            } else {
+                Outcome::Injected
+            }
+        };
+        device.slot.api.answer = answer(now);
+        deliver_one(device, pen_xy(PenPhase::Down, x, 1), now);
+        while now < start + length {
+            now += frame;
+            x += 1;
+            device.slot.api.answer = answer(now);
+            deliver_one(device, pen_xy(PenPhase::Move, x, 1), now);
+        }
+        deliver_one(device, pen_xy(PenPhase::Up, x, 1), now);
+    }
+
+    #[test]
+    fn a_mid_stroke_hitch_that_clears_keeps_the_stroke_native() {
+        // Claude's case: Windows is not ready for 1.1 s in the middle of a
+        // stroke. Recreating the device at one second would cancel the
+        // native part, which an ink app may discard, and gain nothing: the
+        // stall clears on its own. The stroke stays one native stroke.
+        let mut device = PenDevice::new(FakeApi::new(&[]));
+        stroke_with_hitch(
+            &mut device,
+            Instant::now(),
+            Duration::from_millis(2100),
+            Duration::from_millis(500),
+            Duration::from_millis(1100),
+        );
+        let frames = &device.slot.api.frames;
+        let count = |phase| frames.iter().filter(|&&(_, p)| p == phase).count();
+        assert_eq!((count(PenPhase::Down), count(PenPhase::Cancel)), (1, 0));
+        assert_eq!(frames.last(), Some(&(1, PenPhase::Up)));
+        assert!(device.slot.api.destroyed.is_empty());
+        assert!(device.slot.api.mouse.is_empty());
+    }
+
+    #[test]
+    fn a_long_mid_stroke_hitch_still_reaches_the_mouse() {
+        // Guard: a two-second stall mid-stroke is stuck native input; the
+        // rest of the stroke is drawn on the mouse and released.
+        let mut device = PenDevice::new(FakeApi::new(&[]));
+        stroke_with_hitch(
+            &mut device,
+            Instant::now(),
+            Duration::from_millis(3000),
+            Duration::from_millis(500),
+            Duration::from_millis(2000),
+        );
+        assert_eq!(device.slot.reported, ["stuck"]);
+        assert!(!device.slot.api.destroyed.is_empty());
+        let mouse = &device.slot.api.mouse;
+        assert!(matches!(mouse.get(1), Some(Injection::LeftDown { .. })));
+        assert!(matches!(mouse.last(), Some(Injection::LeftUp { .. })));
+        assert!(!device.slot.api.button);
+    }
+
+    #[test]
+    fn an_owed_up_survives_a_stall_into_the_next_stroke() {
+        // Claude's case: Windows is not ready from the lift for 1.15 s, and
+        // the next stroke starts 0.3 s after the lift, as in handwriting.
+        // The up is owed to the contact Windows holds and goes natively
+        // once the stall clears, before the next stroke, which stays native.
+        let mut device = PenDevice::new(FakeApi::new(&[]));
+        let start = Instant::now();
+        let frame = Duration::from_millis(16);
+        let mut now = start;
+        deliver_one(&mut device, pen_xy(PenPhase::Down, 10, 1), now);
+        for x in 11..40 {
+            now += frame;
+            deliver_one(&mut device, pen_xy(PenPhase::Move, x, 1), now);
+        }
+        device.slot.api.answer = Outcome::NotReady;
+        now += frame;
+        let lift = now;
+        deliver_one(&mut device, pen_xy(PenPhase::Up, 60, 1), lift);
+        let clears = lift + Duration::from_millis(1150);
+        let mut x = 100;
+        while now < lift + Duration::from_millis(1500) {
+            now += frame;
+            if now >= clears {
+                device.slot.api.answer = Outcome::Injected;
+            }
+            if now < lift + Duration::from_millis(300) {
+                flush_one(&mut device, now);
+                continue;
+            }
+            let phase = if x == 100 {
+                PenPhase::Down
+            } else {
+                PenPhase::Move
+            };
+            deliver_one(&mut device, pen_xy(phase, x, 2), now);
+            x += 1;
+        }
+        deliver_one(&mut device, pen_xy(PenPhase::Up, x, 2), now);
+        let frames = &device.slot.api.frames;
+        let first = |phase| frames.iter().position(|&(_, p)| p == phase);
+        let downs: Vec<_> = (0..frames.len())
+            .filter(|&i| frames[i].1 == PenPhase::Down)
+            .collect();
+        assert_eq!(downs.len(), 2, "{frames:?}");
+        assert!(
+            first(PenPhase::Up).is_some_and(|up| up < downs[1]),
+            "{frames:?}"
+        );
+        assert_eq!(first(PenPhase::Cancel), None);
+        assert!(frames.iter().all(|&(handle, _)| handle == 1));
+        assert!(device.slot.api.destroyed.is_empty());
+        assert!(device.slot.api.mouse.is_empty());
+    }
+
     #[test]
     fn mouse_fallback_draws_pen_strokes_where_the_pen_would() {
         // Restored guard: the fallback's events, converted when sent, land
