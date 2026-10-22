@@ -162,8 +162,14 @@ pub(crate) fn start_time(pid: u32) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Held by tests that run copies of the test executable. A copy alive
+    /// while another test scans for running copies would be taken for
+    /// another host.
+    #[cfg(windows)]
+    pub(crate) static RUNS_THIS_EXE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     #[test]
     fn arguments_survive_the_windows_command_line() {
@@ -219,6 +225,7 @@ mod tests {
             std::fs::rename(partial, result).unwrap();
             return;
         }
+        let _copies = RUNS_THIS_EXE.lock();
         let name = format!("Local\\em-detached-probe-{}", std::process::id());
         let attributes = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -243,7 +250,7 @@ mod tests {
         let exe = std::env::current_exe().unwrap();
         let child = spawn_detached(&exe, &["--exact", NAME, "--test-threads=1"]);
         std::env::remove_var(PROBE);
-        child.unwrap();
+        let child = child.unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let answer = loop {
             if let Ok(text) = std::fs::read_to_string(&result) {
@@ -257,6 +264,10 @@ mod tests {
         };
         let _ = std::fs::remove_file(&result);
         unsafe { CloseHandle(event) }.unwrap();
+        // Release the lock only once the copy has exited.
+        while child.is_running() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert_eq!(answer, "not inherited");
     }
 

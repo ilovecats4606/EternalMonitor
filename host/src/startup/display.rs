@@ -487,6 +487,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn an_exited_copy_still_held_open_is_not_another_host() {
+        let _copies = super::super::process::tests::RUNS_THIS_EXE.lock();
         // The test executable stands in for the host's; `--list` exits at once.
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--list")
