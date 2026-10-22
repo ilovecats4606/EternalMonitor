@@ -5,10 +5,17 @@ SETUP.md's iPad and PC tables put each message in bold in the first column,
 and QUICKSTART.txt lists them as `- "message": what to do`. Each quote must
 equal a whole message in the Windows host or iPad app source: one string
 literal as the app renders it, or literals the source joins into one message
-(Swift `+`, Rust `concat!`). A quote that ends a sentence where a longer
-message goes on with another one fails too. A placeholder such as {version} or \\(host) in the
-source is written as an ellipsis (…). Runs of whitespace compare as one space.
-QUICKSTART.txt is ASCII, so there it is "..." and apostrophes are straight.
+(Swift `+`, Rust `concat!`), with comments between them ignored. When a
+quote is not a whole message but starts one, the error names that message. A
+placeholder such as {version} or \\(host) in the source is written as an
+ellipsis (…). Runs of whitespace compare as one space. QUICKSTART.txt is
+ASCII, so there it is "..." and apostrophes are straight.
+
+This is a drift detector, not a compiler. A source file it can't read is
+skipped with a warning instead of failing the check. Forms it doesn't read:
+Swift regex literals (/…/) containing a double quote, format strings built
+inside another macro (format!(concat!(…))), and messages joined any other way
+than Swift `+` or Rust `concat!` (for example String + &str or .join()).
 """
 import pathlib
 import re
@@ -23,6 +30,10 @@ RUST_CHAR = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]+\}|.)|[^\\'\n])
 # The format string is a macro's first argument, or its second after a writer.
 RUST_FORMAT_CALL = re.compile(r"\w!\(\s*(?:[^,()\"]+,\s*)?$")
 SWIFT_OPEN = re.compile(r'(#*)("""|")')
+
+
+class LexError(ValueError):
+    """The lexer could not read a file's string literals."""
 
 
 class Literal(NamedTuple):
@@ -44,6 +55,8 @@ def _skip_comment(text, i):
         return None
     depth, i = 1, i + 2
     while depth:
+        if i >= len(text):
+            raise LexError("unterminated /* comment")
         if text.startswith("/*", i):
             depth, i = depth + 1, i + 2
         elif text.startswith("*/", i):
@@ -80,6 +93,11 @@ def _rust_format(value):
     return value.replace("\x01", "{").replace("\x02", "}")
 
 
+def _format_if_called(text, start, value):
+    """The literal at start as printed, when it is a format macro's string."""
+    return _rust_format(value) if RUST_FORMAT_CALL.search(text[max(0, start - 120):start]) else value
+
+
 def rust_literals(text):
     literals, i = [], 0
     while i < len(text):
@@ -89,7 +107,8 @@ def rust_literals(text):
             i = after_comment
         elif raw and not _identifier_before(text, i):
             close = text.index('"' + raw[1], raw.end())
-            literals.append(Literal(text[raw.end():close], i, close + 1 + len(raw[1])))
+            value = _format_if_called(text, i, text[raw.end():close])
+            literals.append(Literal(value, i, close + 1 + len(raw[1])))
             i = close + 1 + len(raw[1])
         elif text[i] == '"' or (text.startswith('b"', i) and not _identifier_before(text, i)):
             start, i, out = i, text.index('"', i) + 1, []
@@ -99,10 +118,7 @@ def rust_literals(text):
                 else:
                     piece, i = text[i], i + 1
                 out.append(piece)
-            value = "".join(out)
-            if RUST_FORMAT_CALL.search(text[max(0, start - 120):start]):
-                value = _rust_format(value)
-            literals.append(Literal(value, start, i + 1))
+            literals.append(Literal(_format_if_called(text, start, "".join(out)), start, i + 1))
             i += 1
         elif text[i] == "'" and RUST_CHAR.match(text, i):
             i = RUST_CHAR.match(text, i).end()
@@ -115,6 +131,10 @@ def _skip_parens(text, i):
     """The index after the balanced parentheses starting at i."""
     depth = 0
     while True:
+        after_comment = _skip_comment(text, i)
+        if after_comment is not None:
+            i = after_comment
+            continue
         if SWIFT_OPEN.match(text, i) and text[i] in '"#':
             _, i = swift_string(text, i)
             continue
@@ -150,12 +170,17 @@ def swift_string(text, i):
     # """: content starts on the next line and ends before the closing line,
     # whose indentation is removed from every line.
     begin = text.index("\n", opening.end()) + 1
-    close = text.index('"""' + hashes, begin)
+    # An escaped \""" is text; only an unescaped """ (plus the hashes) closes.
+    close = begin
+    while not text.startswith('"""' + hashes, close):
+        close += len(escape) + 1 if text.startswith(escape, close) else 1
+        if close >= len(text):
+            raise LexError("unterminated multi-line string")
     last_newline = text.rindex("\n", begin - 1, close)
     indent = text[last_newline + 1:close]
     lines = [line[len(indent):] if line.startswith(indent) else line.lstrip()
              for line in text[begin:last_newline].split("\n")] if last_newline >= begin else []
-    value, _ = _swift_body("\n".join(lines) + '"""', 0, '"""', escape)
+    value, _ = _swift_body("\n".join(lines) + '"""' + hashes, 0, '"""' + hashes, escape)
     return value, close + 3 + len(hashes)
 
 
@@ -174,13 +199,28 @@ def swift_literals(text):
     return _join(text, literals, r"\s*\+\s*")
 
 
+def _without_comments(code):
+    """Code holding no string literals, with each comment as one space."""
+    out, i = [], 0
+    while i < len(code):
+        after_comment = _skip_comment(code, i)
+        if after_comment is None:
+            out.append(code[i])
+            i += 1
+        else:
+            out.append(" ")
+            i = after_comment
+    return "".join(out)
+
+
 def _join(text, literals, joiner, opener=None):
     """Messages, with literals the source joins into one message merged."""
     messages = []
     for literal in literals:
         previous = messages[-1] if messages else None
-        joined = previous and re.fullmatch(joiner, text[previous[1]:literal.start])
-        if joined and (opener is None or re.search(opener, text[:previous[2]])):
+        joined = previous and re.fullmatch(joiner, _without_comments(text[previous[1]:literal.start]))
+        before = text[max(0, previous[2] - 200):previous[2]] if previous else ""
+        if joined and (opener is None or re.search(opener, _without_comments(before))):
             messages[-1] = (previous[0] + literal.value, literal.end, previous[2])
         else:
             messages.append((literal.value, literal.end, literal.start))
@@ -195,11 +235,20 @@ def _spaces(text):
 
 
 def source_messages(root):
-    """Every whole message in the app sources, as the user would read it."""
+    """Every whole message in the app sources, as the user would read it.
+
+    A file the lexer can't read is skipped with a warning on stderr.
+    """
     messages = set()
     for folder, pattern, extract in SOURCES:
         for path in sorted((root / folder).rglob(pattern)):
-            messages.update(_spaces(m) for m in extract(path.read_text(encoding="utf-8")))
+            try:
+                found = extract(path.read_text(encoding="utf-8"))
+            except (IndexError, ValueError) as error:
+                print(f"WARNING: skipped {path.relative_to(root)}: could not read its string literals"
+                      f" ({type(error).__name__}: {error})", file=sys.stderr)
+                continue
+            messages.update(_spaces(m) for m in found)
     return messages
 
 
@@ -236,12 +285,12 @@ def ascii_form(message):
 
 def _problem(quote, messages):
     """Why a quote is not a whole app message, or None."""
-    if quote not in messages:
-        return "not an exact app message"
-    longer = sorted(m for m in messages if m.startswith(quote + " "))
-    if longer and quote[-1] in ".!?":
+    if quote in messages:
+        return None
+    longer = sorted(m for m in messages if m.startswith(quote))
+    if longer:
         return f"only the start of the app message \"{longer[0]}\""
-    return None
+    return "not an exact app message"
 
 
 def check(root=ROOT):

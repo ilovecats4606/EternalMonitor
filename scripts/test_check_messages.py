@@ -1,4 +1,6 @@
 """check_messages.py must reject a troubleshooting quote the apps don't show."""
+import contextlib
+import io
 import pathlib
 import shutil
 import sys
@@ -79,7 +81,8 @@ class CheckMessagesTest(unittest.TestCase):
     def test_shortened_quote_fails(self):
         problems = self.problems(ipad="**That code didn’t match**")
         self.assertEqual(len(problems), 1)
-        self.assertIn("SETUP.md:9: not an exact app message: That code didn’t match", problems[0])
+        self.assertIn("SETUP.md:9: only the start of the app message", problems[0])
+        self.assertTrue(problems[0].endswith(": That code didn’t match"))
 
     def test_setup_keeps_the_apps_curly_apostrophe(self):
         self.assertEqual(len(self.problems(ipad="**That code didn't match. Check the PC and try again.**")), 1)
@@ -93,13 +96,28 @@ class CheckMessagesTest(unittest.TestCase):
         problems = self.problems(quick="That code didn’t match. Check the PC and try again.")
         self.assertIn("scripts/QUICKSTART.txt: must be ASCII", problems)
 
-    def test_first_sentence_of_a_longer_message_fails(self):
-        # "No PCs found." is a message of its own, but the row means the
-        # longer one, so a quote cut down to its first sentence must fail.
-        problems = self.problems(ipad="**No PCs found.**")
-        self.assertEqual(len(problems), 1)
-        self.assertIn("only the start of the app message", problems[0])
+    def test_an_exact_whole_message_passes_even_when_a_longer_one_starts_with_it(self):
+        # "No PCs found." is a message of its own (the scan status), so quoting
+        # it is exact even though another message begins with it.
+        self.assertEqual(self.problems(ipad="**No PCs found.**"), [])
         self.assertEqual(self.problems(ipad="**No PCs found. Check that EternalMonitor is open on the PC.**"), [])
+        problems = self.problems(ipad="**No PCs found. Check that**")
+        self.assertEqual(len(problems), 1)
+        self.assertIn('only the start of the app message "No PCs found. Check that EternalMonitor', problems[0])
+
+    def test_comments_between_joined_literals_are_ignored(self):
+        (self.root / "host/src/gui/d.rs").write_text(
+            'const M: &str = concat!("Check the PC, ", /* note */ "then make sure.");')
+        self.assertEqual(self.problems(ipad="**Check the PC, then make sure.**"), [])
+        self.assertEqual(len(self.problems(ipad="**Check the PC,**")), 1)
+
+    def test_a_file_the_lexer_cannot_read_is_skipped_with_a_warning(self):
+        (self.root / "ios/EternalMonitor/App/broken.swift").write_text('let s = "never closed')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.problems(), [])
+        self.assertIn("WARNING: skipped ios/EternalMonitor/App/broken.swift: could not read its string literals",
+                      err.getvalue())
 
     def test_a_title_that_is_not_a_sentence_may_start_a_longer_message(self):
         # "The update did not finish" and "…did not finish, so …" are both whole.
@@ -156,6 +174,28 @@ class LiteralFormsTest(unittest.TestCase):
     def test_swift_interpolation_with_nested_strings(self):
         messages = swift('let s = "Found \\(n) PC\\(n == 1 ? "" : "s")"\nlet t = "Next"')
         self.assertEqual(messages, {"Found … PC…", "Next"})
+
+    def test_swift_comment_inside_an_interpolation(self):
+        self.assertEqual(swift('let s = "Reaching \\(1 /* ( */)"'), {"Reaching …"})
+
+    def test_comments_between_joined_literals(self):
+        self.assertEqual(swift('let j = "Check the PC, " /* note */ + "then try again."'),
+                         {"Check the PC, then try again."})
+        self.assertEqual(rust('let j = concat!("Check the PC, ", /* note */ "then try again.");'),
+                         {"Check the PC, then try again."})
+
+    def test_rust_raw_format_string(self):
+        self.assertEqual(rust('let s = format!(r#"Reaching {host}"#);'), {"Reaching …"})
+
+    def test_swift_multiline_escaped_and_raw_triple_quotes(self):
+        self.assertEqual(swift('let m = """\n    Say \\""" here\n    """\nlet n = "after"'), {'Say """ here', "after"})
+        self.assertEqual(swift('let m = #"""\n    Bare """ inside\n    """#\nlet n = "after"'), {'Bare """ inside', "after"})
+
+    def test_unterminated_forms_raise_instead_of_hanging(self):
+        with self.assertRaises(check_messages.LexError):
+            check_messages.swift_literals('let s = "ok" /* never closed')
+        with self.assertRaises(IndexError):
+            check_messages.rust_literals('let s = "never closed')
 
     def test_swift_raw_strings_and_concatenation(self):
         messages = swift('let r = #"Say "hi" \\#(name)"#\nlet j = "One, "\n    + "two."\n// "Not this"')
