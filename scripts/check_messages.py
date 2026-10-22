@@ -38,8 +38,10 @@ class LexError(ValueError):
 
 class Literal(NamedTuple):
     value: str
-    start: int
-    end: int
+    # The code since the previous literal, with each comment as one space.
+    # Joins and format calls are decided from this alone, so text inside a
+    # literal (a URL's //, a "/*") is never read as code.
+    code_before: str
 
 
 def _identifier_before(text, i):
@@ -93,38 +95,41 @@ def _rust_format(value):
     return value.replace("\x01", "{").replace("\x02", "}")
 
 
-def _format_if_called(text, start, value):
-    """The literal at start as printed, when it is a format macro's string."""
-    return _rust_format(value) if RUST_FORMAT_CALL.search(text[max(0, start - 120):start]) else value
+def _rust_literal(code, value):
+    """A Rust literal as printed, given the code before it."""
+    return Literal(_rust_format(value) if RUST_FORMAT_CALL.search(code) else value, code)
 
 
 def rust_literals(text):
-    literals, i = [], 0
+    literals, code, i = [], [], 0
     while i < len(text):
         after_comment = _skip_comment(text, i)
         raw = RUST_RAW.match(text, i)
         if after_comment is not None:
+            code.append(" ")
             i = after_comment
         elif raw and not _identifier_before(text, i):
             close = text.index('"' + raw[1], raw.end())
-            value = _format_if_called(text, i, text[raw.end():close])
-            literals.append(Literal(value, i, close + 1 + len(raw[1])))
-            i = close + 1 + len(raw[1])
+            literals.append(_rust_literal("".join(code), text[raw.end():close]))
+            code, i = [], close + 1 + len(raw[1])
         elif text[i] == '"' or (text.startswith('b"', i) and not _identifier_before(text, i)):
-            start, i, out = i, text.index('"', i) + 1, []
+            i, out = text.index('"', i) + 1, []
             while text[i] != '"':
                 if text[i] == "\\":
                     piece, i = _escape(text, i, skip_indent=True)
                 else:
                     piece, i = text[i], i + 1
                 out.append(piece)
-            literals.append(Literal(_format_if_called(text, start, "".join(out)), start, i + 1))
-            i += 1
+            literals.append(_rust_literal("".join(code), "".join(out)))
+            code, i = [], i + 1
         elif text[i] == "'" and RUST_CHAR.match(text, i):
-            i = RUST_CHAR.match(text, i).end()
+            end = RUST_CHAR.match(text, i).end()
+            code.append(text[i:end])
+            i = end
         else:
+            code.append(text[i])
             i += 1
-    return _join(text, literals, r"\s*,\s*", opener=r"concat!\(\s*$")
+    return _join(literals, r"\s*,\s*", opener=r"concat!\(\s*$")
 
 
 def _skip_parens(text, i):
@@ -185,46 +190,37 @@ def swift_string(text, i):
 
 
 def swift_literals(text):
-    literals, i = [], 0
+    literals, code, i = [], [], 0
     while i < len(text):
         after_comment = _skip_comment(text, i)
         if after_comment is not None:
+            code.append(" ")
             i = after_comment
         elif SWIFT_OPEN.match(text, i) and (text[i] == '"' or not _identifier_before(text, i)):
-            value, end = swift_string(text, i)
-            literals.append(Literal(value, i, end))
-            i = end
+            value, i = swift_string(text, i)
+            literals.append(Literal(value, "".join(code)))
+            code = []
         else:
+            code.append(text[i])
             i += 1
-    return _join(text, literals, r"\s*\+\s*")
+    return _join(literals, r"\s*\+\s*")
 
 
-def _without_comments(code):
-    """Code holding no string literals, with each comment as one space."""
-    out, i = [], 0
-    while i < len(code):
-        after_comment = _skip_comment(code, i)
-        if after_comment is None:
-            out.append(code[i])
-            i += 1
-        else:
-            out.append(" ")
-            i = after_comment
-    return "".join(out)
+def _join(literals, joiner, opener=None):
+    """Messages, with literals the source joins into one message merged.
 
-
-def _join(text, literals, joiner, opener=None):
-    """Messages, with literals the source joins into one message merged."""
-    messages = []
+    A literal joins the message before it when only the joiner (Swift `+`,
+    or a comma inside Rust `concat!(`) stands between them. For concat!, the
+    message's first literal must follow the opener directly.
+    """
+    messages = []  # [value, code before its first literal]
     for literal in literals:
-        previous = messages[-1] if messages else None
-        joined = previous and re.fullmatch(joiner, _without_comments(text[previous[1]:literal.start]))
-        before = text[max(0, previous[2] - 200):previous[2]] if previous else ""
-        if joined and (opener is None or re.search(opener, _without_comments(before))):
-            messages[-1] = (previous[0] + literal.value, literal.end, previous[2])
+        if (messages and re.fullmatch(joiner, literal.code_before)
+                and (opener is None or re.search(opener, messages[-1][1]))):
+            messages[-1][0] += literal.value
         else:
-            messages.append((literal.value, literal.end, literal.start))
-    return [value for value, _, _ in messages]
+            messages.append([literal.value, literal.code_before])
+    return [value for value, _ in messages]
 
 
 SOURCES = [("host/src", "*.rs", rust_literals), ("ios/EternalMonitor", "*.swift", swift_literals)]

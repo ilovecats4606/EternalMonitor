@@ -111,6 +111,19 @@ class CheckMessagesTest(unittest.TestCase):
         self.assertEqual(self.problems(ipad="**Check the PC, then make sure.**"), [])
         self.assertEqual(len(self.problems(ipad="**Check the PC,**")), 1)
 
+    def test_a_url_before_a_join_does_not_hide_it(self):
+        # Sol's input, plus an earlier "/*" literal: neither is code.
+        (self.root / "host/src/gui/e.rs").write_text(
+            'const A: &str = "/*";\nconst URL: &str = "https://example.com"; '
+            'const MSG: &str = concat!("Check the cable.", " Then try again.");')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            problems = self.problems(ipad="**Check the cable.**")
+            self.assertEqual(self.problems(ipad="**Check the cable. Then try again.**"), [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn('only the start of the app message "Check the cable. Then try again."', problems[0])
+        self.assertEqual(err.getvalue(), "")
+
     def test_a_file_the_lexer_cannot_read_is_skipped_with_a_warning(self):
         (self.root / "ios/EternalMonitor/App/broken.swift").write_text('let s = "never closed')
         err = io.StringIO()
@@ -184,6 +197,18 @@ class LiteralFormsTest(unittest.TestCase):
         self.assertEqual(rust('let j = concat!("Check the PC, ", /* note */ "then try again.");'),
                          {"Check the PC, then try again."})
 
+    def test_literals_are_never_read_as_code(self):
+        source = 'const URL: &str = "https://example.com"; const MSG: &str = concat!("No PCs found.", " Check the PC.");'
+        messages = rust(source)
+        self.assertEqual(messages, {"https://example.com", "No PCs found. Check the PC."})
+        self.assertNotIn("No PCs found.", messages)
+        self.assertEqual(rust('const A: &str = "/*"; ' + source), messages | {"/*"})
+        self.assertEqual(swift('let u = "https://x.y"\nlet j = "One, " + "two."'), {"https://x.y", "One, two."})
+
+    def test_a_comment_between_a_format_call_and_its_string(self):
+        self.assertEqual(rust('format!(\n    // keeps "Windows 10"\n    "build={}.{}",\n    a, b)'),
+                         {"build=….…"})
+
     def test_rust_raw_format_string(self):
         self.assertEqual(rust('let s = format!(r#"Reaching {host}"#);'), {"Reaching …"})
 
@@ -200,6 +225,54 @@ class LiteralFormsTest(unittest.TestCase):
     def test_swift_raw_strings_and_concatenation(self):
         messages = swift('let r = #"Say "hi" \\#(name)"#\nlet j = "One, "\n    + "two."\n// "Not this"')
         self.assertEqual(messages, {'Say "hi" …', "One, two."})
+
+
+class RepositoryMutationTest(unittest.TestCase):
+    """A temp copy of the real docs and sources: a shortened quote must fail."""
+
+    # Sol's pattern on one line: a URL literal, then a concat! whose first
+    # piece is the shortened quote the tests below use.
+    PROBE = ('const URL: &str = "https://eternalmonitor.dev/known-issues.html"; '
+             'const M: &str = concat!("That code didn’t match.", " Check the PC and try again.");\n')
+
+    def setUp(self):
+        self.root = pathlib.Path(tempfile.mkdtemp())
+        root = check_messages.ROOT
+
+        def sources_only(folder, names):
+            return [n for n in names if not (pathlib.Path(folder, n).is_dir() or n.endswith((".rs", ".swift")))]
+
+        for folder in ("host/src", "ios/EternalMonitor"):
+            shutil.copytree(root / folder, self.root / folder, ignore=sources_only)
+        (self.root / "scripts").mkdir()
+        shutil.copy(root / "SETUP.md", self.root / "SETUP.md")
+        shutil.copy(root / "scripts/QUICKSTART.txt", self.root / "scripts/QUICKSTART.txt")
+        (self.root / "host/src/zz_probe.rs").write_text(self.PROBE, encoding="utf-8")
+
+    def tearDown(self):
+        shutil.rmtree(self.root)
+
+    def shorten(self, name, full, short):
+        path = self.root / name
+        text = path.read_text(encoding="utf-8")
+        self.assertEqual(text.count(full), 1, f"{name} no longer quotes {full!r}")
+        path.write_text(text.replace(full, short), encoding="utf-8")
+
+    def test_the_copy_passes_unchanged(self):
+        self.assertEqual(check_messages.check(self.root), [])
+
+    def test_a_shortened_setup_quote_fails(self):
+        self.shorten("SETUP.md", "**That code didn’t match. Check the PC and try again.**", "**That code didn’t match.**")
+        problems = check_messages.check(self.root)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertTrue(problems[0].startswith("SETUP.md:"))
+
+    def test_a_shortened_quickstart_quote_fails(self):
+        self.shorten("scripts/QUICKSTART.txt", '"That code didn\'t match. Check the PC and try again.":',
+                     '"That code didn\'t match.":')
+        problems = check_messages.check(self.root)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertTrue(problems[0].startswith("scripts/QUICKSTART.txt:"))
 
 
 if __name__ == "__main__":
