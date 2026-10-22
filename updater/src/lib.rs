@@ -23,7 +23,7 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod sha256;
 #[cfg(windows)]
@@ -42,8 +42,8 @@ pub const SETUP_FLAGS: &[&str] = &[
     "/CLOSEAPPLICATIONS",
     "/NORESTARTAPPLICATIONS",
 ];
-/// How long the helper waits for the host to close before running Setup,
-/// which closes anything still holding its files.
+/// How long the helper waits for the host, and any other process running the
+/// installed app, to close before running Setup.
 const HOST_EXIT_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -170,6 +170,7 @@ fn run_with(args: HelperArgs, out: &mut dyn Write, host_exit_wait: Duration) -> 
         return 4;
     }
     let installed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let deadline = Instant::now() + host_exit_wait;
         match host.wait(Some(host_exit_wait)) {
             HostExit::Closed => log.note("EternalMonitor closed"),
             HostExit::StillRunning => {
@@ -177,6 +178,22 @@ fn run_with(args: HelperArgs, out: &mut dyn Write, host_exit_wait: Duration) -> 
                 // the running app alone; the start after it closes reports
                 // the update did not finish.
                 return Err("EternalMonitor did not close; not installing".to_string());
+            }
+        }
+        // The host's failure reporter is a copy of the app without a window
+        // and can outlive the host while it turns the virtual display off.
+        // Setup's /CLOSEAPPLICATIONS does not close such a process and would
+        // then fail on the locked executable. Wait for every copy, within
+        // the same budget; one still running means not installing.
+        match others_closed(&args.app, deadline) {
+            Ok(()) => {}
+            Err(OthersRunning::Unknown(error)) => log.note(&format!(
+                "cannot list other EternalMonitor processes: {error}"
+            )),
+            Err(OthersRunning::Running) => {
+                return Err(
+                    "another EternalMonitor process did not close; not installing".to_string(),
+                )
             }
         }
         run_setup(&args, &installer.file)
@@ -294,6 +311,68 @@ impl Host {
         }
         HostExit::StillRunning
     }
+}
+
+/// Why [`others_closed`] could not report that every copy closed.
+#[derive(Debug)]
+enum OthersRunning {
+    /// A process running the app was still there at the deadline.
+    Running,
+    /// The processes could not be listed; Setup runs as it did before.
+    Unknown(String),
+}
+
+/// Waits until `deadline` for every process running the installed `app` to
+/// exit. This helper is never one of them: it runs from the update folder.
+fn others_closed(app: &Path, deadline: Instant) -> Result<(), OthersRunning> {
+    #[cfg(windows)]
+    {
+        let running =
+            win::processes_running(app).map_err(|e| OthersRunning::Unknown(e.to_string()))?;
+        for process in &running {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if win::wait(process, Some(left)).is_none() {
+                return Err(OthersRunning::Running);
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        loop {
+            let running = unix_processes_running(app).map_err(OthersRunning::Unknown)?;
+            if running.is_empty() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(OthersRunning::Running);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// Processes whose command line runs `app`, for the Unix test builds: as the
+/// program, or as the script an interpreter runs.
+#[cfg(not(windows))]
+fn unix_processes_running(app: &Path) -> Result<Vec<u32>, String> {
+    let listing = Command::new("ps")
+        .args(["-axo", "pid=,stat=,args="])
+        .output()
+        .map_err(|e| e.to_string())?;
+    let app = app.display().to_string();
+    let me = std::process::id();
+    Ok(String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid: u32 = fields.next()?.parse().ok()?;
+            let stat = fields.next()?;
+            let args: Vec<&str> = fields.take(2).collect();
+            let runs = args.first() == Some(&app.as_str()) || args.get(1) == Some(&app.as_str());
+            (runs && pid != me && !stat.starts_with('Z')).then_some(pid)
+        })
+        .collect())
 }
 
 /// Setup's command line: the program, the silent flags and its log.
@@ -518,6 +597,120 @@ mod tests {
             "hosts {pids:?}, running {running:?}: {log}"
         );
         assert!(!dir.join("setup-ran").exists(), "Setup never runs late");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A copy of the app that outlives the host (the host's failure reporter)
+    /// and a Setup that records whether that copy was still running.
+    #[cfg(unix)]
+    fn lingering_case(name: &str) -> (PathBuf, HelperArgs) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp(name);
+        let d = dir.display();
+        let app = dir.join("app.sh");
+        std::fs::write(
+            &app,
+            format!(
+                "#!/bin/sh
+if [ \"$1\" = linger ]; then
+  touch '{d}/lingering'
+  sleep \"$2\"
+  rm '{d}/lingering'
+  exit 0
+fi
+touch '{d}/relaunched'
+"
+            ),
+        )
+        .unwrap();
+        let installer = dir.join("setup.sh");
+        std::fs::write(
+            &installer,
+            format!(
+                "#!/bin/sh
+[ -e '{d}/lingering' ] && touch '{d}/setup-saw-copy'
+touch '{d}/setup-ran'
+"
+            ),
+        )
+        .unwrap();
+        for script in [&app, &installer] {
+            std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let sha256 = sha256_hex(&mut File::open(&installer).unwrap()).unwrap();
+        let args = HelperArgs {
+            installer,
+            sha256,
+            app,
+            host_pid: 0,
+            log: dir.join("update.log"),
+        };
+        (dir, args)
+    }
+
+    /// A stand-in host that closes a second after it starts.
+    #[cfg(unix)]
+    fn closing_host() -> u32 {
+        let host = Command::new("sleep").arg("1").spawn().unwrap();
+        let pid = host.id();
+        std::thread::spawn(move || {
+            let mut host = host;
+            let _ = host.wait();
+        });
+        pid
+    }
+
+    #[cfg(unix)]
+    fn linger(app: &Path, seconds: &str, dir: &Path) -> std::process::Child {
+        let child = Command::new(app).args(["linger", seconds]).spawn().unwrap();
+        let start = std::time::Instant::now();
+        while !dir.join("lingering").exists() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        child
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_waits_for_a_copy_of_the_app_that_outlives_the_host() {
+        let (dir, mut args) = lingering_case("lingering-copy");
+        let mut copy = linger(&args.app, "2.5", &dir);
+        args.host_pid = closing_host();
+        let mut out = Vec::new();
+        run_with(args.clone(), &mut out, Duration::from_secs(10));
+        let _ = copy.wait();
+        let log = std::fs::read_to_string(&args.log).unwrap();
+        assert!(dir.join("setup-ran").exists(), "{log}");
+        assert!(
+            !dir.join("setup-saw-copy").exists(),
+            "Setup ran while a copy of the app still held it: {log}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_of_the_app_that_does_not_close_skips_setup_and_relaunches() {
+        let (dir, mut args) = lingering_case("stuck-copy");
+        let mut copy = linger(&args.app, "30", &dir);
+        args.host_pid = closing_host();
+        let mut out = Vec::new();
+        let code = run_with(args.clone(), &mut out, Duration::from_millis(2000));
+        copy.kill().unwrap();
+        let _ = copy.wait();
+        let log = std::fs::read_to_string(&args.log).unwrap();
+        assert_eq!(code, 0, "{log}");
+        assert!(!dir.join("setup-ran").exists(), "{log}");
+        assert!(
+            log.contains("another EternalMonitor process did not close"),
+            "{log}"
+        );
+        // The user still gets the app back.
+        let start = std::time::Instant::now();
+        while !dir.join("relaunched").exists() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(dir.join("relaunched").exists(), "{log}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

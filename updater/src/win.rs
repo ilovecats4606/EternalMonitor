@@ -307,6 +307,44 @@ pub fn image_id(process: &OwnedHandle) -> io::Result<FileId> {
     file_id(&image)
 }
 
+/// Every running process whose image is the file `app` names, opened so the
+/// caller can wait for it. The file's identity decides, so another spelling
+/// of the path (a short name, a junction) still matches and another copy of
+/// the same program does not.
+pub fn processes_running(app: &Path) -> io::Result<Vec<OwnedHandle>> {
+    use windows::Win32::System::ProcessStatus::K32EnumProcesses;
+    let target = {
+        use std::os::windows::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ.0)
+            .open(app)?;
+        file_id(&file)?
+    };
+    let mut pids = vec![0u32; 4096];
+    let count = loop {
+        let mut bytes = 0u32;
+        let size = (pids.len() * std::mem::size_of::<u32>()) as u32;
+        if !unsafe { K32EnumProcesses(pids.as_mut_ptr(), size, &mut bytes) }.as_bool() {
+            return Err(io::Error::last_os_error());
+        }
+        if bytes < size {
+            break bytes as usize / std::mem::size_of::<u32>();
+        }
+        // A full buffer may have left processes out.
+        pids = vec![0u32; pids.len() * 2];
+    };
+    let me = std::process::id();
+    Ok(pids[..count]
+        .iter()
+        .filter(|&&pid| pid != 0 && pid != me)
+        // Processes of other users and protected ones cannot be opened;
+        // they cannot be this user's EternalMonitor.
+        .filter_map(|&pid| open_process(pid).ok())
+        .filter(|process| image_id(process).is_ok_and(|id| id == target))
+        .collect())
+}
+
 /// Starts `exe` from its own folder, inheriting no handles. Unlike
 /// `std::process::Command`, which passes on every inheritable handle.
 pub fn start(exe: &Path) -> io::Result<()> {
