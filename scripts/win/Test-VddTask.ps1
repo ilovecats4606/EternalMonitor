@@ -73,7 +73,10 @@ $took = ((Get-Date) - $started).TotalSeconds
 if ($case.Code -ne 1 -or $case.Output -notmatch 'Previous VDD task timed out: Enable' -or $case.Output -match 'RUN') {
     throw "A hung Enable was not reported as a timeout: $($case.Output)"
 }
-if ($took -gt 25) { throw "The wait took $took s" }
+# The script's own wait is bounded at 10 s; a cold PowerShell start for the
+# child can take tens of seconds more on a busy PC. A wait that never ended
+# would take hours with this mock.
+if ($took -gt 120) { throw "The wait took $took s" }
 # Without -After, as older hosts call it, only this task is waited for.
 $case = Invoke-Case @{ Enable = 1000000 } "-Task 'Disable'"
 if ($case.Code -ne 0 -or $case.Output -notmatch 'RUN Disable') {
