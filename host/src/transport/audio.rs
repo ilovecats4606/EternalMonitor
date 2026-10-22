@@ -263,4 +263,35 @@ mod tests {
         assert_eq!(stats.audio.late_seqs.to_string(), "3");
         assert_eq!(stats.audio.wire, crate::audio::WireStream::Known(id, 7));
     }
+
+    #[test]
+    fn a_field_size_opus_packet_is_sent_or_charged_to_its_own_capture() {
+        let _stats = AUDIO_STATS.lock();
+        let (shared, id) = session(FEATURE_WANTS_AUDIO);
+        let mut sender = AudioSender::default();
+        PIPELINE_STATS.lock().audio = crate::audio::AudioStats::started("A");
+        // 576 bytes: the size field logs showed; the encoder now allows it.
+        let field = || {
+            let mut queued = packet(id, 100);
+            queued.packet.opus = vec![0x55; 576];
+            queued
+        };
+        let (_, bytes) = sender.prepare(field(), &shared, 7, 100).unwrap();
+        assert_eq!(AudioHeader::decode(&bytes).unwrap().1.len(), 576);
+        // A link with a smaller datagram size (a VPN packet size, say) drops
+        // it, and charges the drop to the capture that numbered it.
+        shared.max_dgram.store(576, Ordering::SeqCst);
+        assert!(sender.prepare(field(), &shared, 7, 100).is_none());
+        {
+            let stats = PIPELINE_STATS.lock();
+            assert_eq!((stats.audio.dropped, stats.audio.oversized_dropped), (1, 1));
+            assert_eq!(stats.audio.failed_seqs.to_string(), "3");
+        }
+        // Once capture B replaced A, A's oversized packet is nobody's drop.
+        let retired = field();
+        PIPELINE_STATS.lock().audio = crate::audio::AudioStats::started("B");
+        assert!(sender.prepare(retired, &shared, 7, 100).is_none());
+        let stats = PIPELINE_STATS.lock();
+        assert_eq!((stats.audio.dropped, stats.audio.oversized_dropped), (0, 0));
+    }
 }
