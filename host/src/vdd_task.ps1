@@ -8,8 +8,19 @@ try {
     # requests, but an Enable it stopped waiting for keeps running in Task
     # Scheduler; a Disable that finished first would be undone by it.
     # Waiting for them must not eat into this run's own time.
+    # An install without the other task still runs this one, as before.
+    $waitFor = @($Task)
+    if ($After) {
+        try {
+            [void]$service.GetFolder('\').GetTask($After)
+            $waitFor = @($After, $Task)
+        } catch {
+            # 0x80070002: the task does not exist.
+            if ($_.Exception.GetBaseException().HResult -ne -2147024894) { throw }
+        }
+    }
     $deadline = (Get-Date).AddSeconds(10)
-    foreach ($name in @($After, $Task) | Where-Object { $_ }) {
+    foreach ($name in $waitFor) {
         while ($service.GetFolder('\').GetTask($name).State -in @(2,4)) {
             if ((Get-Date) -gt $deadline) { throw "Previous VDD task timed out: $name" }
             Start-Sleep -Milliseconds 50

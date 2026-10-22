@@ -5,6 +5,7 @@ $ErrorActionPreference = 'Stop'
 $script = Get-Content -Raw (Join-Path $PSScriptRoot '..\..\host\src\vdd_task.ps1')
 $mock = @'
 # $EMBusy[name]: how many more state reads report that task as running.
+# $EMMissing: tasks that do not exist, as Task Scheduler reports them.
 function New-Object {
     param([string]$ComObject, [Parameter(ValueFromRemainingArguments=$true)]$Rest)
     if ($ComObject -ne 'Schedule.Service') { throw "Unexpected COM object $ComObject" }
@@ -15,6 +16,10 @@ function New-Object {
         $folder = [pscustomobject]@{}
         $folder | Add-Member ScriptMethod GetTask {
             param($name)
+            if ($global:EMMissing -contains $name) {
+                throw [System.Runtime.InteropServices.COMException]::new(
+                    'The system cannot find the file specified. (Exception from HRESULT: 0x80070002)', -2147024894)
+            }
             $task = [pscustomobject]@{ Name = $name; Enabled = $true; LastTaskResult = 0
                 Definition = [pscustomobject]@{ Settings = [pscustomobject]@{ AllowDemandStart = $true } } }
             $task | Add-Member ScriptProperty State {
@@ -36,10 +41,11 @@ function New-Object {
 }
 '@
 
-function Invoke-Case([hashtable]$busy, [string]$arguments) {
+function Invoke-Case([hashtable]$busy, [string]$arguments, [string[]]$missing = @()) {
     $file = Join-Path $env:TEMP ('em-vdd-task-test-' + [guid]::NewGuid().ToString('N') + '.ps1')
     $busyText = ($busy.GetEnumerator() | ForEach-Object { "'$($_.Key)' = $($_.Value)" }) -join '; '
-    $body = "`$global:EMBusy = @{ $busyText }`n$mock`n& {`n$script`n} $arguments`n"
+    $missingText = ($missing | ForEach-Object { "'$_'" }) -join ', '
+    $body = "`$global:EMBusy = @{ $busyText }`n`$global:EMMissing = @($missingText)`n$mock`n& {`n$script`n} $arguments`n"
     Set-Content -Path $file -Value $body -Encoding UTF8
     # The child's stderr is expected output here, not a failure of this script.
     $ErrorActionPreference = 'Continue'
@@ -73,4 +79,14 @@ $case = Invoke-Case @{ Enable = 1000000 } "-Task 'Disable'"
 if ($case.Code -ne 0 -or $case.Output -notmatch 'RUN Disable') {
     throw "A call without -After waited for another task: $($case.Output)"
 }
-Write-Output 'VDD task checks passed: waits for the other direction, earlier runs, hung Enable bound, no -After'
+# An install without the other task still runs the requested one.
+$case = Invoke-Case @{} "-Task 'Disable' -After 'Enable'" @('Enable')
+if ($case.Code -ne 0 -or $case.Output -notmatch 'RUN Disable') {
+    throw "A missing -After task stopped the requested one: $($case.Output)"
+}
+# A missing requested task still fails, as Missing for the host.
+$case = Invoke-Case @{} "-Task 'Disable' -After 'Enable'" @('Disable')
+if ($case.Code -ne 1 -or $case.Output -notmatch '0x80070002' -or $case.Output -match 'RUN') {
+    throw "A missing requested task was not reported: $($case.Output)"
+}
+Write-Output 'VDD task checks passed: waits for the other direction, earlier runs, hung Enable bound, no -After, missing tasks'
