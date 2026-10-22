@@ -21,6 +21,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -331,7 +332,15 @@ fn run_setup(args: &HelperArgs, _installer: &File) -> Result<i32, String> {
     Ok(status.code().unwrap_or(-1))
 }
 
-fn relaunch(app: &Path) -> io::Result<()> {
+/// Starts the installed app again, passing on none of this helper's handles.
+#[cfg(windows)]
+pub fn relaunch(app: &Path) -> io::Result<()> {
+    win::start(app)
+}
+
+/// Starts the installed app again.
+#[cfg(not(windows))]
+pub fn relaunch(app: &Path) -> io::Result<()> {
     let mut command = Command::new(app);
     if let Some(dir) = app.parent() {
         command.current_dir(dir);

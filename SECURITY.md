@@ -34,7 +34,8 @@ Knowing these limits helps you judge whether a finding is new.
   SHA-256 in both eternalmonitor.dev/latest.json and the GitHub release. Against
   other software already running as your Windows user, the updater adds defense
   in depth rather than a guarantee. Its helper loads DLLs only from System32 and
-  imports only Windows system libraries. It refuses an update folder reached
+  imports only Windows system libraries. It inherits only its output pipe from
+  the host, and Setup and the restarted app inherit no handles from it. It refuses an update folder reached
   through a link and keeps the installer open so it can't be changed. Setup
   starts suspended and runs only if it is the verified file. If the old host
   takes more than 60 seconds to close, Setup does not run, but the helper keeps

@@ -25,9 +25,11 @@ use windows::Win32::System::LibraryLoader::{
     SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32,
 };
 use windows::Win32::System::Threading::{
-    CreateProcessW, QueryFullProcessImageNameW, ResumeThread, TerminateProcess, CREATE_SUSPENDED,
-    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, PROCESS_NAME_WIN32, STARTF_USESTDHANDLES,
-    STARTUPINFOW,
+    CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
+    QueryFullProcessImageNameW, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
+    CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, PROCESS_NAME_WIN32,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
 /// Called first thing in `main`: DLLs this process loads later come only from
@@ -160,9 +162,66 @@ impl Suspended {
     }
 }
 
+/// The handles a child may inherit, and nothing else
+/// (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`). Each must be inheritable.
+struct HandleList {
+    /// Backing store for the attribute list, aligned for it.
+    buffer: Vec<usize>,
+    /// Windows reads the list from here when the child starts.
+    _handles: Box<[HANDLE]>,
+}
+
+impl HandleList {
+    fn new(handles: &[HANDLE]) -> io::Result<Self> {
+        let mut size = 0;
+        // Fails with "insufficient buffer" and reports the size it needs.
+        let _ = unsafe {
+            InitializeProcThreadAttributeList(
+                LPPROC_THREAD_ATTRIBUTE_LIST::default(),
+                1,
+                0,
+                &mut size,
+            )
+        };
+        let mut buffer = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
+        let list = LPPROC_THREAD_ATTRIBUTE_LIST(buffer.as_mut_ptr().cast());
+        unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) }
+            .map_err(io::Error::other)?;
+        let this = Self {
+            buffer,
+            _handles: handles.into(),
+        };
+        unsafe {
+            UpdateProcThreadAttribute(
+                this.list(),
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                Some(this._handles.as_ptr().cast()),
+                std::mem::size_of_val(&*this._handles),
+                None,
+                None,
+            )
+        }
+        .map_err(io::Error::other)?;
+        Ok(this)
+    }
+
+    fn list(&self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+        LPPROC_THREAD_ATTRIBUTE_LIST(self.buffer.as_ptr() as *mut _)
+    }
+}
+
+impl Drop for HandleList {
+    fn drop(&mut self) {
+        unsafe { DeleteProcThreadAttributeList(self.list()) }
+    }
+}
+
 /// Starts `exe` suspended, with `command_line` (program name first). With
-/// `stdout`, the child writes to that (inheritable) handle; only standard
-/// handles are inherited, since Rust opens everything else non-inheritable.
+/// `stdout`, the child writes to that (inheritable) handle and inherits that
+/// handle alone; without it, it inherits nothing. The host holds inheritable
+/// handles it never meant to pass on (sockets, graphics driver objects), so
+/// inheritance is never left open-ended.
 pub fn start_suspended(
     exe: &Path,
     command_line: &str,
@@ -175,14 +234,25 @@ pub fn start_suspended(
         .chain(Some(0))
         .collect();
     let directory = exe.parent().map(|dir| wide(dir.as_os_str()));
-    let mut startup = STARTUPINFOW {
-        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+    let mut startup = STARTUPINFOEXW {
+        StartupInfo: STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOEXW>() as u32,
+            ..Default::default()
+        },
         ..Default::default()
     };
-    if let Some(stdout) = stdout {
-        startup.dwFlags = STARTF_USESTDHANDLES;
-        startup.hStdOutput = stdout;
-    }
+    let mut creation = CREATE_SUSPENDED | PROCESS_CREATION_FLAGS(flags);
+    let inherited = match stdout {
+        Some(stdout) => {
+            startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            startup.StartupInfo.hStdOutput = stdout;
+            let list = HandleList::new(&[stdout])?;
+            startup.lpAttributeList = list.list();
+            creation |= EXTENDED_STARTUPINFO_PRESENT;
+            Some(list)
+        }
+        None => None,
+    };
     let mut information = PROCESS_INFORMATION::default();
     unsafe {
         CreateProcessW(
@@ -190,13 +260,13 @@ pub fn start_suspended(
             PWSTR(command.as_mut_ptr()),
             None,
             None,
-            stdout.is_some(),
-            CREATE_SUSPENDED | PROCESS_CREATION_FLAGS(flags),
+            inherited.is_some(),
+            creation,
             None,
             directory
                 .as_ref()
                 .map_or(PCWSTR::null(), |dir| PCWSTR(dir.as_ptr())),
-            &startup,
+            &startup.StartupInfo,
             &mut information,
         )
     }
@@ -235,6 +305,15 @@ pub fn image_id(process: &OwnedHandle) -> io::Result<FileId> {
                 .open(&path)
         })?;
     file_id(&image)
+}
+
+/// Starts `exe` from its own folder, inheriting no handles. Unlike
+/// `std::process::Command`, which passes on every inheritable handle.
+pub fn start(exe: &Path) -> io::Result<()> {
+    let command_line = format!("\"{}\"", exe.display());
+    start_suspended(exe, &command_line, 0, None)?
+        .resume()
+        .map(drop)
 }
 
 /// Starts `exe` suspended and lets it run only if Windows mapped the very file
