@@ -1110,6 +1110,8 @@ mod tests {
         Destroyed,
         /// A fallback mouse event, and whether SendInput inserted it.
         Mouse(Injection, bool),
+        /// The test reset the session here.
+        Reset,
     }
 
     struct Rng(u64);
@@ -1140,6 +1142,7 @@ mod tests {
         resets: usize,
         dropped: std::collections::BTreeMap<&'static str, usize>,
         samples_checked: usize,
+        ups_checked: usize,
     }
 
     /// Windows for the random streams, until `ready`: not ready for a
@@ -1416,6 +1419,7 @@ mod tests {
                 }
                 if rng.below(25) == 0 {
                     // The session resets; the stroke in progress carries on.
+                    device.slot.api.seen.push(Seen::Reset);
                     reset_one(&mut device, now);
                     note_drops(&mut device, true, &times, &mut exempt, &mut coverage);
                     coverage.resets += 1;
@@ -1433,6 +1437,11 @@ mod tests {
             // Replay what Windows took, in order.
             let output = std::mem::take(&mut device.slot.api.seen);
             let (mut native, mut mouse) = (None, None);
+            // Strokes drawn on either path, and those Windows or a reset
+            // ended early (a rejected frame, a destroyed device, a session
+            // reset) with no press since: their up has nothing left to end.
+            let mut drawn = std::collections::BTreeSet::new();
+            let mut cut = std::collections::BTreeSet::new();
             let mut last_sample = 0;
             let mut taken = std::collections::BTreeMap::<(i32, &'static str), usize>::new();
             let mut take = |id: i32, kind: &'static str| {
@@ -1453,7 +1462,11 @@ mod tests {
                             );
                         }
                         match phase {
-                            PenPhase::Down => native = Some(y),
+                            PenPhase::Down => {
+                                native = Some(y);
+                                drawn.insert(y);
+                                cut.remove(&y);
+                            }
                             PenPhase::Up | PenPhase::Cancel => {
                                 assert_eq!(
                                     native,
@@ -1474,7 +1487,14 @@ mod tests {
                             PenPhase::Cancel | PenPhase::Leave => {}
                         }
                     }
-                    Seen::Refused(_) | Seen::Destroyed => native = None,
+                    Seen::Refused(_) | Seen::Destroyed => {
+                        if let Some(stroke) = native.take() {
+                            cut.insert(stroke);
+                        }
+                    }
+                    // A reset ends whatever is held; the frames or release
+                    // that follow end it.
+                    Seen::Reset => cut.extend(native.iter().chain(mouse.iter()).copied()),
                     Seen::Mouse(_, false) => {}
                     Seen::Mouse(Injection::MoveAbs { x, .. }, true) => {
                         take(pixel_x[&x], "mouse move")
@@ -1489,6 +1509,8 @@ mod tests {
                             "stream {stream}: native and mouse together: {output:?}"
                         );
                         mouse = Some(pixel_y[&y]);
+                        drawn.insert(pixel_y[&y]);
+                        cut.remove(&pixel_y[&y]);
                         take(pixel_x[&x], "mouse press");
                     }
                     Seen::Mouse(Injection::LeftUp { .. }, true) => {
@@ -1506,8 +1528,16 @@ mod tests {
             // Exactly once, on one path, for every sample not dropped by
             // design. An up, cancel or leave has nothing to deliver when
             // what it ends is already gone; the replay above checks that
-            // nothing is ended twice and nothing stays held.
+            // nothing is ended twice and nothing stays held. An up whose
+            // stroke is still live must land at its own position, where the
+            // Pencil lifted: natively an up frame there, on the mouse a move
+            // there before the release.
             let once = |id, kind| taken.get(&(id, kind)).copied().unwrap_or(0);
+            let cut_by_design: std::collections::BTreeSet<i32> = samples
+                .iter()
+                .filter(|sample| exempt.contains(&sample.x))
+                .map(|sample| sample.y)
+                .collect();
             for sample in &samples {
                 let id = sample.x;
                 let native_frames =
@@ -1523,6 +1553,18 @@ mod tests {
                     native_frames == 0 || mouse_input == 0,
                     "stream {stream}: sample {id} on both paths: {output:?}"
                 );
+                let stroke = sample.y;
+                if sample.phase == PenPhase::Up
+                    && drawn.contains(&stroke)
+                    && !cut.contains(&stroke)
+                    && !cut_by_design.contains(&stroke)
+                {
+                    coverage.ups_checked += 1;
+                    assert!(
+                        once(id, "up") + once(id, "mouse move") == 1,
+                        "stream {stream}: up {id} of stroke {stroke} missed its position: {output:?}"
+                    );
+                }
                 if exempt.contains(&id)
                     || !matches!(
                         sample.phase,
@@ -1577,6 +1619,7 @@ mod tests {
                 "{coverage:#?}"
             );
         }
+        assert!(coverage.ups_checked > 10_000, "{coverage:#?}");
         assert!(coverage.streams_overflowed > 300, "{coverage:#?}");
         assert!(coverage.streams_losing_device > 300, "{coverage:#?}");
         assert!(coverage.mouse_refused > 300, "{coverage:#?}");
