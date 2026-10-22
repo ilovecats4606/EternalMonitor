@@ -7,7 +7,7 @@ Apple Pencil and a keyboard on the iPad control the PC.
 Full guide with every screen explained:
 https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md
 Known issues and what to do about them:
-https://github.com/sidebandstudio/EternalMonitor/blob/main/docs/known-issues.md
+https://eternalmonitor.dev/known-issues.html
 
 What you need
 -------------
@@ -18,7 +18,9 @@ What you need
 - For Wi-Fi: the PC and iPad on the same home or office network. Guest
   networks usually block devices from seeing each other.
 - For USB: a cable that carries data, and Apple's free Apple Devices app
-  from the Microsoft Store, open on the PC while you stream.
+  from the Microsoft Store, open on the PC while you stream. Apple Devices
+  needs Windows 10 version 22H2 (build 19045) or Windows 11. On older
+  Windows 10, use Wi-Fi.
 
 Both apps must come from the same version of EternalMonitor. The download
 page always lists the matching pair:
@@ -48,7 +50,9 @@ Private networks and click Allow access.
 
 3. Connect with a USB cable (optional)
 --------------------------------------
-A cable gives a steadier picture and charges the iPad.
+A cable gives a steadier picture and charges the iPad. It needs Windows 10
+version 22H2 (build 19045) or Windows 11, because Apple Devices does. To see
+your version, open Windows Settings, System, About.
 1. Install Apple Devices from the Microsoft Store, open it and leave it
    open. It can stay minimized.
 2. Plug in the iPad and unlock it. The first time, tap Trust on the iPad.
@@ -90,6 +94,9 @@ TestFlight", then Update.
 
 If something goes wrong
 -----------------------
+Messages are quoted as the apps show them. The apps use curly apostrophes
+in a few places, so search for a few words rather than the whole line.
+
 What the iPad says, and what to do:
 - "Your PC didn't answer": check that this window says "Ready for your
   iPad", the PC is awake, and both are on the same Wi-Fi, not a guest
@@ -101,18 +108,32 @@ What the iPad says, and what to do:
   open, then tap Try again.
 - "That looks like the pairing code, not the PC's address": type the
   Address from this window, not the Pairing code.
-- "That code didn't match": type the six digits shown in this window now.
+- "That code didn't match. Check the PC and try again.": type the six
+  digits shown in this window now.
 - "EternalMonitor isn't allowed on your local network": tap Open Settings
   and turn on Local Network.
 - "The connection over the cable stopped": keep EternalMonitor and Apple
   Devices open, unlock the iPad, then unplug the cable and plug it in again.
-- "This iPad app is older than EternalMonitor on your PC": tap Open
+- "This iPad app is older than EternalMonitor on your PC, so they can't
+  connect. Update the iPad app: open TestFlight and tap Update.": tap Open
   TestFlight, then Update.
+- "EternalMonitor on your PC is older than this iPad app, so they can't
+  connect. Update EternalMonitor on your PC: click Update now on the PC, or
+  download it from eternalmonitor.dev.": in this window, click "Update now".
+  If the button says "Check for updates" instead, click it, then click
+  "Update now" when it appears. If no update is found, click "Download from
+  the website".
 
 What this window says, and what to do:
 - "The second screen couldn't start, so your main screen is mirrored":
-  click Try again. If it says part of the install is missing, click
-  Download installer and run it again.
+  the line below says why.
+  If it says Windows' display driver stopped responding, restart the PC.
+  That message has no button.
+  If it says the second screen isn't installed, or part of the install is
+  missing or blocked, click "Download installer", run it, then click
+  "Try again".
+  If it says Windows didn't add the second screen in time, click
+  "Try again". If that keeps happening, run EternalMonitor-Setup.exe again.
 - "Video is using the processor instead of the graphics card": click
   "Use recommended settings" if shown. Otherwise update your graphics driver
   from NVIDIA, AMD or Intel, then click Restart.
