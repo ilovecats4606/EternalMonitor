@@ -281,18 +281,7 @@ pub fn start_suspended(
 /// identity. The path is read from the kernel; the identity, not the path
 /// string, is what we compare.
 pub fn image_id(process: &OwnedHandle) -> io::Result<FileId> {
-    let mut buffer = vec![0u16; 32_768];
-    let mut size = buffer.len() as u32;
-    unsafe {
-        QueryFullProcessImageNameW(
-            HANDLE(process.as_raw_handle()),
-            PROCESS_NAME_WIN32,
-            PWSTR(buffer.as_mut_ptr()),
-            &mut size,
-        )
-    }
-    .map_err(io::Error::other)?;
-    let path = String::from_utf16_lossy(&buffer[..size as usize]);
+    let path = image_path(process)?;
     let image = std::fs::OpenOptions::new()
         .read(true)
         .open(&path)
@@ -307,19 +296,37 @@ pub fn image_id(process: &OwnedHandle) -> io::Result<FileId> {
     file_id(&image)
 }
 
+/// The path a process was started from, as the kernel reports it.
+fn image_path(process: &OwnedHandle) -> io::Result<String> {
+    let mut buffer = vec![0u16; 32_768];
+    let mut size = buffer.len() as u32;
+    unsafe {
+        QueryFullProcessImageNameW(
+            HANDLE(process.as_raw_handle()),
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut size,
+        )
+    }
+    .map_err(io::Error::other)?;
+    Ok(String::from_utf16_lossy(&buffer[..size as usize]))
+}
+
 /// Every running process whose image is the file `app` names, opened so the
-/// caller can wait for it. The file's identity decides, so another spelling
-/// of the path (a short name, a junction) still matches and another copy of
-/// the same program does not.
+/// caller can wait for it. Its final path matches, or, where the path is
+/// spelled another way (a short name, a junction), the file's identity does;
+/// another copy of the same program never matches. Comparing paths first
+/// does not depend on opening the image, which antivirus scanning can
+/// briefly refuse.
 pub fn processes_running(app: &Path) -> io::Result<Vec<OwnedHandle>> {
     use windows::Win32::System::ProcessStatus::K32EnumProcesses;
-    let target = {
+    let (target, target_path) = {
         use std::os::windows::fs::OpenOptionsExt;
         let file = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ.0)
             .open(app)?;
-        file_id(&file)?
+        (file_id(&file)?, final_path(HANDLE(file.as_raw_handle()))?)
     };
     let mut pids = vec![0u32; 4096];
     let count = loop {
@@ -341,7 +348,10 @@ pub fn processes_running(app: &Path) -> io::Result<Vec<OwnedHandle>> {
         // Processes of other users and protected ones cannot be opened;
         // they cannot be this user's EternalMonitor.
         .filter_map(|&pid| open_process(pid).ok())
-        .filter(|process| image_id(process).is_ok_and(|id| id == target))
+        .filter(|process| {
+            image_path(process).is_ok_and(|path| path.eq_ignore_ascii_case(&target_path))
+                || image_id(process).is_ok_and(|id| id == target)
+        })
         .collect())
 }
 
