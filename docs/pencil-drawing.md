@@ -89,9 +89,12 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   (the device is then recreated to end its pointer). The waiting samples and
   the rest of that stroke follow it, pressing the mouse at the first. Native
   input resumes at the next pen down or hover once the mouse holds nothing.
-  The fallback tracks what `SendInput` inserted: a release Windows refuses,
-  for example under UIPI, is retried at the next sample, refresh tick or
-  reset, and native input waits for it.
+  The fallback is an ordered queue for `SendInput`: input Windows refuses,
+  for example under UIPI, waits and is retried first at the next sample,
+  refresh tick or reset, so a refused release always comes before the next
+  press. Ink that has waited a second is dropped rather than replayed late,
+  but a release stays owed while Windows holds the button, and native input
+  waits until the mouse is idle.
 - When a session ends or another takes over, the host drops pen samples
   Windows never received and ends only the pointer Windows holds, where it
   holds it. If that place is off the virtual screen after a display change,
