@@ -55,28 +55,28 @@ pub(super) fn owner_file(directory: &Path, owner: ProcessId, kind: &str) -> Path
 /// box when it cannot start.
 #[cfg(windows)]
 pub(super) fn start(directory: &Path, owner: ProcessId, launch_id: &str) {
-    use std::os::windows::process::CommandExt;
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let spawned = std::process::Command::new(exe)
-        .arg(REPORTER_ARG)
-        .arg(owner.pid.to_string())
-        .arg(owner.start.to_string())
-        .arg(directory)
-        .arg(launch_id)
-        // CREATE_NO_WINDOW: no second console.
-        .creation_flags(0x0800_0000)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    // The reporter needs no handle of the host's, and must not keep one open
+    // (a socket, a driver object) after the host ends.
+    let spawned = directory
+        .to_str()
+        .ok_or_else(|| std::io::Error::other("the crash folder path is not Unicode"))
+        .and_then(|directory| {
+            super::process::spawn_detached(
+                &exe,
+                &[
+                    REPORTER_ARG,
+                    &owner.pid.to_string(),
+                    &owner.start.to_string(),
+                    directory,
+                    launch_id,
+                ],
+            )
+        });
     match spawned {
-        Ok(child) => {
-            let id = ProcessId {
-                pid: child.id(),
-                start: super::process::start_time(child.id()).unwrap_or(0),
-            };
+        Ok(id) => {
             let _ = REPORTER.set(id);
             let _ = FILES.set((directory.to_path_buf(), owner));
             tracing::info!(pid = id.pid, "Failure reporter started");
