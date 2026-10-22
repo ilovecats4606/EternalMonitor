@@ -635,15 +635,22 @@ mod tests {
     fn a_busy_history_never_holds_the_window() {
         let directory = temp_dir("renderer-busy");
         let busy = crate::startup::lock::try_lock(&directory.join(HISTORY_LOCK)).unwrap();
+        // Each call on the GUI thread must return without waiting for the
+        // lock. The code this replaced waited up to 2 s per call; each bound
+        // stays under one such wait, with room for a loaded PC's disk (a
+        // 500 ms bound on the whole sequence failed there).
+        let quick = Duration::from_millis(1500);
         let started = Instant::now();
         assert_eq!(update_history(&directory, |_| {}), None);
+        assert!(started.elapsed() < quick, "{:?}", started.elapsed());
         let launch = ProcessId::current();
         let drew = marker("10de:2c02 32.0.15.9186", "vulkan");
         fs::write(marker_path(&directory, launch), b"{}").unwrap();
         // Not finished: the next frame tries again.
+        let started = Instant::now();
         assert!(!finish_launch(&directory, &drew, launch, true));
+        assert!(started.elapsed() < quick, "{:?}", started.elapsed());
         assert!(marker_path(&directory, launch).exists());
-        assert!(started.elapsed() < Duration::from_millis(500));
         drop(busy);
         assert!(finish_launch(&directory, &drew, launch, true));
         assert!(!marker_path(&directory, launch).exists());
