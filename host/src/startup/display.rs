@@ -430,6 +430,50 @@ mod tests {
     }
 
     #[test]
+    fn a_quit_whose_turn_off_timed_out_is_finished_by_the_reporter() {
+        use crate::startup::reporter::{cleans_up, owner_file as reporter_file, DISPLAY};
+        let path = owner_file("quit-timeout");
+        let crash = owner_file("quit-timeout-crash");
+        fs::create_dir(&crash).unwrap();
+        let host = ProcessId::current();
+        // The host turned the display on; at quit its Disable timed out
+        // behind an Enable that was still running.
+        assert!(change_at(&path, true, || true));
+        let marker = reporter_file(&crash, host, DISPLAY);
+        crate::startup::display_off_at_quit(|| {
+            let done = change_at(&path, false, || false);
+            if !done {
+                // What reporter::mark writes for a host with a reporter.
+                fs::write(&marker, b"").unwrap();
+            }
+            done
+        });
+        assert_eq!(owner_at(&path), Some(host));
+        // The host exits normally; its reporter cleans up all the same.
+        assert!(
+            cleans_up(Some(0), marker.exists()),
+            "the reporter skipped the cleanup"
+        );
+        let mut disabled = false;
+        let result = disable_for_ended_at(
+            &path,
+            host,
+            || None,
+            || {
+                disabled = true;
+                true
+            },
+        );
+        assert_eq!(result, Ok(true));
+        assert!(disabled);
+        assert!(!path.exists());
+        // A normal quit that turned the display off leaves nothing to do.
+        assert!(!cleans_up(Some(0), false));
+        assert!(cleans_up(Some(1), false));
+        fs::remove_dir_all(crash).unwrap();
+    }
+
+    #[test]
     fn a_hosts_own_turn_off_leaves_another_hosts_record() {
         let path = owner_file("startup");
         // Host A turned the display on; host B starts and turns it off.

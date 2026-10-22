@@ -10,8 +10,9 @@
 //!
 //! Each launch's files in the crash folder are named by the host's process:
 //! `.rec` the crash record, `.box` a message to show, `.ready` the reporter's
-//! own id once it watches the host, `.shown` once the window works and
-//! `.done` once the host quit normally or reported its failure itself.
+//! own id once it watches the host, `.shown` once the window works,
+//! `.done` once the host quit normally or reported its failure itself, and
+//! `.display` when it quit without turning the virtual display off.
 
 use super::process::ProcessId;
 #[cfg(windows)]
@@ -29,6 +30,7 @@ pub(super) const REQUEST: &str = "box";
 const READY: &str = "ready";
 pub(super) const SHOWN: &str = "shown";
 pub(super) const DONE: &str = "done";
+pub(super) const DISPLAY: &str = "display";
 /// How long a host that fails at once waits for its reporter to start.
 const READY_WAIT: Duration = Duration::from_secs(3);
 /// How long the crash message waits for the virtual display to turn off.
@@ -196,7 +198,7 @@ fn save(outcome: &super::Outcome, launch_id: &str) -> std::io::Result<()> {
 /// this reporter waits for its messages, so it is not taken for a host.
 #[cfg(any(windows, test))]
 fn remove_files(directory: &Path, owner: ProcessId, saved: bool) {
-    for kind in [REQUEST, "tmp", DONE, SHOWN] {
+    for kind in [REQUEST, "tmp", DONE, SHOWN, DISPLAY] {
         let _ = fs::remove_file(owner_file(directory, owner, kind));
     }
     if saved {
@@ -332,7 +334,7 @@ fn run(args: &[String]) -> i32 {
     // at most CLEANUP_WAIT, and this process at most CLEANUP_CAP.
     let cleanup_started = Instant::now();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    if exit_code != Some(0) {
+    if cleans_up(exit_code, file(DISPLAY).exists()) {
         let reporters = reporters(&directory);
         let thread_reporters = reporters.clone();
         let spawned = std::thread::Builder::new()
@@ -350,7 +352,7 @@ fn run(args: &[String]) -> i32 {
             clean_up(owner, &reporters);
         }
     } else {
-        // Nothing to clean up after a normal quit: the waits below end at once.
+        // A normal quit turned the display off: the waits below end at once.
         drop(done_tx);
     }
 
@@ -400,6 +402,13 @@ fn run(args: &[String]) -> i32 {
     }
     let _ = fs::remove_file(file(READY));
     0
+}
+
+/// Whether to turn the virtual display off after the host ended: after any
+/// abnormal end, and after a normal quit that could not turn it off itself.
+#[cfg(any(windows, test))]
+pub(super) fn cleans_up(exit_code: Option<u32>, display_left: bool) -> bool {
+    exit_code != Some(0) || display_left
 }
 
 /// Turn the virtual display off after `owner` ended, if it still should be,
@@ -602,7 +611,7 @@ mod tests {
     fn a_crash_record_stays_until_its_report_is_saved() {
         let directory = temp_dir("handled");
         let host = exited_process();
-        for kind in [RECORD, READY, DONE, SHOWN] {
+        for kind in [RECORD, READY, DONE, SHOWN, DISPLAY] {
             fs::write(owner_file(&directory, host, kind), b"x").unwrap();
         }
         remove_files(&directory, host, false);

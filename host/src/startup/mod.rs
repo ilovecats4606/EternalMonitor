@@ -61,7 +61,13 @@ pub fn install_failure_hooks() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if std::thread::current().name() == Some("main") {
-            in_report_order(|| save(&panic_detail(info)), crate::vdd::disable, show);
+            in_report_order(
+                || save(&panic_detail(info)),
+                || {
+                    crate::vdd::disable();
+                },
+                show,
+            );
         } else {
             tracing::error!(panic = %info, backtrace = %std::backtrace::Backtrace::force_capture(), "Host panic");
             crate::vdd::disable();
@@ -115,6 +121,16 @@ fn in_report_order(
     disable_virtual_display();
     if let Some((summary, body)) = message {
         show(summary, &body);
+    }
+}
+
+/// At quit, turn the virtual display off with `disable`. When that does not
+/// complete, as when an Enable outlasts the task's wait, the failure reporter
+/// tries again once this process has exited, under the owner record's rules.
+/// Quit does not wait any longer for it.
+pub fn display_off_at_quit(disable: impl FnOnce() -> bool) {
+    if !disable() {
+        reporter::mark(reporter::DISPLAY);
     }
 }
 

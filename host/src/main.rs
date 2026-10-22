@@ -274,8 +274,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         gui_control.request_shutdown();
 
         // Never leave the virtual display attached after we exit — it should only exist while
-        // EternalMonitor is actively using it.
-        vdd::disable();
+        // EternalMonitor is actively using it. If it may still be on, the failure reporter
+        // turns it off after this process exits.
+        eternal_host::startup::display_off_at_quit(vdd::disable);
     };
     // A window error is saved first and shown after the cleanup, as a panic is.
     match window_error {

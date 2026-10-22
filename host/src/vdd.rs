@@ -338,8 +338,9 @@ fn request(enabled: bool, purpose: Purpose, progress: impl FnMut()) -> bool {
 /// Disable the virtual display device (best effort — failures are non-fatal).
 /// For startup, quit and panics: a hung or refused earlier task does not stop
 /// it, and it waits for an Enable still running, within the task's bounds.
-pub fn disable() {
-    request(false, Purpose::Cleanup, || {});
+/// True when the display is known to be off.
+pub fn disable() -> bool {
+    request(false, Purpose::Cleanup, || {})
 }
 
 /// Disable the virtual display after `host` ended abnormally, if it owned the
