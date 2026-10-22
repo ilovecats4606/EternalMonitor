@@ -139,8 +139,8 @@ pub fn show_existing() {
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsIconic, SetForegroundWindow,
-        ShowWindow, SW_RESTORE, SW_SHOW,
+        AllowSetForegroundWindow, EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+        SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
     };
 
     unsafe extern "system" fn visit(hwnd: HWND, data: LPARAM) -> BOOL {
@@ -172,6 +172,12 @@ pub fn show_existing() {
         if !same {
             return true.into();
         }
+        // The window's own thread restores it and asks to be activated, so
+        // the running host needs the right to come to the front. Windows
+        // gives it to the launch the user just started; pass it on. Without
+        // that right (a launch from a background task) the window is only
+        // restored and its taskbar button flashes.
+        let _ = AllowSetForegroundWindow(pid);
         let _ = ShowWindow(
             hwnd,
             if IsIconic(hwnd).as_bool() {
@@ -180,7 +186,17 @@ pub fn show_existing() {
                 SW_SHOW
             },
         );
-        let _ = SetForegroundWindow(hwnd);
+        if SetForegroundWindow(hwnd).as_bool() {
+            tracing::info!(
+                pid,
+                "Brought the running EternalMonitor window to the front"
+            );
+        } else {
+            tracing::info!(
+                pid,
+                "Windows kept another window in front of EternalMonitor"
+            );
+        }
         false.into()
     }
 
