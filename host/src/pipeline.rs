@@ -50,10 +50,11 @@ pub async fn run_pipeline_supervised(
         })
     {
         let reason = error.to_string();
-        let mut stats = stats::PIPELINE_STATS.lock();
-        stats.audio.stopped("Unavailable");
-        stats.audio.error = Some(reason.clone());
-        drop(stats);
+        crate::audio::report_unavailable(
+            &stats::PIPELINE_STATS,
+            || crate::supervisor::generation_is_current(generation),
+            &reason,
+        );
         reporter.stage_exited(Stage::Audio, StageOutcome::Failed(reason));
     }
 

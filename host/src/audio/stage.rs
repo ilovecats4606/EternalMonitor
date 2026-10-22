@@ -231,6 +231,24 @@ fn publish(
     is_current().then(|| std::mem::replace(&mut pipeline.audio, stats))
 }
 
+/// Report audio unavailable for `reason`, if this generation is current.
+/// The check shares the stats lock with the change: a detached old pipeline
+/// that fails to start its audio thread after its successor started must not
+/// mark the live capture unavailable. True when it reported.
+pub(crate) fn report_unavailable(
+    target: &parking_lot::Mutex<crate::stats::PipelineStats>,
+    is_current: impl FnOnce() -> bool,
+    reason: &str,
+) -> bool {
+    let mut stats = target.lock();
+    let current = is_current();
+    if current {
+        stats.audio.stopped("Unavailable");
+        stats.audio.error = Some(reason.to_string());
+    }
+    current
+}
+
 /// Apply `change` to the published audio stats if this generation is current.
 fn update_current(generation: u64, change: impl FnOnce(&mut AudioStats)) {
     let mut stats = PIPELINE_STATS.lock();
@@ -596,6 +614,28 @@ mod tests {
         assert_eq!(replaced.late_seqs.to_string(), "41-42");
         assert!(publish(&target, AudioStats::started("C"), || false).is_none());
         assert_eq!(target.lock().audio.device, "B");
+    }
+
+    #[test]
+    fn an_old_pipelines_failed_audio_start_leaves_the_live_capture_alone() {
+        let target = parking_lot::Mutex::new(crate::stats::PipelineStats::default());
+        let mut live = AudioStats::started("Speakers");
+        live.status = "Streaming".into();
+        let stream = live.stream;
+        publish(&target, live, || true).unwrap();
+        // Generation 1's audio thread could not start after generation 2 did.
+        assert!(!report_unavailable(&target, || false, "no thread"));
+        {
+            let stats = target.lock();
+            assert_eq!(stats.audio.status, "Streaming");
+            assert_eq!(stats.audio.error, None);
+            assert_eq!(stats.audio.stream, stream);
+        }
+        // The current generation's failure is reported.
+        assert!(report_unavailable(&target, || true, "no thread"));
+        let stats = target.lock();
+        assert_eq!(stats.audio.status, "Unavailable");
+        assert_eq!(stats.audio.error.as_deref(), Some("no thread"));
     }
 
     /// Log lines `run` writes on this thread.
