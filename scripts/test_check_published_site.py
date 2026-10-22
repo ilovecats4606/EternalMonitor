@@ -59,6 +59,20 @@ class CheckPublishedSiteTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(deploying.waits[:3], list(site.WAITS[:3]))
 
+    def test_a_slow_pages_deploy_within_ten_minutes_passes(self):
+        # Pages finishing 240 s after the tag: the 180 s window failed this.
+        clock = []
+
+        def get(url):
+            return (200, b"<html>" if url.split("?")[0].endswith(".html") else LATEST) if sum(clock) >= 240 else (404, b"")
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = site.main(["--tag", "v0.3.2", "--strict"], get=get, sleep=clock.append)
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertGreaterEqual(sum(site.WAITS), 600)
+        self.assertEqual(list(site.WAITS), sorted(site.WAITS))
+
     def test_latest_json_must_not_be_newer_than_the_tag(self):
         newer = json.dumps({"windows": {"version": "0.3.3"}}).encode()
         code, out = published(newer).run("v0.3.2-rc.1", strict=True)

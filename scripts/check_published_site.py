@@ -8,7 +8,9 @@ this before building the installer:
 
     check_published_site.py --tag v0.3.2 --strict
 
-Each URL gets a few tries with growing waits, for a deploy still in progress.
+Each URL gets tries with growing waits, about ten minutes in all, for a Pages
+deploy still in progress. If that runs out, rerun the workflow once Pages
+has finished.
 latest.json may not name a version newer than the tag. It normally names the
 previous release here: it carries this installer's SHA-256, so it is updated
 only after this workflow publishes and Apple approves the matching iPad build.
@@ -24,7 +26,7 @@ import urllib.error
 import urllib.request
 
 SITE = "https://eternalmonitor.dev"
-WAITS = (0, 30, 60, 90)  # seconds before each try: about three minutes in all
+WAITS = (0, 15, 30, 60, 90, 120, 150, 150)  # seconds before each try: 615 s in all
 
 
 def fetch(url):
