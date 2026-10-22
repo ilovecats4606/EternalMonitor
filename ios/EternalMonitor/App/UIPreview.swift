@@ -29,7 +29,7 @@ enum UIPreview {
         case "error-router":
             manager.problem = .routerAddress
         case "error-updating":
-            manager.problem = .pcUpdating
+            manager.problem = .pcUpdating(.reconnecting)
         case "mismatch":
             manager.versionMismatch = .iPadOlder
             manager.connectionError = VersionMismatch.iPadOlder.message

@@ -101,7 +101,8 @@ final class ConnectionProblemTests: XCTestCase {
             .noReply(usb: false), .noReply(usb: true), .noPicture, .receiverNotReady, .badAddress("pc"),
             .noNetwork, .localNetworkBlocked, .couldNotConnect, .usbFailed, .lost(.pcStoppedResponding), .lost(.cableUnplugged),
             .lost(.usbTurnedOff), .reconnecting(attempt: 2, of: 6), .reconnectFailed, .pcEndedSession,
-            .pcBusy, .pairingCodeAsAddress, .routerAddress, .pcUpdating,
+            .pcBusy, .pairingCodeAsAddress, .routerAddress,
+            .pcUpdating(.reconnecting), .pcUpdating(.manual), .pcUpdating(.notBack),
         ]
         for problem in all {
             XCTAssertFalse(problem.title.isEmpty)
@@ -120,15 +121,36 @@ final class ConnectionProblemTests: XCTestCase {
     func testAnUpdateStaysTheReasonWhileThePCRestarts() {
         // Busy during the handoff and silence while Setup runs are the update.
         for attempt: ConnectionProblem in [.pcBusy, .noReply(usb: false), .pcEndedSession] {
-            XCTAssertEqual(ConnectionProblem.kept(.pcUpdating, after: attempt), .pcUpdating, "\(attempt)")
+            XCTAssertEqual(ConnectionProblem.kept(.pcUpdating(.reconnecting), after: attempt), .pcUpdating(.reconnecting), "\(attempt)")
         }
         // Something the user must fix replaces it.
-        XCTAssertEqual(ConnectionProblem.kept(.pcUpdating, after: .localNetworkBlocked), .localNetworkBlocked)
+        XCTAssertEqual(ConnectionProblem.kept(.pcUpdating(.reconnecting), after: .localNetworkBlocked), .localNetworkBlocked)
         // Unchanged rules otherwise.
         XCTAssertEqual(ConnectionProblem.kept(nil, after: .pcBusy), .pcBusy)
         XCTAssertEqual(ConnectionProblem.kept(.usbFailed, after: .noReply(usb: false)), .usbFailed)
-        XCTAssertEqual(ConnectionProblem.afterReconnecting(lastAttempt: .pcUpdating), .pcUpdating)
-        XCTAssertEqual(ConnectionProblem.pcUpdating.actions, [.retry])
+        XCTAssertEqual(ConnectionProblem.afterReconnecting(lastAttempt: .pcUpdating(.reconnecting)), .pcUpdating(.reconnecting))
+        XCTAssertEqual(ConnectionProblem.pcUpdating(.reconnecting).actions, [.retry])
+    }
+
+    func testTheUpdateMessagePromisesOnlyWhatWillHappen() {
+        let reconnecting = ConnectionProblem.pcUpdating(.reconnecting)
+        XCTAssertTrue(reconnecting.detail.contains("reconnects when it's back"), reconnecting.detail)
+        // Auto-reconnect off: nothing reconnects by itself.
+        let manual = reconnecting.withoutReconnecting
+        XCTAssertEqual(manual, .pcUpdating(.manual))
+        XCTAssertFalse(manual.detail.contains("reconnects"), manual.detail)
+        XCTAssertTrue(manual.detail.contains("Try again") && manual.detail.contains("opened again"), manual.detail)
+        XCTAssertEqual(manual.actions, [.retry])
+        // Every attempt ran out.
+        let notBack = reconnecting.afterTheCycle
+        XCTAssertEqual(notBack, .pcUpdating(.notBack))
+        XCTAssertFalse(notBack.detail.contains("reconnects"), notBack.detail)
+        XCTAssertTrue(notBack.title.contains("hasn't come back"), notBack.title)
+        XCTAssertEqual(notBack.actions, [.retry])
+        // Other problems pass through both unchanged.
+        XCTAssertEqual(ConnectionProblem.pcBusy.withoutReconnecting, .pcBusy)
+        XCTAssertEqual(ConnectionProblem.reconnectFailed.afterTheCycle, .reconnectFailed)
+        XCTAssertEqual(ConnectionProblem.lost(.pcStoppedResponding).withoutReconnecting, .lost(.pcStoppedResponding))
     }
 
     func testUSBCardTextIsPlain() {

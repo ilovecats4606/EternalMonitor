@@ -570,10 +570,10 @@ final class ConnectionManager: ObservableObject {
                     // back on the new version, so reconnect as for a restart.
                     if self.reconnectCycleID != nil {
                         self.disconnect()
-                        self.reconnectFailure = .pcUpdating
-                        self.problem = .pcUpdating
+                        self.reconnectFailure = .pcUpdating(.reconnecting)
+                        self.problem = .pcUpdating(.reconnecting)
                     } else {
-                        self.beginReconnect(.pcStoppedResponding, failure: .pcUpdating)
+                        self.beginReconnect(.pcStoppedResponding, failure: .pcUpdating(.reconnecting))
                     }
                 case .userDisconnect, .superseded:
                     // Disconnected from the PC, or another device took over:
@@ -834,7 +834,7 @@ final class ConnectionManager: ObservableObject {
         record(.warning, "ctrl", "Connection lost (\(logged))")
         disconnect()
         guard auto, let target else {
-            problem = failure ?? .lost(reason)
+            problem = (failure ?? .lost(reason)).withoutReconnecting
             return
         }
         startReconnectCycle(to: target, failure: failure)
@@ -870,7 +870,7 @@ final class ConnectionManager: ObservableObject {
             guard let self, self.reconnectCycleID == cycleID else { return }
             let kept = self.reconnectFailure
             self.endReconnectCycle()
-            self.problem = kept ?? .reconnectFailed
+            self.problem = (kept ?? .reconnectFailed).afterTheCycle
         }
     }
 

@@ -31,7 +31,17 @@ enum ConnectionProblem: Equatable {
     /// The PC is streaming to another device, or still to this iPad's cable.
     case pcBusy
     /// The PC stopped the stream to install an update and restarts on it.
-    case pcUpdating
+    case pcUpdating(UpdateWait)
+
+    /// What this iPad does while the PC updates.
+    enum UpdateWait: Equatable {
+        /// Automatic attempts are running or about to.
+        case reconnecting
+        /// Auto-reconnect is off: the user connects again.
+        case manual
+        /// Every automatic attempt ran out.
+        case notBack
+    }
 
     enum LostReason: Equatable {
         case pcStoppedResponding
@@ -64,7 +74,8 @@ enum ConnectionProblem: Equatable {
         case .reconnectFailed: return "Couldn't reconnect to your PC"
         case .pcEndedSession: return "Your PC ended the session"
         case .pcBusy: return "Your PC is already streaming to another device"
-        case .pcUpdating: return "Your PC is updating EternalMonitor"
+        case .pcUpdating(.reconnecting), .pcUpdating(.manual): return "Your PC is updating EternalMonitor"
+        case .pcUpdating(.notBack): return "Your PC hasn't come back from its update yet"
         }
     }
 
@@ -109,8 +120,12 @@ enum ConnectionProblem: Equatable {
             return "Check that the PC is awake and EternalMonitor is open on it, then try again."
         case .pcEndedSession:
             return "Someone clicked Stop on the PC, changed a setting that restarts the stream, or closed EternalMonitor. Try again when the PC says Ready for your iPad."
-        case .pcUpdating:
+        case .pcUpdating(.reconnecting):
             return "This iPad reconnects when it's back. If it doesn't, check that EternalMonitor opened again on the PC, then try again."
+        case .pcUpdating(.manual):
+            return "Tap Try again once EternalMonitor has opened again on the PC."
+        case .pcUpdating(.notBack):
+            return "Check that EternalMonitor opened again on the PC, then try again. Windows may still be waiting for you to approve the update there."
         case .pcBusy:
             return "Disconnect the other iPad first, then try again."
         }
@@ -167,10 +182,23 @@ enum ConnectionProblem: Equatable {
     /// PC updates it turns sessions away (Busy), then stops answering until
     /// the new version starts; neither replaces the update as the reason.
     static func kept(_ kept: ConnectionProblem?, after attempt: ConnectionProblem?) -> ConnectionProblem? {
-        if kept == .pcUpdating, [.pcBusy, .noReply(usb: false), .pcEndedSession].contains(attempt) {
+        if case .pcUpdating = kept, [.pcBusy, .noReply(usb: false), .pcEndedSession].contains(attempt) {
             return kept
         }
         return afterReconnecting(lastAttempt: attempt) != .reconnectFailed ? attempt : kept
+    }
+
+    /// The problem to show when no automatic attempt will run (Auto-reconnect
+    /// is off): it must not promise a reconnect.
+    var withoutReconnecting: ConnectionProblem {
+        if case .pcUpdating = self { return .pcUpdating(.manual) }
+        return self
+    }
+
+    /// The problem to show once every automatic attempt ran out.
+    var afterTheCycle: ConnectionProblem {
+        if case .pcUpdating = self { return .pcUpdating(.notBack) }
+        return self
     }
 
     /// What a link failure means for the user. The raw error stays in the

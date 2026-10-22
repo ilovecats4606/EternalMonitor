@@ -115,7 +115,26 @@ final class GoodbyeTests: XCTestCase {
         let answered = await Task.detached { (0..<6).filter { _ in host.acceptSession(status: .busy) }.count }.value
         XCTAssertGreaterThan(answered, 0, "the iPad never tried the PC again")
         try await until("gave up", seconds: 20) { manager.reconnectAttempt == 0 && manager.state == .disconnected }
+        // Every attempt ran out: no promise that it reconnects by itself.
+        XCTAssertEqual(manager.problem?.title, "Your PC hasn't come back from its update yet")
+        XCTAssertFalse(manager.problem?.detail.contains("reconnects") ?? true)
+        XCTAssertEqual(manager.problem?.actions, [.retry])
+    }
+
+    /// With Auto-reconnect off nothing retries, so the message says to try
+    /// again once the PC is back.
+    func testAnUpdateWithAutoReconnectOffSaysToTryAgain() async throws {
+        let host = FakeUDPHost()
+        let manager = try await streaming(host)
+        defer { manager.cancel() }
+        UserDefaults.standard.set(false, forKey: "autoReconnect")
+        host.sendBye(.hostShuttingDown)
+        try await until("disconnected") { manager.state == .disconnected }
         XCTAssertEqual(manager.problem?.title, "Your PC is updating EternalMonitor")
+        XCTAssertFalse(manager.problem?.detail.contains("reconnects") ?? true, manager.problem?.detail ?? "")
+        XCTAssertEqual(manager.problem?.actions, [.retry])
+        let attempts = await Task.detached { host.helloAttempts(within: 1.5) }.value
+        XCTAssertEqual(attempts, 0)
     }
 
     /// Disconnected from the PC's side: the iPad stays away.

@@ -411,7 +411,7 @@ final class USBLinkFailureTests: XCTestCase {
         try await until("handshake") { manager.hostInfo != nil }
         wifi.sendBye(.hostShuttingDown)
         try await until("the goodbye ends that attempt") { manager.state == .disconnected }
-        XCTAssertEqual(manager.problem, .pcUpdating)
+        XCTAssertEqual(manager.problem, .pcUpdating(.reconnecting))
         XCTAssertEqual(manager.reconnectAttempt, 1, "a restarting PC keeps the automatic cycle")
         try await finishConnecting(manager, to: wifi)
     }
