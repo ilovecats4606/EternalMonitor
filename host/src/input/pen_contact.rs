@@ -9,7 +9,8 @@
 //! with UP or a cancel at the last updated position; hover starts or updates
 //! with an in-range UPDATE and ends with a bare UPDATE. A rejected frame
 //! cancels every injected contact. ERROR_NOT_READY applies nothing; the same
-//! frame must be retried.
+//! frame is retried, unless its sample goes stale first: then the next one is
+//! planned from the state Windows last accepted.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -27,6 +28,10 @@ pub(super) const INPUT_STALE: Duration = Duration::from_secs(1);
 /// strokes that start and end while Windows stays not ready; past it native
 /// input counts as stuck and the waiting samples go to the mouse.
 pub(super) const QUEUE_LIMIT: usize = 8;
+
+/// How long a device recreated because native input seemed stuck has to
+/// accept a frame before Pencil input goes to the mouse instead.
+pub(super) const STUCK_TRIAL: Duration = Duration::from_millis(200);
 
 /// `POINTER_FLAG_*` values from winuser.h, so frames can be built and checked
 /// off Windows. `windows_inject.rs` asserts that they match the SDK's.
@@ -171,6 +176,10 @@ pub trait PenTarget {
     fn available(&self) -> bool {
         true
     }
+    /// Native input accepts nothing, even on a new device: stop using the
+    /// device, which ends any pointer it holds, so Pencil input goes to the
+    /// mouse until a device is asked for again.
+    fn give_up(&mut self);
 }
 
 #[derive(Debug, Default)]
@@ -186,6 +195,12 @@ pub struct PenContact {
     /// Samples that cannot be delivered natively, oldest first, with when
     /// they were received, for the mouse; see `take_abandoned`.
     abandoned: Vec<(PenSample, Instant)>,
+    /// When Windows first answered ERROR_NOT_READY since it last accepted a
+    /// frame.
+    refused_since: Option<Instant>,
+    /// The device is new because native input seemed stuck: unless it
+    /// accepts a frame by then, Pencil input goes to the mouse.
+    trial_until: Option<Instant>,
     /// Samples dropped by design, with why, so tests can tell them from
     /// samples lost by mistake.
     #[cfg(test)]
@@ -204,6 +219,15 @@ enum Brought {
 }
 
 impl PenContact {
+    /// A contact on a device asked for again after native input was found
+    /// stuck: it has until `until` to accept a frame.
+    pub fn on_trial(until: Instant) -> Self {
+        Self {
+            trial_until: Some(until),
+            ..Self::default()
+        }
+    }
+
     #[cfg(test)]
     pub fn state(&self) -> PointerState {
         self.state
@@ -223,7 +247,7 @@ impl PenContact {
         now: Instant,
         target: &mut impl PenTarget,
     ) {
-        self.expire(now, target);
+        self.expire(now);
         if self.queue.len() >= QUEUE_LIMIT && !self.coalesces(&sample) {
             // Windows has refused the first waiting frame for a whole queue
             // of samples: native input is stuck. Recreating the device ends
@@ -242,20 +266,48 @@ impl PenContact {
     /// Deliver waiting samples in order until Windows is not ready. Call on
     /// every refresh tick so an end of contact is not left waiting for the
     /// next Pencil sample.
+    ///
+    /// Native input is stuck once Windows has accepted nothing for
+    /// `INPUT_STALE` while ink waits. The device is then recreated once; if
+    /// the new one accepts nothing within `STUCK_TRIAL` either, the waiting
+    /// samples go to the mouse and the device is given up. An end waiting
+    /// alone never counts: recreating could only lose it.
     pub fn flush(
         &mut self,
         output: Option<CaptureGeometry>,
         now: Instant,
         target: &mut impl PenTarget,
     ) {
-        self.expire(now, target);
-        while let Some(sample) = self.pending() {
-            match self.bring(mapped(sample, output), target) {
-                Brought::Delivered => {
-                    self.queue.pop_front();
+        self.expire(now);
+        loop {
+            while let Some(sample) = self.pending() {
+                match self.bring(mapped(sample, output), target) {
+                    Brought::Delivered => {
+                        self.queue.pop_front();
+                    }
+                    Brought::Waiting => break,
+                    Brought::Abandoned => return self.abandon(output),
                 }
-                Brought::Waiting => return,
-                Brought::Abandoned => return self.abandon(output),
+            }
+            if self.queue.is_empty() {
+                return;
+            }
+            let refused_since = *self.refused_since.get_or_insert(now);
+            if !self.queue.iter().any(|(sample, _)| is_ink(sample)) {
+                return;
+            }
+            match self.trial_until {
+                Some(until) if now >= until => {
+                    target.give_up();
+                    self.state = PointerState::Out;
+                    return self.abandon(output);
+                }
+                None if now.saturating_duration_since(refused_since) >= INPUT_STALE => {
+                    target.recreate();
+                    self.state = PointerState::Out;
+                    self.trial_until = Some(now + STUCK_TRIAL);
+                }
+                _ => return,
             }
         }
     }
@@ -268,24 +320,20 @@ impl PenContact {
         std::mem::take(&mut self.abandoned)
     }
 
-    /// Drop waiting samples once the oldest has waited `INPUT_STALE`. A
-    /// frame for it is outstanding and Windows may hold a pointer, so the
-    /// device is recreated: that ends the pointer where Windows holds it
-    /// without sending a frame other than the refused one, and the next
-    /// sample starts from out of range.
-    fn expire(&mut self, now: Instant, target: &mut impl PenTarget) {
-        let stale = |&(_, received): &(PenSample, Instant)| {
-            now.saturating_duration_since(received) >= INPUT_STALE
-        };
-        if !self.queue.front().is_some_and(stale) {
-            return;
-        }
-        #[cfg(test)]
-        self.dropped
-            .extend(self.queue.iter().map(|&(s, _)| (s, "stale")));
-        self.queue.clear();
-        target.recreate();
-        self.state = PointerState::Out;
+    /// Drop each waiting down, move or hover that has itself waited
+    /// `INPUT_STALE`. Ends stay: an up, cancel or leave is owed to whatever
+    /// Windows holds, and plans to nothing if Windows holds nothing. Fresher
+    /// samples are planned from the state Windows last accepted, so a move
+    /// whose down was dropped starts the contact itself.
+    fn expire(&mut self, now: Instant) {
+        self.queue.retain(|&(sample, received)| {
+            let stale = is_ink(&sample) && now.saturating_duration_since(received) >= INPUT_STALE;
+            #[cfg(test)]
+            if stale {
+                self.dropped.push((sample, "stale"));
+            }
+            !stale
+        });
     }
 
     #[cfg(test)]
@@ -368,6 +416,15 @@ impl PenContact {
     /// none of its own frames; a cancel or leave is delivered once the
     /// pointer has ended, even by recreating the device.
     fn bring(&mut self, sample: PenSample, target: &mut impl PenTarget) -> Brought {
+        // An up goes where the Pencil lifted. If a display change put that
+        // off the virtual screen, end the contact where Windows has it.
+        let sample = match sample.phase {
+            PenPhase::Up if !on_screen(sample, target.screen()) => PenSample {
+                phase: PenPhase::Cancel,
+                ..sample
+            },
+            _ => sample,
+        };
         // A rejection cancels the contact; resume a move or hover from this
         // same, freshly mapped sample once. A frame still rejected after
         // that, or a rejected down or up, gives the sample up.
@@ -406,11 +463,7 @@ impl PenContact {
     /// display change, and a refused end may leave the pointer held; either
     /// way, recreating the device ends it instead.
     fn end(&mut self, frame: PenSample, target: &mut impl PenTarget) -> Outcome {
-        let screen = target.screen();
-        let (x, y) = super::desktop_pixel_to_pointer_location(frame.x, frame.y, screen);
-        let on_screen = (0..i64::from(screen.width)).contains(&i64::from(x))
-            && (0..i64::from(screen.height)).contains(&i64::from(y));
-        if on_screen {
+        if on_screen(frame, target.screen()) {
             let outcome = self.send(frame, target);
             if outcome != Outcome::Rejected {
                 return outcome;
@@ -425,6 +478,8 @@ impl PenContact {
         let outcome = target.inject(frame, self.state.kind());
         match outcome {
             Outcome::Injected => {
+                self.refused_since = None;
+                self.trial_until = None;
                 self.state = match frame.phase {
                     PenPhase::Down | PenPhase::Move => PointerState::Contact(frame),
                     PenPhase::Hover => PointerState::Hover(frame),
@@ -481,6 +536,22 @@ impl PenContact {
             (PenPhase::Up | PenPhase::Cancel | PenPhase::Leave, _) => [None, None],
         }
     }
+}
+
+/// A down, move or hover: input that draws or moves the pointer, as opposed
+/// to an end Windows may be owed.
+fn is_ink(sample: &PenSample) -> bool {
+    matches!(
+        sample.phase,
+        PenPhase::Down | PenPhase::Move | PenPhase::Hover
+    )
+}
+
+/// Whether `frame`'s location lies on `screen`.
+fn on_screen(frame: PenSample, screen: VirtualScreen) -> bool {
+    let (x, y) = super::desktop_pixel_to_pointer_location(frame.x, frame.y, screen);
+    (0..i64::from(screen.width)).contains(&i64::from(x))
+        && (0..i64::from(screen.height)).contains(&i64::from(y))
 }
 
 #[cfg(test)]
@@ -542,18 +613,20 @@ mod tests {
     };
 
     /// What Windows saw: a frame at a desktop pixel and its outcome, or a
-    /// recreated device.
+    /// recreated or given up device.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Seen {
         F(PenPhase, i32, i32, Outcome),
         Recreated,
+        GaveUp,
     }
 
     /// Windows as documented: a frame in the table is applied, anything else
     /// is rejected and cancels the contact. A location off the virtual
     /// screen is rejected without ending the pointer, which Windows may then
     /// still hold. After ERROR_NOT_READY the next frame must be the same
-    /// one, unless the display changed. Recreating the device ends the
+    /// one, unless the display changed (these tests never age a sample
+    /// until it is dropped as stale). Recreating the device ends the
     /// pointer. Tests can script NOT_READY and rejections, and cancel the
     /// contact behind the injector's back (a display change). Positions are
     /// where Windows resolves each frame's location on the virtual screen
@@ -638,6 +711,12 @@ mod tests {
             self.state = PointerKind::Out;
             self.retry = None;
             self.frames.push(Seen::Recreated);
+        }
+
+        fn give_up(&mut self) {
+            self.state = PointerKind::Out;
+            self.retry = None;
+            self.frames.push(Seen::GaveUp);
         }
     }
 
@@ -1084,6 +1163,11 @@ mod tests {
             self.windows.recreate();
             self.accepted.push(None);
         }
+
+        fn give_up(&mut self) {
+            self.windows.give_up();
+            self.accepted.push(None);
+        }
     }
 
     #[test]
@@ -1272,6 +1356,34 @@ mod tests {
             assert_eq!(windows.take(), expected, "{start:?} then {next:?}");
             assert!(windows.illegal.is_empty());
         }
+    }
+
+    #[test]
+    fn an_up_off_the_virtual_screen_ends_the_contact_where_windows_has_it() {
+        // The display holding the lift leaves the virtual screen while the
+        // up waits: the up cannot go where the Pencil lifted, so the contact
+        // ends where Windows has it, never with a frame off the screen.
+        let right = VirtualScreen {
+            left: 0,
+            top: 0,
+            width: 4920,
+            height: 1640,
+        };
+        let (mut contact, mut windows) = (PenContact::default(), FakeWindows::default());
+        windows.screen = right;
+        deliver(&mut contact, &mut windows, pen(Down, 2000, 819));
+        windows.screen = VirtualScreen {
+            width: 2560,
+            ..right
+        };
+        windows.display_changed();
+        deliver(&mut contact, &mut windows, pen(Up, 3739, 819));
+        assert_eq!(
+            windows.take(),
+            [F(Down, 2000, 819, Injected), F(Cancel, 2000, 819, Injected)]
+        );
+        assert!(windows.illegal.is_empty());
+        assert_eq!(contact.state(), PointerState::Out);
     }
 
     #[test]

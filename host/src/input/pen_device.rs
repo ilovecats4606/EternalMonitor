@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
-use super::pen_contact::{Outcome, PenContact, PenTarget, PointerKind, INPUT_STALE};
+use super::pen_contact::{Outcome, PenContact, PenTarget, PointerKind, INPUT_STALE, STUCK_TRIAL};
 use super::{desktop_pixel_to_abs, CaptureGeometry, Injection, PenPhase, PenSample, VirtualScreen};
 
 /// After Windows refuses a device, ask again at most this often.
@@ -91,8 +91,12 @@ struct Mouse {
 struct Slot<A: PenApi> {
     api: A,
     handle: Option<A::Handle>,
-    /// When Windows last refused to create the device, while it is missing.
+    /// When Windows last refused to create the device, or native input was
+    /// given up as stuck, while the device is missing.
     failed_at: Option<Instant>,
+    /// Native input was given up because it accepted nothing, and has not
+    /// accepted a frame since.
+    stuck: bool,
     /// The device messages logged, for tests: capturing tracing output is
     /// unreliable while other test threads hit the same log sites.
     #[cfg(test)]
@@ -104,7 +108,9 @@ impl<A: PenApi> Slot<A> {
     fn create(&mut self, now: Instant) {
         match self.api.create() {
             Ok(handle) => {
-                if self.failed_at.take().is_some() {
+                // After native input was stuck, it is available again only
+                // once Windows accepts a frame.
+                if self.failed_at.take().is_some() && !self.stuck {
                     info!("Native Windows pen input is available again");
                     #[cfg(test)]
                     self.reported.push("available again");
@@ -129,11 +135,12 @@ impl<A: PenApi> Slot<A> {
     }
 }
 
-/// The device as `PenContact` sees it for one batch.
+/// The device as `PenContact` sees it for one batch, at `now`.
 struct Target<'a, A: PenApi> {
     slot: &'a mut Slot<A>,
     screen: VirtualScreen,
     output: Option<CaptureGeometry>,
+    now: Instant,
 }
 
 impl<A: PenApi> PenTarget for Target<'_, A> {
@@ -142,13 +149,19 @@ impl<A: PenApi> PenTarget for Target<'_, A> {
     }
 
     fn inject(&mut self, frame: PenSample, from: PointerKind) -> Outcome {
-        match self.slot.handle {
-            Some(handle) => self
-                .slot
-                .api
-                .inject(handle, frame, from, self.screen, self.output),
-            None => Outcome::Rejected,
+        let Some(handle) = self.slot.handle else {
+            return Outcome::Rejected;
+        };
+        let outcome = self
+            .slot
+            .api
+            .inject(handle, frame, from, self.screen, self.output);
+        if outcome == Outcome::Injected && std::mem::take(&mut self.slot.stuck) {
+            info!("Native Windows pen input is available again");
+            #[cfg(test)]
+            self.slot.reported.push("available again");
         }
+        outcome
     }
 
     fn available(&self) -> bool {
@@ -157,11 +170,22 @@ impl<A: PenApi> PenTarget for Target<'_, A> {
 
     fn recreate(&mut self) {
         self.slot.destroy();
-        self.slot.create(Instant::now());
+        self.slot.create(self.now);
         info!(
             available = self.slot.handle.is_some(),
             "Recreated the native pen device to end a pointer Windows may still hold"
         );
+    }
+
+    /// Log the first time in a streak, like a device Windows refused.
+    fn give_up(&mut self) {
+        self.slot.destroy();
+        self.slot.failed_at = Some(self.now);
+        if !std::mem::replace(&mut self.slot.stuck, true) {
+            warn!("Native Windows pen input accepts nothing; Pencil uses the mouse");
+            #[cfg(test)]
+            self.slot.reported.push("stuck");
+        }
     }
 }
 
@@ -171,6 +195,7 @@ impl<A: PenApi> PenDevice<A> {
             api,
             handle: None,
             failed_at: None,
+            stuck: false,
             #[cfg(test)]
             reported: Vec::new(),
         };
@@ -187,7 +212,10 @@ impl<A: PenApi> PenDevice<A> {
     }
 
     /// Where no stroke is in progress (a pen down or a hover), ask again for
-    /// a device Windows refused, at most once per `RETRY_INTERVAL`.
+    /// a device Windows refused or native input that was stuck, at most once
+    /// per `RETRY_INTERVAL`. After a stuck streak the new device must accept
+    /// a frame within `STUCK_TRIAL`, so a stroke it cannot carry soon goes
+    /// to the mouse.
     pub fn revive(&mut self, now: Instant) {
         let waiting = self
             .slot
@@ -198,7 +226,11 @@ impl<A: PenApi> PenDevice<A> {
         }
         self.slot.create(now);
         // A new device holds no pointer.
-        self.contact = PenContact::default();
+        self.contact = if self.slot.stuck {
+            PenContact::on_trial(now + STUCK_TRIAL)
+        } else {
+            PenContact::default()
+        };
     }
 
     /// Deliver one pen sample to this device or to the mouse.
@@ -206,7 +238,8 @@ impl<A: PenApi> PenDevice<A> {
     /// Each sample goes to exactly one of the two, once and in order. A
     /// stroke or hover belongs to one path at a time. It moves to the mouse
     /// when native input cannot carry it (the device is gone, Windows
-    /// rejects a frame, or Windows stays not ready for a whole queue):
+    /// rejects a frame, or Windows stays not ready for a whole queue or, even
+    /// on a new device, for `INPUT_STALE`):
     /// `PenContact` then hands over the sample and every one waiting behind
     /// it. A stroke on the mouse stays there until it ends, and native input
     /// resumes only where a stroke or hover starts with the mouse idle:
@@ -233,6 +266,7 @@ impl<A: PenApi> PenDevice<A> {
             slot: &mut self.slot,
             screen,
             output,
+            now,
         };
         self.contact.deliver(sample, output, now, &mut target);
         self.hand_over(now);
@@ -248,6 +282,7 @@ impl<A: PenApi> PenDevice<A> {
                 screen: self.slot.api.screen(),
                 slot: &mut self.slot,
                 output: None,
+                now,
             };
             self.contact.reset(&mut target);
         }
@@ -268,6 +303,7 @@ impl<A: PenApi> PenDevice<A> {
             slot: &mut self.slot,
             screen,
             output,
+            now,
         };
         self.contact.flush(output, now, &mut target);
         self.hand_over(now);
@@ -323,19 +359,9 @@ impl<A: PenApi> PenDevice<A> {
     /// Offer Windows the waiting input, oldest first, placed on the virtual
     /// screen as it is now. What it inserts leaves the queue and sets the
     /// button state; the rest waits for the next sample, tick or reset.
-    /// Ink whose sample arrived `INPUT_STALE` ago is dropped first, so a
-    /// late call never inserts it; a waiting release alone is never stale.
+    /// Stale ink is dropped first, so a late call never inserts it.
     fn pump(&mut self, now: Instant) {
-        let oldest_ink = self
-            .mouse
-            .waiting
-            .iter()
-            .find(|waiting| waiting.event != MouseEvent::Release);
-        if oldest_ink
-            .is_some_and(|waiting| now.saturating_duration_since(waiting.received) >= INPUT_STALE)
-        {
-            self.drop_mouse_input("stale", now);
-        }
+        self.expire_mouse(now);
         if self.mouse.waiting.is_empty() {
             return;
         }
@@ -361,6 +387,63 @@ impl<A: PenApi> PenDevice<A> {
                 MouseEvent::Release => self.mouse.pressed = false,
             }
         }
+    }
+
+    /// Drop each waiting move or press whose sample arrived `INPUT_STALE`
+    /// ago, as the native queue does, and plan the rest again: a stroke
+    /// whose press went is pressed at its next fresh move, and a release
+    /// stays only while it ends a press Windows holds or will hold. A kept
+    /// release goes where the pointer will be, though SendInput does not
+    /// move it for one.
+    fn expire_mouse(&mut self, now: Instant) {
+        let stale = |waiting: &Waiting| {
+            waiting.event != MouseEvent::Release
+                && now.saturating_duration_since(waiting.received) >= INPUT_STALE
+        };
+        if !self.mouse.waiting.iter().any(stale) {
+            return;
+        }
+        let (mut held, mut at, mut press_owed) = (self.mouse.pressed, self.mouse.at, false);
+        let mut kept = VecDeque::with_capacity(self.mouse.waiting.len());
+        for waiting in std::mem::take(&mut self.mouse.waiting) {
+            match waiting.event {
+                _ if stale(&waiting) => {
+                    #[cfg(test)]
+                    self.mouse
+                        .dropped
+                        .push((waiting.event, waiting.at, "stale"));
+                    press_owed |= waiting.event == MouseEvent::Press;
+                }
+                MouseEvent::Move => {
+                    at = waiting.at;
+                    kept.push_back(waiting);
+                    if std::mem::take(&mut press_owed) {
+                        kept.push_back(Waiting {
+                            event: MouseEvent::Press,
+                            ..waiting
+                        });
+                        held = true;
+                    }
+                }
+                MouseEvent::Press => {
+                    held = true;
+                    kept.push_back(waiting);
+                }
+                MouseEvent::Release if held => {
+                    held = false;
+                    kept.push_back(Waiting { at, ..waiting });
+                }
+                MouseEvent::Release => {
+                    #[cfg(test)]
+                    self.mouse
+                        .dropped
+                        .push((waiting.event, waiting.at, "stale"));
+                    press_owed = false;
+                }
+            }
+        }
+        self.mouse.waiting = kept;
+        self.mouse.planned = held;
     }
 
     /// Drop waiting mouse input and end any stroke on the mouse, keeping a
@@ -1084,16 +1167,18 @@ mod tests {
         deliver_one(&mut device, pen_xy(PenPhase::Move, 11, 1), start);
         let half = start + INPUT_STALE / 2;
         deliver_one(&mut device, pen_xy(PenPhase::Up, 12, 1), half);
-        // Past the limit the old stroke's ink is dropped; the release is not.
+        // Past the limit each move is dropped once it has itself waited
+        // that long; the release, owed to the press Windows holds, is not.
         let stale = start + INPUT_STALE;
         flush_one(&mut device, stale);
         assert_eq!(
             device.take_dropped_mouse_input(),
-            [
-                (MouseEvent::Move, (11, 1), "stale"),
-                (MouseEvent::Move, (12, 1), "stale"),
-                (MouseEvent::Release, (12, 1), "stale"),
-            ]
+            [(MouseEvent::Move, (11, 1), "stale")]
+        );
+        flush_one(&mut device, half + INPUT_STALE);
+        assert_eq!(
+            device.take_dropped_mouse_input(),
+            [(MouseEvent::Move, (12, 1), "stale")]
         );
         // A release left waiting alone is never dropped.
         for second in 2..5 {
@@ -1178,6 +1263,11 @@ mod tests {
         overflows: usize,
         streams_overflowed: usize,
         native_stale: usize,
+        /// Streams where native input was given up as stuck.
+        streams_given_up: usize,
+        /// Ends Windows was owed, delivered `INPUT_STALE` or more after
+        /// their sample arrived.
+        late_owed_ends: usize,
         streams_losing_device: usize,
         streams_mouse_blocked: usize,
         resets: usize,
@@ -1360,9 +1450,15 @@ mod tests {
                               cut_strokes: &mut std::collections::BTreeSet<i32>,
                               coverage: &mut Coverage| {
                 let api_now = device.slot.api.now;
-                let waited = |id: i32| api_now.saturating_duration_since(times[id as usize - 1]);
-                // A drop takes everything waiting once the oldest is stale.
-                let mut oldest_stale = None;
+                // Each sample dropped as stale must itself have waited the
+                // limit; fresher ones behind it are kept.
+                let old_enough = |id: i32, what: &dyn std::fmt::Debug| {
+                    let waited = api_now.saturating_duration_since(times[id as usize - 1]);
+                    assert!(
+                        waited >= INPUT_STALE,
+                        "stream {stream}: {what:?} of sample {id} dropped as stale after {waited:?}"
+                    );
+                };
                 for (sample, why) in device.contact.take_dropped() {
                     match why {
                         "coalesced" => assert!(
@@ -1372,16 +1468,26 @@ mod tests {
                         "reset" => {
                             assert!(resetting, "stream {stream}: reset drop outside a reset")
                         }
+                        // Only ink goes stale: an end is owed to whatever
+                        // Windows holds. A stroke keeps its up, so it is
+                        // still checked to land where the Pencil lifted.
                         "stale" => {
                             assert!(!resetting, "stream {stream}: stale drop in a reset");
-                            oldest_stale = oldest_stale.max(Some(waited(sample.x)));
+                            assert!(
+                                matches!(
+                                    sample.phase,
+                                    PenPhase::Down | PenPhase::Move | PenPhase::Hover
+                                ),
+                                "stream {stream}: dropped the end {sample:?} as stale"
+                            );
+                            old_enough(sample.x, &sample.phase);
                             coverage.native_stale += 1;
                         }
                         _ => panic!("stream {stream}: dropped {sample:?} for {why}"),
                     }
                     *coverage.dropped.entry(why).or_default() += 1;
                     exempt.insert(sample.x);
-                    if why != "coalesced" {
+                    if why == "reset" {
                         cut_strokes.insert(sample.y);
                     }
                 }
@@ -1394,17 +1500,12 @@ mod tests {
                         _ => panic!("stream {stream}: dropped {event:?} for {why}"),
                     }
                     *coverage.dropped.entry(why).or_default() += 1;
+                    // A release goes with the press it ended.
                     if why == "stale" && event != MouseEvent::Release {
-                        oldest_stale = oldest_stale.max(Some(waited(id)));
+                        old_enough(id, &event);
                     }
                     exempt.insert(id);
                     cut_strokes.insert(stroke);
-                }
-                if let Some(waited) = oldest_stale {
-                    assert!(
-                        waited >= INPUT_STALE,
-                        "stream {stream}: stale after {waited:?}"
-                    );
                 }
             };
             for step in 0..length {
@@ -1514,6 +1615,7 @@ mod tests {
                 &mut coverage,
             );
             coverage.streams_overflowed += usize::from(overflowed);
+            coverage.streams_given_up += usize::from(device.slot.reported.contains(&"stuck"));
             coverage.streams_losing_device += usize::from(lost);
 
             // Replay what Windows took, in order.
@@ -1534,9 +1636,11 @@ mod tests {
                 last_sample = id;
                 *taken.entry((id, kind)).or_default() += 1;
             };
-            // Nothing but an end may reach Windows `INPUT_STALE` after its
-            // sample arrived: native cancels and leaves end the pointer where
-            // Windows had it, and a mouse release may be owed for longer.
+            // Nothing but an end Windows is owed may reach it `INPUT_STALE`
+            // after its sample arrived: native cancels and leaves end the
+            // pointer where Windows had it, an up (and the move to where the
+            // Pencil lifted before it) ends a contact Windows holds, and a
+            // mouse release may be owed for longer.
             let fresh = |id: i32, at: Instant, what: &str| {
                 let age = at.saturating_duration_since(times[id as usize - 1]);
                 assert!(
@@ -1547,8 +1651,18 @@ mod tests {
             for seen in &output {
                 match *seen {
                     Seen::Native(phase, x, y, at) => {
-                        if !matches!(phase, PenPhase::Cancel | PenPhase::Leave) {
+                        let owed = match phase {
+                            PenPhase::Cancel | PenPhase::Leave => true,
+                            PenPhase::Up | PenPhase::Move => {
+                                samples[x as usize - 1].phase == PenPhase::Up && native == Some(y)
+                            }
+                            _ => false,
+                        };
+                        if !owed {
                             fresh(x, at, "native frame");
+                        } else if at.saturating_duration_since(times[x as usize - 1]) >= INPUT_STALE
+                        {
+                            coverage.late_owed_ends += 1;
                         }
                         if matches!(phase, PenPhase::Down | PenPhase::Move) {
                             assert_eq!(
@@ -1714,6 +1828,8 @@ mod tests {
         assert!(coverage.ups_checked > 10_000, "{coverage:#?}");
         assert!(coverage.streams_overflowed > 200, "{coverage:#?}");
         assert!(coverage.native_stale > 300, "{coverage:#?}");
+        assert!(coverage.streams_given_up > 40, "{coverage:#?}");
+        assert!(coverage.late_owed_ends > 50, "{coverage:#?}");
         assert!(coverage.streams_losing_device > 300, "{coverage:#?}");
         assert!(coverage.mouse_refused > 300, "{coverage:#?}");
         assert!(
@@ -1739,49 +1855,330 @@ mod tests {
         flush_one(&mut device, late);
         assert!(device.slot.api.frames.is_empty());
         assert!(device.slot.api.mouse.is_empty());
+        // The down went stale. The up stays, but Windows holds nothing for
+        // it to end, so it sends nothing and the device is kept.
         let dropped = device.contact.take_dropped();
         assert_eq!(
             dropped
                 .iter()
                 .map(|&(s, why)| (s.phase, why))
                 .collect::<Vec<_>>(),
-            [(PenPhase::Down, "stale"), (PenPhase::Up, "stale")]
+            [(PenPhase::Down, "stale")]
         );
-        // The pointer Windows may hold went with the old device, and the
-        // next tap starts cleanly on a new one.
-        assert_eq!(device.slot.api.destroyed, [1]);
+        assert!(device.slot.api.destroyed.is_empty());
+        // The next tap starts cleanly.
         assert!(send(&mut device, &[PenPhase::Down, PenPhase::Up], late).is_empty());
         assert_eq!(
             device.slot.api.frames,
-            [(2, PenPhase::Down), (2, PenPhase::Up)]
+            [(1, PenPhase::Down), (1, PenPhase::Up)]
         );
     }
 
     #[test]
-    fn taps_windows_was_never_ready_for_are_not_replayed_as_clicks() {
-        // Claude's case: taps ten seconds apart while Windows stays not
-        // ready. They must not fill the queue and come out as mouse clicks
-        // when the next tap overflows it.
+    fn taps_windows_is_never_ready_for_are_clicked_when_they_come() {
+        // Claude's case: taps ten seconds apart, on a 50 ms refresh tick,
+        // while Windows stays not ready and SendInput works. No tap may come
+        // out late, as an overflow once replayed old taps as clicks; once
+        // native input is found stuck, each tap is a click when it comes.
         let mut device = PenDevice::new(FakeApi::new(&[]));
         device.slot.api.answer = Outcome::NotReady;
         let start = Instant::now();
-        for tap in 0..5 {
+        let (mut clicks, mut dropped) = (Vec::new(), Vec::new());
+        for tap in 0..4 {
             let at = start + Duration::from_secs(10 * tap);
-            assert!(send(&mut device, &[PenPhase::Down, PenPhase::Up], at).is_empty());
+            let x = 100 + tap as i32;
+            deliver_one(&mut device, pen_xy(PenPhase::Down, x, 1), at);
+            deliver_one(&mut device, pen_xy(PenPhase::Up, x, 1), at);
+            let mut mouse = std::mem::take(&mut device.slot.api.mouse);
+            for tick in 1..=10 {
+                mouse.extend(tick_at(&mut device, at + Duration::from_millis(50 * tick)));
+            }
+            clicks.push(mouse);
+            dropped.extend(device.contact.take_dropped());
         }
-        // Each tap dropped the one before it, with a new device.
-        let dropped = device.contact.take_dropped();
-        assert_eq!(dropped.len(), 8);
-        assert!(dropped.iter().all(|&(_, why)| why == "stale"));
-        assert_eq!(device.slot.api.destroyed, [1, 2, 3, 4]);
-        // Windows becomes ready: only the last tap reaches it.
+        // The first tap only showed Windows to be slow, and went stale.
+        assert!(clicks[0].is_empty());
+        assert_eq!(
+            dropped
+                .iter()
+                .map(|&(s, why)| (s.phase, s.x, why))
+                .collect::<Vec<_>>(),
+            [(PenPhase::Down, 100, "stale")]
+        );
+        for (tap, mouse) in clicks.iter().enumerate().skip(1) {
+            let (x, y) = abs(100 + tap as i32, 1);
+            assert_eq!(
+                mouse,
+                &[
+                    Injection::MoveAbs { x, y },
+                    Injection::LeftDown { x, y },
+                    Injection::MoveAbs { x, y },
+                    Injection::LeftUp { x, y },
+                ],
+                "tap {tap}"
+            );
+        }
+        assert_eq!(device.slot.reported, ["stuck"]);
+    }
+
+    #[test]
+    fn strokes_reach_the_mouse_when_native_input_stays_not_ready() {
+        // Claude's case: Windows answers every native frame ERROR_NOT_READY
+        // while SendInput works, and ten half-second strokes come 0.7 s
+        // apart on a 16 ms refresh tick. Each stroke used to wait, expire
+        // and recreate the device, so nothing was drawn and nothing logged.
+        let mut device = PenDevice::new(FakeApi::new(&[]));
+        device.slot.api.answer = Outcome::NotReady;
+        let start = Instant::now();
+        let frame = Duration::from_millis(16);
+        let mut began = Vec::new();
+        for stroke in 1..=10 {
+            let begin = start + Duration::from_millis(1200) * (stroke - 1);
+            began.push((stroke as i32, begin));
+            let mut now = begin;
+            let mut x = 100;
+            deliver_one(&mut device, pen_xy(PenPhase::Down, x, stroke as i32), now);
+            while now < begin + Duration::from_millis(500) {
+                now += frame;
+                x += 1;
+                deliver_one(&mut device, pen_xy(PenPhase::Move, x, stroke as i32), now);
+            }
+            deliver_one(&mut device, pen_xy(PenPhase::Up, x, stroke as i32), now);
+            while now < begin + Duration::from_millis(1200) - frame {
+                now += frame;
+                flush_one(&mut device, now);
+            }
+        }
+        let pressed: Vec<u16> = device
+            .slot
+            .api
+            .mouse
+            .iter()
+            .filter_map(|input| match *input {
+                Injection::LeftDown { y, .. } => Some(y),
+                _ => None,
+            })
+            .collect();
+        // Every stroke starting two seconds after Windows first refused a
+        // frame is drawn on the mouse.
+        for (stroke, begin) in began {
+            if begin >= start + Duration::from_secs(2) {
+                assert!(
+                    pressed.contains(&abs(0, stroke).1),
+                    "stroke {stroke} was not drawn: {pressed:?}"
+                );
+            }
+        }
+        assert!(!device.slot.api.button);
+        assert_eq!(device.slot.reported, ["stuck"]);
+    }
+
+    #[test]
+    fn a_lift_windows_is_slow_to_take_still_lands_where_the_pencil_lifted() {
+        // Claude's case: a three-second native stroke, then Windows is not
+        // ready from the lift for 1.2 s. The up is owed to the contact
+        // Windows holds: it must not be dropped as stale or turned into a
+        // destroyed device, which ends the contact as cancelled, and an ink
+        // app may discard a cancelled stroke the user saw drawn.
+        let mut device = PenDevice::new(FakeApi::new(&[]));
+        let start = Instant::now();
+        let frame = Duration::from_millis(16);
+        let mut now = start;
+        deliver_one(&mut device, pen_xy(PenPhase::Down, 10, 1), now);
+        for x in 11..=197 {
+            now += frame;
+            deliver_one(&mut device, pen_xy(PenPhase::Move, x, 1), now);
+        }
+        device.slot.api.answer = Outcome::NotReady;
+        now += frame;
+        let lift = now;
+        deliver_one(&mut device, pen_xy(PenPhase::Up, 300, 1), lift);
+        while now < lift + Duration::from_millis(1200) {
+            now += frame;
+            flush_one(&mut device, now);
+        }
+        device.slot.api.answer = Outcome::Injected;
+        now += frame;
+        flush_one(&mut device, now);
+        // A move to where the Pencil lifted, then the up there.
+        assert_eq!(
+            device.slot.api.frames[device.slot.api.frames.len() - 2..],
+            [(1, PenPhase::Move), (1, PenPhase::Up)]
+        );
+        assert!(device.slot.api.destroyed.is_empty());
+        assert!(!device
+            .slot
+            .api
+            .frames
+            .iter()
+            .any(|&(_, phase)| phase == PenPhase::Cancel));
+        assert!(device.contact.take_dropped().is_empty());
+        assert!(device.slot.api.mouse.is_empty());
+    }
+
+    #[test]
+    fn a_stroke_behind_stale_samples_keeps_its_fresh_down() {
+        // Claude's case: Windows is not ready for a tap, nor for the next
+        // stroke's down, which arrives 68 ms before the tap goes stale.
+        // When Windows is ready again only the tap is dropped; the stroke
+        // starts then, not 70 ms later.
+        let mut device = PenDevice::new(FakeApi::new(&[]));
+        device.slot.api.answer = Outcome::NotReady;
+        let start = Instant::now();
+        deliver_one(&mut device, pen_xy(PenPhase::Down, 10, 1), start);
+        deliver_one(
+            &mut device,
+            pen_xy(PenPhase::Up, 10, 1),
+            start + Duration::from_millis(100),
+        );
+        let expiry = start + INPUT_STALE;
+        deliver_one(
+            &mut device,
+            pen_xy(PenPhase::Down, 20, 2),
+            expiry - Duration::from_millis(68),
+        );
         device.slot.api.answer = Outcome::Injected;
         device.slot.api.frames.clear();
-        assert!(tick_at(&mut device, start + Duration::from_millis(40_100)).is_empty());
+        flush_one(&mut device, expiry);
+        let dropped = device.contact.take_dropped();
         assert_eq!(
-            device.slot.api.frames,
-            [(5, PenPhase::Down), (5, PenPhase::Up)]
+            dropped
+                .iter()
+                .map(|&(s, why)| (s.phase, s.x, why))
+                .collect::<Vec<_>>(),
+            [(PenPhase::Down, 10, "stale")]
         );
+        assert_eq!(device.slot.api.frames, [(1, PenPhase::Down)]);
+        assert!(device.slot.api.destroyed.is_empty());
+    }
+
+    #[test]
+    fn mouse_fallback_draws_pen_strokes_where_the_pen_would() {
+        // Restored guard: the fallback's events, converted when sent, land
+        // on the pen's desktop pixel at the far corner of a monitor left of
+        // the primary, where the virtual screen starts at a negative x.
+        // SendInput resolves `origin + abs * span / 65536`.
+        let screen = VirtualScreen {
+            left: -2360,
+            top: 0,
+            width: 4920,
+            height: 1640,
+        };
+        let landing = |x: u16, y: u16| {
+            (
+                screen.left + (u64::from(x) * u64::from(screen.width) / 65_536) as i32,
+                screen.top + (u64::from(y) * u64::from(screen.height) / 65_536) as i32,
+            )
+        };
+        let mut device = PenDevice::new(FakeApi::new(&[false]));
+        device.slot.api.screen = screen;
+        let now = Instant::now();
+        for phase in [
+            PenPhase::Hover,
+            PenPhase::Down,
+            PenPhase::Move,
+            PenPhase::Up,
+        ] {
+            deliver_one(&mut device, pen_xy(phase, -2360, 1639), now);
+        }
+        let mouse = &device.slot.api.mouse;
+        let (x, y) = desktop_pixel_to_abs(-2360, 1639, screen);
+        assert_eq!(landing(x, y), (-2360, 1639));
+        assert_eq!(
+            mouse,
+            &[
+                Injection::MoveAbs { x, y },
+                Injection::MoveAbs { x, y },
+                Injection::LeftDown { x, y },
+                Injection::MoveAbs { x, y },
+                Injection::MoveAbs { x, y },
+                Injection::LeftUp { x, y },
+            ]
+        );
+    }
+
+    #[test]
+    fn random_strokes_reach_the_mouse_once_native_input_stays_not_ready() {
+        // Liveness: Windows takes native frames until a random moment, then
+        // answers every one ERROR_NOT_READY for good, while SendInput works.
+        // Strokes of random length and spacing, with hovers or refresh
+        // ticks between them every 16 ms: every stroke starting two seconds
+        // or more after Windows first refused a frame is drawn on the mouse.
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let frame = Duration::from_millis(16);
+        let mut checked = 0;
+        for stream in 0..300 {
+            let mut device = PenDevice::new(FakeApi::new(&[]));
+            let start = Instant::now();
+            let stuck_at = start + Duration::from_millis(rng.below(5000));
+            let mut now = start;
+            let mut refused_at = None;
+            let mut began = Vec::new();
+            let mut call = |device: &mut PenDevice<FakeApi>, sample: Option<Injection>, now| {
+                if now >= stuck_at {
+                    device.slot.api.answer = Outcome::NotReady;
+                }
+                let attempts = device.slot.api.frames.len();
+                match sample {
+                    Some(sample) => deliver_one(device, sample, now),
+                    None => flush_one(device, now),
+                }
+                if now >= stuck_at && device.slot.api.frames.len() > attempts {
+                    refused_at.get_or_insert(now);
+                }
+            };
+            for stroke in 1..=40 {
+                let hovering = rng.below(2) == 0;
+                for _ in 0..rng.below(100) {
+                    now += frame;
+                    let hover = hovering.then(|| pen_xy(PenPhase::Hover, 1000, 0));
+                    call(&mut device, hover, now);
+                }
+                if hovering {
+                    call(&mut device, Some(pen_xy(PenPhase::Leave, 1000, 0)), now);
+                }
+                began.push((stroke, now));
+                let mut x = 100;
+                call(&mut device, Some(pen_xy(PenPhase::Down, x, stroke)), now);
+                for _ in 0..rng.below(60) {
+                    now += frame;
+                    x += 1;
+                    call(&mut device, Some(pen_xy(PenPhase::Move, x, stroke)), now);
+                }
+                call(&mut device, Some(pen_xy(PenPhase::Up, x, stroke)), now);
+            }
+            // The refresh tick carries on after the last stroke.
+            for _ in 0..30 {
+                now += frame;
+                call(&mut device, None, now);
+            }
+            let pressed: std::collections::BTreeSet<u16> = device
+                .slot
+                .api
+                .mouse
+                .iter()
+                .filter_map(|input| match *input {
+                    Injection::LeftDown { y, .. } => Some(y),
+                    _ => None,
+                })
+                .collect();
+            let Some(refused_at) = refused_at else {
+                continue;
+            };
+            for &(stroke, begin) in &began {
+                if begin >= refused_at + Duration::from_secs(2) {
+                    checked += 1;
+                    assert!(
+                        pressed.contains(&abs(0, stroke).1),
+                        "stream {stream}: stroke {stroke} at {:?} not drawn, native stuck from {:?}",
+                        begin - start,
+                        refused_at - start
+                    );
+                }
+            }
+            assert_eq!(device.slot.reported, ["stuck"], "stream {stream}");
+        }
+        assert!(checked > 5000, "{checked}");
     }
 
     #[test]

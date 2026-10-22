@@ -86,7 +86,8 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   order. A stroke moves to the mouse fallback when native input cannot carry
   it: Windows rejects a down or up, or still rejects a fresh start, the pen
   device is lost, or Windows stays not ready for a whole queue of samples
-  (the device is then recreated to end its pointer). The waiting samples and
+  (the device is then recreated to end its pointer), or native input is
+  stuck (below). The waiting samples and
   the rest of that stroke follow it, pressing the mouse at the first. Native
   input resumes at the next pen down or hover once the mouse holds nothing.
   The fallback is an ordered queue for `SendInput`: input Windows refuses,
@@ -96,11 +97,20 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   display change while input waits moves it with the desktop. Native input
   waits until the mouse is idle.
 - Each sample is timed from when the host receives it, and keeps that time
-  in the native queue and on the mouse. Once the oldest waiting sample is a
-  second old, everything waiting on that path is dropped rather than drawn
-  late: natively, the pen device is recreated, which ends any pointer Windows
-  holds; on the mouse, a release stays owed while Windows holds the button.
-  The next sample starts a new stroke cleanly.
+  in the native queue and on the mouse. A down, move or hover that has waited
+  a second is dropped rather than drawn late; fresher samples behind it stay,
+  and a stroke whose down went starts at its next fresh sample. An end is
+  never dropped this way: an up Windows is owed goes where the Pencil lifted
+  once Windows takes it (or, if that is off the virtual screen after a
+  display change, ends the contact where Windows has it), and a mouse release
+  stays owed while Windows holds the button.
+- Native input is stuck when Windows has accepted no frame for a second and
+  ink is waiting. The host then recreates the pen device once; if the new
+  one accepts nothing within 200 ms, the waiting samples and the strokes that
+  follow go to the mouse, and the host logs it once. It tries a new device at
+  a later pen down or hover once the mouse is idle, at most once a second,
+  and gives that device 200 ms too. Recovery is logged when Windows accepts
+  a frame again. An up waiting alone never counts as stuck.
 - When a session ends or another takes over, the host drops pen samples
   Windows never received and ends only the pointer Windows holds, where it
   holds it. If that place is off the virtual screen after a display change,
@@ -116,9 +126,10 @@ USB remains the preferred drawing connection because Wi-Fi can lose samples.
   Drawing mode shows it as unavailable and sends no Pencil samples, and
   Pencil outside Drawing mode works as a mouse.
 - After `ERROR_NOT_READY`, that sample and any behind it wait in order, and
-  the next sample or refresh tick retries the same frame first; later
-  positions coalesce behind it. No other sample is dropped unless waiting
-  makes it stale, as above. Each waiting sample is mapped again
+  the next sample or refresh tick retries the same frame first, unless its
+  sample went stale; later positions coalesce behind it. No other sample is
+  dropped unless waiting makes it stale, as above. Each waiting sample is
+  mapped again
   from its normalised position when it is sent, so it lands on the display
   where it is at that moment.
 - A held contact remembers its normalised position. The refresh tick remaps it

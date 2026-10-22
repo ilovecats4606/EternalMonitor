@@ -1563,6 +1563,10 @@ mod tests {
         fn recreate(&mut self) {
             self.recreated += 1;
         }
+
+        fn give_up(&mut self) {
+            self.recreated += 1;
+        }
     }
 
     /// Send the relay's recorded pen batch the way `windows_inject.rs` does,
