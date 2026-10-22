@@ -56,13 +56,15 @@ enum MouseEvent {
 }
 
 /// A mouse event waiting for `SendInput`: where it goes on the desktop, so
-/// it is placed on the virtual screen current when it is sent, and when
-/// the host received the sample it came from.
+/// it is placed on the virtual screen current when it is sent, when the
+/// host received the sample it came from, and whether that sample was a
+/// down or move of a stroke still being drawn.
 #[derive(Debug, Clone, Copy)]
 struct Waiting {
     event: MouseEvent,
     at: (i32, i32),
     received: Instant,
+    ink: bool,
 }
 
 /// The mouse fallback: an ordered queue of input for `SendInput`, like the
@@ -361,6 +363,7 @@ impl<A: PenApi> PenDevice<A> {
                 event,
                 at,
                 received,
+                ink: want,
             }));
         self.pump(now);
     }
@@ -400,8 +403,10 @@ impl<A: PenApi> PenDevice<A> {
 
     /// Drop each waiting move or press whose sample arrived `INPUT_STALE`
     /// ago, as the native queue does, and plan the rest again: a stroke
-    /// whose press went is pressed at its next fresh move, and a release
-    /// stays only while it ends a press Windows holds or will hold. A kept
+    /// whose press went is pressed at its next fresh down or move, never at
+    /// the move placing an up, cancel or leave, so ending a stroke Windows
+    /// never saw pressed cannot click; a release stays only while it ends a
+    /// press Windows holds or will hold. A kept
     /// release goes where the pointer will be, though SendInput does not
     /// move it for one.
     fn expire_mouse(&mut self, now: Instant) {
@@ -426,7 +431,7 @@ impl<A: PenApi> PenDevice<A> {
                 MouseEvent::Move => {
                     at = waiting.at;
                     kept.push_back(waiting);
-                    if std::mem::take(&mut press_owed) {
+                    if std::mem::take(&mut press_owed) && waiting.ink {
                         kept.push_back(Waiting {
                             event: MouseEvent::Press,
                             ..waiting
@@ -475,6 +480,7 @@ impl<A: PenApi> PenDevice<A> {
                 event: MouseEvent::Release,
                 at: self.mouse.at,
                 received: now,
+                ink: false,
             });
         }
     }
@@ -1720,6 +1726,13 @@ mod tests {
                     }
                     Seen::Mouse(Injection::LeftDown { x, y }, true, at) => {
                         fresh(pixel_x[&x], at, "mouse press");
+                        // Only a down or move draws: ending a stroke whose
+                        // press never reached Windows must not click.
+                        let phase = samples[pixel_x[&x] as usize - 1].phase;
+                        assert!(
+                            matches!(phase, PenPhase::Down | PenPhase::Move),
+                            "stream {stream}: mouse press for a {phase:?}: {output:?}"
+                        );
                         assert_eq!(
                             mouse, None,
                             "stream {stream}: mouse pressed twice: {output:?}"
@@ -2265,6 +2278,79 @@ mod tests {
         deliver_one(&mut device, pen_xy(PenPhase::Leave, x, 1), now);
         deliver_one(&mut device, pen_xy(PenPhase::Hover, x, 1), now);
         assert_eq!(device.slot.api.created, 3);
+    }
+
+    #[test]
+    fn a_stroke_cancelled_before_its_press_reached_windows_never_clicks() {
+        // Sol's case: SendInput refuses a stroke's press, the stroke is
+        // cancelled 990 ms later, and input works again at 1010 ms, when
+        // the press has gone stale. Re-creating it at the cancel's place
+        // would click whatever window is there now.
+        let mut device = PenDevice::new(FakeApi::new(&[false]));
+        let start = Instant::now();
+        device.slot.api.mouse_limit = 0;
+        deliver_one(&mut device, pen_xy(PenPhase::Down, 10, 1), start);
+        let cancel = start + Duration::from_millis(990);
+        deliver_one(&mut device, pen_xy(PenPhase::Cancel, 10, 1), cancel);
+        device.slot.api.mouse_limit = usize::MAX;
+        let mouse = tick_at(&mut device, start + Duration::from_millis(1010));
+        assert!(
+            !mouse.iter().any(|input| matches!(
+                input,
+                Injection::LeftDown { .. } | Injection::LeftUp { .. }
+            )),
+            "{mouse:?}"
+        );
+        assert!(!device.slot.api.button);
+    }
+
+    #[test]
+    fn a_lift_after_a_stale_press_moves_without_clicking() {
+        // As above with the Pencil lifting at 990 ms, somewhere else: the up
+        // is fresh, but its stroke was never pressed, so the pointer goes
+        // to the lift with no button event.
+        let mut device = PenDevice::new(FakeApi::new(&[false]));
+        let start = Instant::now();
+        device.slot.api.mouse_limit = 0;
+        deliver_one(&mut device, pen_xy(PenPhase::Down, 10, 1), start);
+        let lift = start + Duration::from_millis(990);
+        deliver_one(&mut device, pen_xy(PenPhase::Up, 20, 1), lift);
+        device.slot.api.mouse_limit = usize::MAX;
+        let (x, y) = abs(20, 1);
+        assert_eq!(
+            tick_at(&mut device, start + Duration::from_millis(1010)),
+            [Injection::MoveAbs { x, y }]
+        );
+        assert!(!device.slot.api.button);
+    }
+
+    #[test]
+    fn a_stroke_that_carries_on_after_a_stale_press_is_pressed_again() {
+        // The press goes stale but the stroke goes on: its fresh move is
+        // pressed, so the rest of the stroke draws and is released.
+        let mut device = PenDevice::new(FakeApi::new(&[false]));
+        let start = Instant::now();
+        device.slot.api.mouse_limit = 0;
+        deliver_one(&mut device, pen_xy(PenPhase::Down, 10, 1), start);
+        let moved = start + Duration::from_millis(990);
+        deliver_one(&mut device, pen_xy(PenPhase::Move, 15, 1), moved);
+        device.slot.api.mouse_limit = usize::MAX;
+        let recovered = start + Duration::from_millis(1010);
+        let mut mouse = tick_at(&mut device, recovered);
+        deliver_one(&mut device, pen_xy(PenPhase::Up, 20, 1), recovered);
+        mouse.extend(std::mem::take(&mut device.slot.api.mouse));
+        let (x15, y15) = abs(15, 1);
+        let (x20, y20) = abs(20, 1);
+        assert_eq!(
+            mouse,
+            [
+                Injection::MoveAbs { x: x15, y: y15 },
+                Injection::LeftDown { x: x15, y: y15 },
+                Injection::MoveAbs { x: x20, y: y20 },
+                Injection::LeftUp { x: x20, y: y20 },
+            ]
+        );
+        assert!(!device.slot.api.button);
     }
 
     #[test]
