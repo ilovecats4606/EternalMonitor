@@ -426,12 +426,29 @@ fn native_detail(record: record::Record, module: Option<(&str, u64)>) -> String 
     )
 }
 
+/// Which builds obey [`SIMULATE_ENV`]: debug builds and builds with the
+/// `fault-injection` feature. A function of the two flags, so a debug test
+/// can check the release combination too.
+const fn simulation_allowed(debug_assertions: bool, fault_injection: bool) -> bool {
+    debug_assertions || fault_injection
+}
+
+/// Decided at compile time; a release build drops the read below.
+const SIMULATION_ALLOWED: bool =
+    simulation_allowed(cfg!(debug_assertions), cfg!(feature = "fault-injection"));
+
+/// The requested simulation, or nothing where this build does not allow one.
+fn simulation_value(allowed: bool, requested: impl FnOnce() -> Option<String>) -> String {
+    if allowed {
+        requested().unwrap_or_default()
+    } else {
+        String::new()
+    }
+}
+
 /// The value of [`SIMULATE_ENV`], in builds that may simulate failures.
 fn simulation_requested() -> String {
-    #[cfg(any(debug_assertions, feature = "fault-injection"))]
-    return std::env::var(SIMULATE_ENV).unwrap_or_default();
-    #[cfg(not(any(debug_assertions, feature = "fault-injection")))]
-    String::new()
+    simulation_value(SIMULATION_ALLOWED, || std::env::var(SIMULATE_ENV).ok())
 }
 
 fn simulated() -> String {
@@ -810,6 +827,27 @@ mod tests {
             |_, _| steps.borrow_mut().push("message"),
         );
         assert_eq!(*steps.borrow(), ["virtual display off"]);
+    }
+
+    #[test]
+    fn only_debug_and_fault_injection_builds_read_the_simulation_request() {
+        // A release build: no debug assertions, no feature.
+        assert!(!simulation_allowed(false, false));
+        assert!(simulation_allowed(true, false));
+        assert!(simulation_allowed(false, true));
+        assert!(simulation_allowed(true, true));
+        assert_eq!(
+            SIMULATION_ALLOWED,
+            cfg!(debug_assertions) || cfg!(feature = "fault-injection")
+        );
+        // Not allowed: the variable is not even read.
+        let requested = || -> Option<String> { panic!("read in a build that ignores it") };
+        assert_eq!(simulation_value(false, requested), "");
+        assert_eq!(
+            simulation_value(true, || Some("error-quiet".into())),
+            "error-quiet"
+        );
+        assert_eq!(simulation_value(true, || None), "");
     }
 
     /// `cargo test --release` runs this; other builds may simulate.
