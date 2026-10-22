@@ -333,7 +333,7 @@ impl PenContact {
         let mut restarted = false;
         loop {
             let mut rejected = false;
-            for frame in self.plan(sample) {
+            for frame in self.plan(sample).into_iter().flatten() {
                 if !target.available() {
                     return Brought::Abandoned;
                 }
@@ -396,8 +396,10 @@ impl PenContact {
         outcome
     }
 
-    /// The frames that take Windows from its current state to `sample`'s.
-    fn plan(&self, sample: PenSample) -> Vec<PenSample> {
+    /// The frames, at most two, that take Windows from its current state to
+    /// `sample`'s. A fixed array keeps the per-sample path free of
+    /// allocation.
+    fn plan(&self, sample: PenSample) -> [Option<PenSample>; 2] {
         let at = |phase, pressure, from: PenSample| PenSample {
             phase,
             pressure,
@@ -407,26 +409,35 @@ impl PenContact {
             // A new contact or hover while one is held: end the old one where
             // Windows last saw it.
             (PenPhase::Down | PenPhase::Hover, PointerState::Contact(last)) => {
-                vec![at(PenPhase::Cancel, 0, last), sample]
+                [Some(at(PenPhase::Cancel, 0, last)), Some(sample)]
             }
-            (PenPhase::Down | PenPhase::Hover, _) => vec![sample],
-            (PenPhase::Move, PointerState::Contact(_)) => vec![sample],
+            (PenPhase::Down | PenPhase::Hover, _) => [Some(sample), None],
+            (PenPhase::Move, PointerState::Contact(_)) => [Some(sample), None],
             // No contact to update (it was cancelled or never started):
             // start one here.
-            (PenPhase::Move, _) => vec![at(PenPhase::Down, sample.pressure, sample)],
+            (PenPhase::Move, _) => [Some(at(PenPhase::Down, sample.pressure, sample)), None],
             (PenPhase::Up, PointerState::Contact(last)) => {
                 if (last.x, last.y) == (sample.x, sample.y) {
-                    vec![sample]
+                    [Some(sample), None]
                 } else {
                     // Windows requires UP at the last updated position.
-                    vec![at(PenPhase::Move, last.pressure, sample), sample]
+                    [
+                        Some(at(PenPhase::Move, last.pressure, sample)),
+                        Some(sample),
+                    ]
                 }
             }
-            (PenPhase::Cancel, PointerState::Contact(last)) => vec![at(PenPhase::Cancel, 0, last)],
-            (PenPhase::Leave, PointerState::Hover(last)) => vec![at(PenPhase::Leave, 0, last)],
-            (PenPhase::Leave, PointerState::Contact(last)) => vec![at(PenPhase::Cancel, 0, last)],
+            (PenPhase::Cancel, PointerState::Contact(last)) => {
+                [Some(at(PenPhase::Cancel, 0, last)), None]
+            }
+            (PenPhase::Leave, PointerState::Hover(last)) => {
+                [Some(at(PenPhase::Leave, 0, last)), None]
+            }
+            (PenPhase::Leave, PointerState::Contact(last)) => {
+                [Some(at(PenPhase::Cancel, 0, last)), None]
+            }
             // Nothing is in contact or in range: there is nothing to end.
-            (PenPhase::Up | PenPhase::Cancel | PenPhase::Leave, _) => Vec::new(),
+            (PenPhase::Up | PenPhase::Cancel | PenPhase::Leave, _) => [None, None],
         }
     }
 }
