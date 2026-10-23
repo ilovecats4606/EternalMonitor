@@ -7,7 +7,8 @@
   the SHA-256 published with the release, installs it with only the Windows
   permission prompt and a progress window, and restarts EternalMonitor. If an
   iPad is streaming, the update waits until streaming stops. If anything fails,
-  the current version keeps running and the banner links to the website.
+  the current version keeps running and the banner links to the website. In a
+  copy Setup did not install, **Update now** opens the download page instead.
 - Windows Settings has **Check for updates automatically** and **Check now**.
   **Later** hides the banner for that version for a day.
 - The iPad connect screen and Settings say when a newer build is ready in

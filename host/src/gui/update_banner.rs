@@ -39,7 +39,11 @@ impl AnalyzerApp {
                 ACCENT,
                 Icon::Download,
                 &format!("EternalMonitor {version} is available"),
-                "Windows will ask for permission, then EternalMonitor restarts. Update the iPad app in TestFlight too.",
+                if self.updates.installs_in_place() {
+                    "Windows will ask for permission, then EternalMonitor restarts. Update the iPad app in TestFlight too."
+                } else {
+                    "Update now opens the download page. Install the new version, then open EternalMonitor again. Update the iPad app in TestFlight too."
+                },
                 190.0,
                 |ui| {
                     if widgets::button(ui, Tone::Ghost, None, "Later").clicked() {

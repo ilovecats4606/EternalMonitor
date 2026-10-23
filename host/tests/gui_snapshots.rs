@@ -285,6 +285,12 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     harness.get_by_label("Version 99.0.0 is ready to install.");
     nav(&mut harness, "Stream");
     harness.get_by_label("EternalMonitor 99.0.0 is available");
+    // Setup did not install this test binary, so Update now only opens the
+    // download page.
+    harness.get_by_label_contains("Update now opens the download page.");
+    assert!(harness
+        .query_by_label_contains("EternalMonitor restarts")
+        .is_none());
     harness.get_by_role_and_label(Role::Button, "Update now");
     snapshot(&mut harness, &shared, "update-banner");
     harness.get_by_label("Later").click();
