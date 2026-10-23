@@ -3,6 +3,25 @@
   'use strict';
 
   var reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var CACHE_TTL = 6 * 3600000;
+  // A cache entry counts only with a finite timestamp from the last six hours;
+  // anything else (missing, malformed, in the future) is a miss.
+  var isFresh = function (at) {
+    if (typeof at !== 'number' || !isFinite(at)) return false;
+    var age = Date.now() - at;
+    return age >= 0 && age <= CACHE_TTL;
+  };
+  // True when version a (e.g. "v0.3.10") is strictly newer than b, compared
+  // number by number; unparseable versions are never newer.
+  var isNewer = function (a, b) {
+    var pa = String(a).replace(/^v/, '').split('.'), pb = String(b).replace(/^v/, '').split('.');
+    if (!pa.every(function (x) { return /^\d+$/.test(x); }) || !pb.every(function (x) { return /^\d+$/.test(x); })) return false;
+    for (var i = 0; i < Math.max(pa.length, pb.length); i++) {
+      var x = parseInt(pa[i] || '0', 10), y = parseInt(pb[i] || '0', 10);
+      if (x !== y) return x > y;
+    }
+    return false;
+  };
   var REPO = 'sidebandstudio/EternalMonitor';
   var FEEDBACK_TO = 'hello@sideband.studio';
 
@@ -124,7 +143,6 @@
   var starEls = document.querySelectorAll('[data-stars]');
   if (starEls.length) {
     var STARS_KEY = 'gh-stars-v2';
-    var STARS_TTL = 6 * 3600000;
     var isCount = function (text) { return typeof text === 'string' && /^\d+(\.\d+)?[kKmM]?$/.test(text); };
     var SVG = 'http://www.w3.org/2000/svg';
     var goldStar = function () {
@@ -157,7 +175,7 @@
     };
     var cached = null;
     try { cached = JSON.parse(localStorage.getItem(STARS_KEY) || 'null'); } catch (e) {}
-    if (cached && isCount(cached.text) && Date.now() - cached.at < STARS_TTL) {
+    if (cached && isCount(cached.text) && isFresh(cached.at)) {
       showStars(cached.text);
     } else {
       var fromShields = function () {
@@ -325,12 +343,12 @@
             (ipad.version ? ' · iPad v' + ipad.version + (ipad.build ? ', TestFlight build ' + ipad.build : '') : ''));
         }
         // The HTML already shows the installer size for its own version, so
-        // GitHub is only asked when latest.json names a newer one, and the
-        // answer is kept for six hours.
-        if (tag === htmlTag || !metaEl) return;
+        // GitHub is only asked when latest.json names a strictly newer one,
+        // and the answer is kept for six hours.
+        if (!metaEl || !isNewer(tag, htmlTag)) return;
         var sizeKey = 'gh-setup-size-' + tag, hit = null;
         try { hit = JSON.parse(localStorage.getItem(sizeKey) || 'null'); } catch (e) {}
-        if (hit && typeof hit.size === 'number' && Date.now() - hit.at < 6 * 3600000) {
+        if (hit && typeof hit.size === 'number' && isFinite(hit.size) && isFresh(hit.at)) {
           metaEl.textContent = 'EternalMonitor-Setup.exe · ' + formatBytes(hit.size);
           return;
         }
