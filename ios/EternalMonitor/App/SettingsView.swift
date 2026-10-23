@@ -42,10 +42,22 @@ struct SettingsView: View {
                         Toggle(isOn: $settings.keepScreenAwake) {
                             rowLabel("Keep screen awake", "sun.max")
                         }
+
+                        // A menu, like Frame rate: a segmented control in a
+                        // scrolling list takes a flick that starts on it as a tap.
+                        Picker(selection: $settings.pictureFit) {
+                            Text("Fit").tag(PictureFit.fit)
+                            Text("Fill").tag(PictureFit.fill)
+                        } label: {
+                            rowLabel("Picture", "aspectratio")
+                        }
+                        .accessibilityIdentifier("settings.pictureFit")
+                        .accessibilityValue(settings.pictureFit == .fit ? "Fit" : "Fill")
                     } header: {
                         sectionHeader("Streaming")
                     } footer: {
-                        footnote("Frame rate applies from the next connection. Tap the picture to show or hide the controls.")
+                        footnote("Frame rate applies from the next connection. Tap the picture to show or hide the controls. "
+                            + "Fill uses the whole iPad screen and trims the edges of the PC picture that don't fit.")
                     }
                     .listRowBackground(Theme.surfaceRaised)
 

@@ -8,6 +8,9 @@ an iPad on 0.3.1 still works with the Windows changes.
 - Apple Pencil lands under the tip when another monitor sits left of or above
   the main display, a cancelled stroke resumes instead of dropping, and Pencil
   works as a mouse if Windows cannot create its pen device.
+- The iPad can fill its whole screen: choose **Picture: Fill** in Settings or
+  tap the arrows next to the settings button. Fill trims the edges of the PC
+  picture that don't fit; **Fit** still shows all of it, with bars.
 - Plain-language messages in both apps say what happened and what to do, with
   **Try again**, **Search again** or **Open Settings**. The iPad looks for PCs
   as soon as it opens and spots a pairing code or router address typed as the
