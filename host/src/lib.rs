@@ -5,6 +5,7 @@ pub mod audio;
 pub mod autostart;
 pub mod capture;
 pub mod clock;
+pub mod console;
 pub mod control;
 pub mod diagnostics;
 pub mod discovery;
