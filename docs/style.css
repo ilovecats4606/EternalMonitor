@@ -361,7 +361,6 @@ small { font-size: 0.875rem; }
   .shot-pc { width: 88%; }
   /* PC block: 64px + 88% / 2.08; the iPad starts 30% of the width down. */
   .shot-ipad { width: 62%; margin-top: calc(-12.3% - 64px); }
-  .shot-label { font-size: 0.75rem; }
 }
 
 /* --- How it works: the connection clip beside the steps --------------------- */
@@ -457,13 +456,13 @@ small { font-size: 0.875rem; }
   grid-template-columns: 1fr 1fr;
   gap: 16px;
   align-items: end;
+}
 /* A Windows dialog on its own: the crop follows its rounded edge. */
 .dialog-shot img {
   width: 100%;
   border-radius: 3.7% / 2.7%;
   border: 1px solid var(--border-strong);
   box-shadow: 0 24px 60px -24px rgba(0, 0, 0, 0.85);
-}
 }
 
 @media (max-width: 860px) {
@@ -999,6 +998,18 @@ html.js .reveal {
   transition: opacity 0.6s var(--ease-out), transform 0.7s var(--ease-out);
 }
 html.js .reveal.visible { opacity: 1; transform: none; }
+
+/* --- Phones: type floors ---------------------------------------------------
+   Reading text at least 15px, short labels at least 14px, code 13–14px. */
+@media (max-width: 720px) {
+  .caption, .fact .d, .hero-meta, .footer, .status-line, .chip span, .toc,
+  .mac-notice, .field label, .field legend, .dl-meta, .nav-link { font-size: 0.9375rem; }
+  .shot-label, .kicker, .btn-sm, .clip-controls .btn, .badge, .sha-label,
+  .sha .btn-sm, .toc h2 { font-size: 0.875rem; }
+  .nav-link .count, .btn .count, .pc-titlebar, .sha code { font-size: 0.8125rem; }
+  .fallback pre, .source-body pre { font-size: 0.875rem; }
+  pre code { font-size: 1em; }
+}
 
 @media (prefers-reduced-motion: reduce) {
   html.js .reveal { opacity: 1; transform: none; transition: none; }
