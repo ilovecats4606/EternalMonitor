@@ -90,8 +90,9 @@ Your PC's screen now appears on the iPad. On the PC, the top of the window
 says **Streaming to** followed by your iPad's name.
 
 If Windows shows a **Windows Security Alert** about EternalMonitor, tick
-**Private networks** and click **Allow access**. The installer normally sets
-this up for you.
+**Private networks** and click **Allow access**. On Windows 11 the prompt is
+titled **Windows Security** and offers **Allow** and **Cancel**: click
+**Allow**. The installer normally sets this up for you.
 
 ## Step 4: Connect with a USB cable (optional)
 
@@ -288,6 +289,7 @@ try fewer words. If your problem isn't here, see [Known issues](https://eternalm
 | --- | --- | --- |
 | **Windows protected your PC** when installing | The installer isn't code-signed yet. | Click **More info**, then **Run anyway**, for a file you downloaded from eternalmonitor.dev. |
 | **Windows Security Alert** about EternalMonitor | Windows Firewall is asking whether EternalMonitor may use the network. | Tick **Private networks** and click **Allow access**. |
+| **Windows Security** with **Allow** and **Cancel**, about EternalMonitor (Windows 11) | Windows 11's firewall is asking whether EternalMonitor may use the network. | Click **Allow**. If you clicked **Cancel** and the iPad can't find the PC, run EternalMonitor-Setup.exe again. |
 | The iPad never connects over USB | Usually Apple Devices is closed, the iPad isn't trusted, or the cable only charges. Apple Devices also needs Windows 10 version 22H2 (build 19045) or Windows 11. | Open Apple Devices on the PC and leave it open. Unlock the iPad, tap **Trust**, and try another cable. Then unplug and plug in again. |
 | The picture stutters or freezes on Wi-Fi | The Wi-Fi is losing data or is too slow. | Move closer to the router or use a 5 GHz network. Connect the PC to the router with a network cable, or use USB. |
 | The second screen is small and blurry | Windows started it at a low resolution. | See [Known issues](https://eternalmonitor.dev/known-issues.html#second-screen-small). |

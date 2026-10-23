@@ -46,7 +46,9 @@ https://testflight.apple.com/join/ppc9QfXc
    Scanning the QR code skips it.
 
 If Windows asks about EternalMonitor in a Windows Security Alert, tick
-Private networks and click Allow access.
+Private networks and click Allow access. On Windows 11 the prompt is called
+Windows Security, with Allow and Cancel: click Allow. If you clicked Cancel
+and the iPad can't find the PC, run EternalMonitor-Setup.exe again.
 
 3. Connect with a USB cable (optional)
 --------------------------------------
