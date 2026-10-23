@@ -287,12 +287,12 @@ small { font-size: 0.875rem; }
 
 /* --- Hero ------------------------------------------------------------------ */
 
-.hero { padding: clamp(56px, 9vw, 112px) 0 0; }
-.hero-text { max-width: 820px; margin-inline: auto; text-align: center; }
-.hero-text h1 { margin-inline: auto; }
+.hero { padding: clamp(40px, 5vw, 64px) 0 0; }
+.hero-text { max-width: 860px; margin-inline: auto; text-align: center; }
+.hero-text h1 { margin-inline: auto; font-size: clamp(2.5rem, 1rem + 3.6vw, 3.6rem); }
 .hero-text .lead {
-  max-width: 600px;
-  margin: 24px auto 0;
+  max-width: 660px;
+  margin: 18px auto 0;
   font-size: clamp(1.0625rem, 0.95rem + 0.5vw, 1.25rem);
   line-height: 1.55;
   color: var(--muted);
@@ -302,21 +302,38 @@ small { font-size: 0.875rem; }
   flex-wrap: wrap;
   justify-content: center;
   gap: 12px;
-  margin-top: 32px;
+  margin-top: 26px;
 }
 .hero-meta {
   display: flex;
   flex-wrap: wrap;
   justify-content: center;
   gap: 8px 20px;
-  margin-top: 20px;
+  margin-top: 16px;
   font-size: 0.875rem;
   color: var(--faint);
 }
 
+/* Wide screens: headline left, the rest right, so the film starts high
+   enough to show most of the real apps in the first screen. */
+@media (min-width: 960px) {
+  .hero-text {
+    max-width: none;
+    display: grid;
+    grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+    column-gap: 64px;
+    align-items: end;
+    text-align: left;
+  }
+  .hero-text h1 { grid-row: 1 / span 3; margin: 0; }
+  .hero-text .lead { max-width: none; margin: 0; font-size: 1.125rem; }
+  .hero-actions, .hero-meta { justify-content: flex-start; }
+  .hero-actions { margin-top: 22px; }
+}
+
 /* --- Film ------------------------------------------------------------------ */
 
-.film { margin-top: clamp(40px, 6vw, 72px); }
+.film { margin-top: clamp(32px, 3.5vw, 44px); }
 .film-stage { position: relative; }
 .film-frame {
   position: relative;
