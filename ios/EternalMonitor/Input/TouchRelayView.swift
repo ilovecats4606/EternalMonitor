@@ -54,7 +54,7 @@ final class RelayTouchUIView: UIView {
     }
     /// Must match the renderer's mode so a touch lands under the finger.
     var pictureFit: PictureFit = .fit {
-        didSet { if oldValue != pictureFit && pencil.isDown { cancelInput() } }
+        didSet { if oldValue != pictureFit { pictureMoved() } }
     }
 
     private var machine = TouchRelayMachine()
@@ -158,9 +158,9 @@ final class RelayTouchUIView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        // Rotation changes the mapping under a held tip. Release before a
-        // subsequent sample could draw a line across the newly fitted image.
-        if inputBounds != bounds.size && pencil.isDown { cancelInput() }
+        // Rotation changes the mapping under every held contact. Release
+        // before a later sample could click or draw across the new picture.
+        if inputBounds != bounds.size { pictureMoved() }
         inputBounds = bounds.size
     }
 
@@ -225,6 +225,21 @@ final class RelayTouchUIView: UIView {
         machine = TouchRelayMachine()
         machine.videoPixelSize = videoSize
         keyboardInput.updateSticky(keyboard.sticky)
+    }
+
+    /// The picture moved under the contacts: Fit or Fill changed, or the iPad
+    /// rotated. End every gesture where it was, as a three-finger tap does:
+    /// a pending tap never clicks, a held button is cancelled at the last
+    /// point sent, and fingers still down are ignored until they all lift.
+    /// Keys stay held; they don't depend on the picture.
+    private func pictureMoved() {
+        holdTimer?.cancel()
+        holdTimer = nil
+        onEvents?(pointer.ended(at: nil) + pencil.cancel())
+        pencilTouch = nil
+        run(machine.threeFingerTap(timeUs: ControlChannel.clientNowUs()).filter {
+            if case .toggleHUD = $0 { return false }; return true
+        })
     }
 
     private func modifierBits(_ flags: UIKeyModifierFlags) -> UInt8 {
