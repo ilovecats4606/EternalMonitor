@@ -186,8 +186,8 @@ pub(crate) mod tests {
         assert_eq!(quote_arg("--failure-reporter"), "--failure-reporter");
         assert_eq!(quote_arg(""), "\"\"");
         assert_eq!(
-            quote_arg(r"C:\Users\Ali Younes\AppData\Roaming\EternalMonitor\crash"),
-            r#""C:\Users\Ali Younes\AppData\Roaming\EternalMonitor\crash""#
+            quote_arg(r"C:\Users\Example User\AppData\Roaming\EternalMonitor\crash"),
+            r#""C:\Users\Example User\AppData\Roaming\EternalMonitor\crash""#
         );
         // A trailing backslash must not escape the closing quote.
         assert_eq!(quote_arg(r"C:\a b\"), r#""C:\a b\\""#);

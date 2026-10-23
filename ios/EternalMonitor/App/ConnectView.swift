@@ -15,6 +15,7 @@ struct ConnectView: View {
     @State private var didPrefillFromLastHost = false
     @State private var showQRScanner = false
     @State private var showDetails = false
+    @State private var feedbackRequest: FeedbackRequest?
     @AppStorage("didSeeOnboarding") private var didSeeOnboarding = false
     @FocusState private var focusedField: Field?
     @Environment(\.horizontalSizeClass) private var sizeClass
@@ -69,6 +70,15 @@ struct ConnectView: View {
                                 problemBanner(problem)
                             } else if let error = connectionManager.connectionError {
                                 errorBanner(error)
+                            } else if !isConnecting
+                                        && connectionManager.feedbackAsk.due(streaming: connectionManager.state == .connected) {
+                                FeedbackAskCard(
+                                    send: {
+                                        withAnimation(Motion.fade) { connectionManager.finishFeedbackAsk() }
+                                        startFeedback(.general)
+                                    },
+                                    notNow: { withAnimation(Motion.fade) { connectionManager.finishFeedbackAsk() } }
+                                )
                             }
 
                             if isConnecting {
@@ -135,6 +145,7 @@ struct ConnectView: View {
             .sheet(isPresented: $showSettings) {
                 SettingsView()
             }
+            .feedbackSheet($feedbackRequest)
             .sheet(isPresented: $showQRScanner) {
                 QRScannerView(
                     onScan: { value in
@@ -148,6 +159,7 @@ struct ConnectView: View {
                 appeared = true
                 #if DEBUG
                 if UIPreview.opensSettings { showSettings = true }
+                if UIPreview.opensFeedback { startFeedback(.general) }
                 #endif
                 if !didPrefillFromLastHost && hostIP.isEmpty && !settings.lastHost.isEmpty {
                     hostIP = settings.lastHost
@@ -299,6 +311,18 @@ struct ConnectView: View {
                     }
                     .padding(.top, 4)
                 }
+                if problem.canReport {
+                    Button {
+                        startFeedback(.problem(problem.title))
+                    } label: {
+                        Label("Report this problem", systemImage: "envelope")
+                            .font(.app(13.5, .medium, relativeTo: .footnote))
+                            .foregroundStyle(Theme.accent)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.top, 4)
+                    .accessibilityIdentifier("connect.reportProblem")
+                }
             }
 
             Spacer(minLength: 0)
@@ -316,6 +340,12 @@ struct ConnectView: View {
         .accessibilityElement(children: .contain)
         .card(padding: 16, tint: Theme.warning)
         .transition(.opacity.combined(with: .move(edge: .top)))
+    }
+
+    /// Mail with the details and diagnostics, or the copy sheet.
+    private func startFeedback(_ kind: Feedback.Kind) {
+        let context = connectionManager.feedbackContext
+        Task { feedbackRequest = await FeedbackRequest.make(kind, context: context) }
     }
 
     private func openAppSettings() {

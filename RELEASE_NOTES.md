@@ -22,11 +22,14 @@ an iPad on 0.3.1 still works with the Windows changes.
   iPad app is out of date.
 - The PC window opens on graphics drivers that crashed 0.3.1 at startup. If
   the host can't start or stops unexpectedly, it names the error and log file,
-  and a helper process reports the crash and turns the second screen off.
-  Opening EternalMonitor again brings the running window to the front.
+  and a helper process reports the crash and tries to turn the second screen
+  off. Opening EternalMonitor again brings the running window to the front.
+- EternalMonitor no longer opens a black console window next to the app.
 - A USB connection stays up when the stream restarts. Capture blocked by the
   lock screen or a display change retries by itself. A hung or missing display
-  task no longer stalls the stream or leaves the second screen behind at quit.
+  task no longer stalls the stream. At quit, EternalMonitor tries to turn the
+  second screen off even while Windows' display task is slow, and if it can't,
+  a helper process tries again.
 - PC audio starts cleanly and survives a large packet. With no iPad connected
   the PC no longer encodes its screen.
 - The installer allows display traffic on work or school networks and names
@@ -34,6 +37,12 @@ an iPad on 0.3.1 still works with the Windows changes.
   stream controls stay until you hide them.
 - Logs collapse repeated lines and keep their last lines at quit. A Known
   issues page and the setup guide's tables list every message and what to do.
+- **Send feedback** in both apps writes an email to the studio with the app
+  versions and setup filled in; nothing is sent until you press Send. The iPad
+  attaches its Diagnostics report, which you can remove, and problem cards
+  offer **Report this problem**. Without an email app, **Copy message** works
+  instead. After a few long sessions each app asks once how it's going, and
+  the PC sidebar has a small card for starring EternalMonitor on GitHub.
 
 ### What to test
 
@@ -41,13 +50,18 @@ On a PC where 0.3.1 closed right after opening, install this build: the window
 should appear, or a message should name the error and log file. Send that file
 with the time.
 
-Install 0.3.1 on Windows, click **Update now** when the banner appears, approve
-the prompt, and check that 0.3.2 opens. Try once while streaming, with
+On a PC with 0.3.1, download the 0.3.2 installer and run it over 0.3.1;
+0.3.1's banner only offers **View release**. From 0.3.2 on, **Update now**
+installs a later build in place: once one is out, click it, approve the
+prompt, and check that the new version opens, once while streaming with
 **Stop and update**. On the iPad, tap **Open TestFlight** from the banner.
 
 With a second monitor left of the main display, touch each corner of the iPad
 picture with Apple Pencil; the pointer should be under the tip. Repeat with the
 extended iPad display and with 125% scaling.
+
+Tap **Send feedback** in Settings on the iPad and click it in the PC's sidebar:
+check the email it writes, and tell us what you think while you're there.
 
 ## EternalMonitor v0.3.1
 

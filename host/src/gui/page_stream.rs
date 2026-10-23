@@ -22,6 +22,7 @@ impl AnalyzerApp {
     ) {
         self.notices(ui, snap);
         self.ipad_update_notice(ui, client);
+        self.feedback_ask_card(ui, client);
         self.status_header(ui, snap, client);
         ui.add_space(GAP - 10.0);
         let wide = ui.available_width() >= 640.0;
