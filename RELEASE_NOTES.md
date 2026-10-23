@@ -42,7 +42,8 @@ Windows changes.
   permission prompt and a progress window, and restarts EternalMonitor. If an
   iPad is streaming, the update waits until streaming stops, or until you
   click **Stop and update**. If anything fails, the current version keeps
-  running and the banner links to the website.
+  running and the banner links to the website. In a copy Setup did not
+  install, **Update now** opens the download page instead.
 - Windows Settings has **Check for updates automatically** and **Check now**.
   **Later** hides the banner for that version for a day.
 - Opening EternalMonitor on the PC while it is already running brings its

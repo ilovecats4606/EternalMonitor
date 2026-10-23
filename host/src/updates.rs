@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use eternal_updater::quote_arg;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
@@ -455,6 +456,69 @@ fn installed_helper(app: &Path) -> Option<PathBuf> {
     .find(|path| path.is_file())
 }
 
+/// The host exe Setup installs (`installer/EternalMonitor.iss`).
+const INSTALLED_EXE: &str = "EternalMonitor-host.exe";
+
+/// Setup replaces `EternalMonitor-host.exe` in the folder it installed into
+/// before (Program Files the first time), and the helper starts the exe that
+/// asked for the update again. So only that exe updates itself. A portable,
+/// renamed or self-built copy would come back as the old version, and Setup
+/// would point the firewall rules away from it; Update now opens the website
+/// for those.
+fn installs_in_place(exe: &Path, install_dir: Option<&Path>) -> bool {
+    let Some(install_dir) = install_dir else {
+        return false;
+    };
+    // Final paths where the files exist, so short (8.3) names are expanded.
+    let plain = |path: &Path| {
+        let path = crate::single_instance::canonical(path)
+            .to_string_lossy()
+            .to_lowercase();
+        path.strip_prefix(r"\\?\").unwrap_or(&path).to_string()
+    };
+    plain(exe) == plain(&install_dir.join(INSTALLED_EXE))
+}
+
+/// Setup's uninstall entry for a per-machine 64-bit install. The .iss writes
+/// `AppId={{...}}`, and Inno unescapes only the `{{`, so every installed
+/// AppId ends in `}}`.
+#[cfg(any(windows, test))]
+const UNINSTALL_KEY: &str =
+    "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{B7E6F2C4-3A91-4E0D-9C2A-ETERNALMONITOR}}_is1";
+
+/// The folder Setup reads from its uninstall entry to install an update into.
+/// `None` when EternalMonitor was never installed.
+#[cfg(windows)]
+fn install_dir() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+    let mut value = [0u16; 1024];
+    let mut bytes = std::mem::size_of_val(&value) as u32;
+    let key: Vec<u16> = UNINSTALL_KEY.encode_utf16().chain([0]).collect();
+    let result = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(key.as_ptr()),
+            w!("Inno Setup: App Path"),
+            RRF_RT_REG_SZ,
+            None,
+            Some(value.as_mut_ptr().cast()),
+            Some(&mut bytes),
+        )
+    };
+    if result.is_err() {
+        return None;
+    }
+    let length = value.iter().position(|&c| c == 0).unwrap_or(value.len());
+    Some(std::ffi::OsString::from_wide(&value[..length]).into())
+}
+
+#[cfg(not(windows))]
+fn install_dir() -> Option<PathBuf> {
+    None
+}
+
 /// Copies the helper out of the install folder, which Setup replaces, and
 /// returns the copy held open so it cannot change before it starts. The copy
 /// must hash the same as the installed helper.
@@ -522,6 +586,8 @@ fn start_install(setup: &Path, release: &Release) -> Result<(), UpdateError> {
         installer: setup.to_path_buf(),
         sha256: release.sha256.clone(),
         app,
+        // The listen port, if one was given, survives the restart.
+        app_args: std::env::args_os().skip(1).collect(),
         host_pid: std::process::id(),
         log: dir.join("update.log"),
     };
@@ -590,33 +656,6 @@ pub fn helper_command_line(helper: &Path, args: &eternal_updater::HelperArgs) ->
     line
 }
 
-/// Quotes one argument for the Windows CRT's command-line parser.
-fn quote_arg(arg: &str) -> String {
-    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
-        return arg.to_string();
-    }
-    let mut out = String::from("\"");
-    let mut backslashes = 0;
-    for c in arg.chars() {
-        match c {
-            '\\' => backslashes += 1,
-            '"' => {
-                out.push_str(&"\\".repeat(backslashes * 2 + 1));
-                out.push('"');
-                backslashes = 0;
-            }
-            _ => {
-                out.push_str(&"\\".repeat(backslashes));
-                out.push(c);
-                backslashes = 0;
-            }
-        }
-    }
-    out.push_str(&"\\".repeat(backslashes * 2));
-    out.push('"');
-    out
-}
-
 // ── State ───────────────────────────────────────────────────────────────────
 
 /// Kept in `update-state.json` next to settings.json.
@@ -678,6 +717,10 @@ pub struct State {
     auto: bool,
     manual_check: bool,
     saved: Saved,
+    /// The release being downloaded, waited for or installed. A check that
+    /// finds a newer one meanwhile leaves it alone: the helper checks the
+    /// file against this release's hash.
+    chosen: Option<Release>,
     phase: Phase,
     check: CheckStatus,
     updated: Option<String>,
@@ -696,6 +739,7 @@ impl State {
             auto,
             manual_check: false,
             saved,
+            chosen: None,
             phase: Phase::Idle,
             check: CheckStatus::NotChecked,
             updated: None,
@@ -790,9 +834,9 @@ impl State {
 
     pub fn notice(&self, now: u64) -> Option<Notice> {
         let version = || {
-            self.saved
-                .latest
+            self.chosen
                 .as_ref()
+                .or(self.saved.latest.as_ref())
                 .map_or_else(String::new, |r| r.version.clone())
         };
         match &self.phase {
@@ -830,6 +874,7 @@ impl State {
         }
         let release = self.available()?.clone();
         self.force = false;
+        self.chosen = Some(release.clone());
         if streaming {
             self.phase = Phase::Queued(None);
             self.idle_since = None;
@@ -856,7 +901,8 @@ impl State {
                     received: 0,
                     total: 0,
                 };
-                self.available().cloned().map(Command::Download)
+                self.chosen = self.available().cloned();
+                self.chosen.clone().map(Command::Download)
             }
             other => {
                 self.phase = other;
@@ -895,7 +941,8 @@ impl State {
                     received: 0,
                     total: 0,
                 };
-                self.available().cloned().map(Command::Download)
+                self.chosen = self.available().cloned();
+                self.chosen.clone().map(Command::Download)
             }
         }
     }
@@ -927,7 +974,7 @@ impl State {
             return None;
         }
         let path = path.clone();
-        let release = self.saved.latest.clone()?;
+        let release = self.chosen.clone()?;
         self.phase = Phase::Installing;
         self.saved.pending = Some((self.current.clone(), release.version.clone()));
         Some((path, release))
@@ -1129,6 +1176,7 @@ pub struct Updater {
     state: Arc<Mutex<State>>,
     path: Option<PathBuf>,
     tx: mpsc::Sender<Command>,
+    in_place: bool,
 }
 
 impl Updater {
@@ -1158,7 +1206,20 @@ impl Updater {
         {
             tracing::warn!(%error, "Could not start the update worker");
         }
-        Self { state, path, tx }
+        let in_place = std::env::current_exe()
+            .is_ok_and(|exe| installs_in_place(&exe, install_dir().as_deref()));
+        Self {
+            state,
+            path,
+            tx,
+            in_place,
+        }
+    }
+
+    /// `false` for a copy Setup would not replace: Update now opens the
+    /// website instead.
+    pub fn installs_in_place(&self) -> bool {
+        self.in_place
     }
 
     fn with<T>(&self, change: impl FnOnce(&mut State) -> T) -> T {

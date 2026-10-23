@@ -581,6 +581,43 @@ fn update_waits_for_the_stream_to_stop() {
     assert_eq!(s.saved.pending, Some(("0.3.1".into(), "0.3.2".into())));
 }
 
+/// A check can find a newer release while one is downloading or waiting for a
+/// stream to end. The file must still go to the helper with its own hash,
+/// which the helper checks, not the newer release's.
+#[test]
+fn a_release_found_mid_update_does_not_replace_the_one_downloaded() {
+    let a = release("0.3.2");
+    let b = Release {
+        sha256: "1".repeat(64),
+        ..release("0.3.3")
+    };
+    let path_a = PathBuf::from("setup-0.3.2.exe");
+
+    let mut s = state(Saved::default());
+    s.finish_check(1000, false, Ok(a.clone()));
+    s.begin_check(false);
+    assert!(matches!(s.update_now(false), Some(Command::Download(r)) if r == a));
+    s.finish_check(1001, false, Ok(b.clone()));
+    assert_eq!(
+        s.notice(1001),
+        Some(Notice::Downloading("0.3.2".into(), None))
+    );
+    s.download_finished(Ok(path_a.clone()));
+    assert_eq!(s.take_ready(false), Some((path_a.clone(), a.clone())));
+    assert_eq!(s.saved.pending, Some(("0.3.1".into(), "0.3.2".into())));
+
+    let mut s = state(Saved::default());
+    s.finish_check(1000, false, Ok(a.clone()));
+    s.update_now(false);
+    s.download_finished(Ok(path_a.clone()));
+    assert!(s.take_ready(true).is_none(), "waits for the stream");
+    s.finish_check(1001, false, Ok(b));
+    let start = Instant::now();
+    assert!(s.tick(false, start).is_none());
+    assert!(s.tick(false, start + Duration::from_secs(4)).is_none());
+    assert_eq!(s.take_ready(false), Some((path_a, a)));
+}
+
 #[test]
 fn update_now_while_streaming_can_be_forced_or_cancelled() {
     let mut s = state(Saved::default());
@@ -716,6 +753,117 @@ fn the_app_closes_only_after_the_helper_takes_over() {
     );
 }
 
+/// Setup installs into its own folder and the helper starts the exe that
+/// asked, so a copy anywhere else would come back as the old version.
+#[test]
+fn the_install_lookup_uses_the_app_id_setup_records() {
+    // Inno turns `{{` into `{` and keeps the rest of AppId as written.
+    let iss = include_str!("../../../installer/EternalMonitor.iss");
+    let app_id = iss
+        .lines()
+        .find_map(|line| line.strip_prefix("AppId="))
+        .expect("EternalMonitor.iss sets AppId")
+        .trim()
+        .replace("{{", "{");
+    assert!(
+        UNINSTALL_KEY.ends_with(&format!("\\{app_id}_is1")),
+        "{UNINSTALL_KEY} is not Setup's entry for AppId {app_id}"
+    );
+}
+
+#[test]
+fn the_installed_host_is_the_exe_setup_installs() {
+    let iss = include_str!("../../../installer/EternalMonitor.iss");
+    let source = format!(r#"Source: "{{#StagingDir}}\{INSTALLED_EXE}"; DestDir: "{{app}}";"#);
+    assert!(
+        iss.lines().any(|line| line.starts_with(&source)),
+        "EternalMonitor.iss does not install {INSTALLED_EXE} into {{app}}"
+    );
+}
+
+#[test]
+fn only_the_installed_copy_installs_updates_in_place() {
+    let installed = Path::new("C:\\")
+        .join("Program Files")
+        .join("EternalMonitor");
+    let exe = installed.join("EternalMonitor-host.exe");
+    assert!(installs_in_place(&exe, Some(&installed)));
+    let trailing = PathBuf::from(format!(
+        "{}{}",
+        installed.display(),
+        std::path::MAIN_SEPARATOR
+    ));
+    assert!(installs_in_place(&exe, Some(&trailing)));
+    let other_case = PathBuf::from(installed.to_string_lossy().to_uppercase());
+    assert!(installs_in_place(&exe, Some(&other_case)));
+
+    // A renamed copy beside the installed host: Setup replaces
+    // EternalMonitor-host.exe, and the helper would start this one again.
+    let renamed = installed.join("EternalMonitor-host-old.exe");
+    assert!(!installs_in_place(&renamed, Some(&installed)));
+    // A build from source copied into the install folder.
+    let other_name = installed.join("eternal-host.exe");
+    assert!(!installs_in_place(&other_name, Some(&installed)));
+    // Setup's own exe, spelled differently.
+    assert!(installs_in_place(
+        &installed.join("ETERNALMONITOR-HOST.EXE"),
+        Some(&installed)
+    ));
+    let verbatim = PathBuf::from(format!(r"\\?\{}", exe.display()));
+    assert!(installs_in_place(&verbatim, Some(&installed)));
+
+    // The zip from the release page, unpacked in Downloads.
+    let portable = Path::new("C:\\")
+        .join("Users")
+        .join("A B")
+        .join("Downloads")
+        .join("EternalMonitor")
+        .join("EternalMonitor-host.exe");
+    assert!(!installs_in_place(&portable, Some(&installed)));
+    // A build from source.
+    let built = Path::new("C:\\")
+        .join("src")
+        .join("target")
+        .join("release")
+        .join("eternal-host.exe");
+    assert!(!installs_in_place(&built, Some(&installed)));
+    // Never installed: Setup would install into Program Files.
+    assert!(!installs_in_place(&portable, None));
+    assert!(!installs_in_place(&exe, None));
+}
+
+/// The registry can record the install folder by its short (8.3) name.
+#[cfg(windows)]
+#[test]
+fn a_short_install_folder_name_matches_the_installed_host() {
+    use std::os::windows::process::CommandExt;
+    let installed =
+        std::env::temp_dir().join(format!("EternalMonitor install {}", std::process::id()));
+    std::fs::create_dir_all(&installed).unwrap();
+    let exe = installed.join("EternalMonitor-host.exe");
+    std::fs::write(&exe, b"").unwrap();
+    std::fs::write(installed.join("EternalMonitor-host-old.exe"), b"").unwrap();
+    let output = std::process::Command::new("cmd")
+        .raw_arg(format!(
+            "/c for %I in (\"{}\") do @echo %~sI",
+            installed.display()
+        ))
+        .output()
+        .unwrap();
+    let short = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let results = [
+        installs_in_place(&exe, Some(&short)),
+        installs_in_place(&short.join("EternalMonitor-host.exe"), Some(&installed)),
+        installs_in_place(&short.join("EternalMonitor-host-old.exe"), Some(&installed)),
+    ];
+    std::fs::remove_dir_all(&installed).unwrap();
+    if short == installed {
+        eprintln!("8.3 names are off for {}; skipped", installed.display());
+        return;
+    }
+    assert_eq!(results, [true, true, false], "{}", short.display());
+}
+
 #[test]
 fn helper_arguments_survive_windows_quoting() {
     let args = eternal_updater::HelperArgs {
@@ -724,6 +872,7 @@ fn helper_arguments_survive_windows_quoting() {
         ),
         sha256: "0".repeat(64),
         app: PathBuf::from(r"C:\Program Files\EternalMonitor\EternalMonitor-host.exe"),
+        app_args: Vec::new(),
         host_pid: 42,
         log: PathBuf::from(r"C:\Users\A B\x\"),
     };
