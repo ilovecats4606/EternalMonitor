@@ -1,3 +1,8 @@
+// A GUI program, so Windows opens no console window next to the app. Debug
+// builds too: CI checks the build it makes, and a terminal still shows the
+// log because the host joins its console (`console::join_parent_console`).
+#![windows_subsystem = "windows"]
+
 use std::sync::mpsc;
 
 use eternal_host::control::{GuiControl, SharedControl};
@@ -9,6 +14,30 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Helper modes are dispatched first, before logging and before the
+    // single-instance check below: a `--failure-reporter` copy outlives the
+    // host it watches and must never be turned away as a second instance,
+    // open the session log or touch the virtual display the way a host does.
+    eternal_host::startup::run_reporter_if_requested();
+    eternal_host::console::join_parent_console();
+
+    // Before any DXGI query or window: monitor rects and injected input must
+    // be physical pixels from the start, not only once the GUI's event loop
+    // opts in. Unaware, a 125% monitor reports 2048x1152 instead of 2560x1440.
+    #[cfg(windows)]
+    eternal_host::input::windows_inject::become_per_monitor_dpi_aware();
+
+    // One host per installation; a second launch shows the first one and
+    // exits. Checked after helper-mode dispatch and before anything a host
+    // owns: opening the session log rotates it and the uploader drains the
+    // shared outbox, so a launch that loses here must not reach either, and
+    // must not reset the virtual display the first host is streaming.
+    let Some(instance) = eternal_host::single_instance::acquire() else {
+        eprintln!("EternalMonitor is already running; showing its window");
+        eternal_host::single_instance::show_existing();
+        return Ok(());
+    };
+
     // Anchor the process-wide media clock before anything else runs.
     clock::init();
 
@@ -38,6 +67,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         path = %logging::session_log_path().display(),
         "Session log file initialized"
     );
+    if let Some(problem) = &instance.problem {
+        tracing::warn!(%problem, "Could not check for another EternalMonitor");
+    }
 
     // Never leave a virtual display attached across runs. If a previous run crashed or was
     // force-killed while streaming the virtual extended display, the VDD device is still enabled
@@ -47,15 +79,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Belt-and-suspenders: a panic anywhere (GUI, supervisor, pipeline threads) must still tear
     // the virtual display down before the process unwinds, so a crash can't strand a phantom
-    // monitor. The default panic hook still runs afterwards for logging/backtrace.
-    {
-        let default_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            error!(panic = %info, backtrace = %std::backtrace::Backtrace::force_capture(), "Host panic");
-            vdd::disable();
-            default_hook(info);
-        }));
-    }
+    // monitor. A panic or native crash that ends the process is also shown to the user and
+    // queued for support instead of the window closing without a word.
+    eternal_host::startup::install_failure_hooks();
+    eternal_host::startup::take_previous_crashes();
 
     let listen_port: u16 = std::env::args()
         .nth(1)
@@ -65,7 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize FFmpeg early so encoder probing works during GPU detection
     if let Err(e) = ffmpeg_next::init() {
         error!(error = %e, "FFmpeg init failed");
-        return Err(e.into());
+        return Err(eternal_host::startup::fatal(e).into());
     }
     eternal_host::diagnostics::install_ffmpeg_logging();
     eternal_host::diagnostics::log_system_report();
@@ -100,7 +127,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // runs never did.) The GUI re-applies the same values at startup, which
     // is idempotent.
     let mut persisted = eternal_host::settings::SettingsFile::load();
-    let auth_token = persisted.ensure_auth_token()?;
+    let auth_token = persisted
+        .ensure_auth_token()
+        .map_err(eternal_host::startup::fatal)?;
     let initial_bitrate = if persisted.bitrate_mbps > 0.0 {
         (persisted.bitrate_mbps * 1_000_000.0).round() as u32
     } else {
@@ -132,7 +161,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     *shared.encoder_input.lock() = match std::env::var("ETERNAL_INPUT") {
         Ok(value) => eternal_host::encoder::input::EncoderInput::from_env(&value)
-            .ok_or_else(|| format!("Invalid ETERNAL_INPUT {value:?}; use auto, bgra or yuv420"))?,
+            .ok_or_else(|| format!("Invalid ETERNAL_INPUT {value:?}; use auto, bgra or yuv420"))
+            .map_err(eternal_host::startup::fatal)?,
         Err(_) => persisted.encoder_input,
     };
     *shared.capture_target.lock() =
@@ -222,6 +252,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // a window): stream until SIGTERM/SIGINT, then fall through to the same
     // clean teardown as a GUI quit — mDNS goodbye, VDD disable, bounded
     // supervisor join. (Previously a kill skipped all of that.)
+    let mut window_error = None;
     if std::env::var("ETERNAL_HEADLESS").is_ok_and(|v| v.trim() == "1") {
         info!("ETERNAL_HEADLESS=1 — running without GUI until terminated");
         #[cfg(unix)]
@@ -232,6 +263,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(windows)]
         unsafe {
+            eternal_host::console::ensure_console();
             if let Err(error) = windows::Win32::System::Console::SetConsoleCtrlHandler(
                 Some(on_console_control),
                 true,
@@ -262,14 +294,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Termination signal received — shutting down cleanly");
     } else if let Err(e) = gui::run_gui(gui_control.clone()) {
         error!(error = %e, "GUI exited with error");
+        window_error = Some(format!("Window error: {e}"));
     }
 
-    gui_control.shared.stop();
-    gui_control.request_shutdown();
+    let stop_streaming = || {
+        gui_control.shared.stop();
+        gui_control.request_shutdown();
 
-    // Never leave the virtual display attached after we exit — it should only exist while
-    // EternalMonitor is actively using it.
-    vdd::disable();
+        // Never leave the virtual display attached after we exit — it should only exist while
+        // EternalMonitor is actively using it. If it may still be on, the failure reporter
+        // turns it off after this process exits.
+        eternal_host::startup::display_off_at_quit(vdd::disable);
+    };
+    // A window error is saved first and shown after the cleanup, as a panic is.
+    match window_error {
+        Some(detail) => eternal_host::startup::report_after(&detail, stop_streaming),
+        None => stop_streaming(),
+    }
 
     // Give the supervisor a bounded amount of time to shut down cleanly,
     // exiting the moment it finishes instead of always burning the full
@@ -298,5 +339,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     info!("EternalMonitor shutting down");
+    // process::exit skips destructors. Flush the log writers and the upload
+    // outbox first, so a normal quit is told apart from a crash.
+    logging::flush_before_exit(_session_guard, _uploads, _stdout_guard);
+    eternal_host::startup::finish();
     std::process::exit(0);
 }

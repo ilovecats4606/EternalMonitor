@@ -210,6 +210,7 @@ pub async fn start_sender(
     let pacing_clock = PacingClock::new()?;
 
     let mut links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
+    shared.session.lock().transport_resumed(Instant::now());
     let mut deferred_control = VecDeque::new();
     let mut dgram_scratch = [0u8; MAX_DGRAM_SIZE];
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -225,8 +226,8 @@ pub async fn start_sender(
             // Random branch selection can delay a NACK by multiple frame
             // bursts on platforms with coarse sleep granularity.
             biased;
-            _ = pen_tick.tick(), if input_relay.pen_available() => {
-                input_relay.keep_pen_alive();
+            _ = pen_tick.tick(), if input_relay.pen_tick_needed() => {
+                input_relay.keep_pen_alive(*shared.capture_geometry.lock());
             }
             _ = tokio::time::sleep_until(fault.next_deadline().unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)).into()), if fault.enabled() => {
                 let destination = *shared.target_addr.lock();
@@ -369,10 +370,15 @@ pub async fn start_sender(
                     awaiting_keyframe = true;
                 }
                 if awaiting_keyframe {
-                    if !nal.is_keyframe {
-                        continue; // stale pre-session frame — the forced IDR is coming
+                    let started = shared.session.lock().client_info().map(|info| info.connected_at);
+                    match first_frame_gate(nal.is_keyframe, nal.timestamp, started) {
+                        FirstFrame::Send => awaiting_keyframe = false,
+                        FirstFrame::Skip => continue, // the forced IDR is coming
+                        FirstFrame::SkipAndRequestKeyframe => {
+                            shared.force_next_idr.store(true, Ordering::SeqCst);
+                            continue;
+                        }
                     }
-                    awaiting_keyframe = false;
                 }
 
                 let send_start = Instant::now();
@@ -479,8 +485,74 @@ pub async fn start_sender(
         }
     }
 
+    // Every way out of the loop comes here, before the links close: an update
+    // that just stopped the stream must still tell the iPad.
+    let goodbye = shared.session.lock().take_goodbye();
+    if let Some(goodbye) = goodbye {
+        say_goodbye(&links, goodbye).await;
+    }
     info!("NAL channel closed, transport sender shutting down");
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FirstFrame {
+    Send,
+    Skip,
+    SkipAndRequestKeyframe,
+}
+
+/// A session's first frame must be a keyframe captured after it started. An
+/// encoder can hold a frame for a long time when nothing is being encoded:
+/// NVENC kept the host's startup frame while the PC sat idle, and the next
+/// viewer received that old, blank keyframe as its first picture. A stale
+/// keyframe is skipped and a fresh one requested.
+fn first_frame_gate(
+    is_keyframe: bool,
+    captured: Instant,
+    session_start: Option<Instant>,
+) -> FirstFrame {
+    if !is_keyframe {
+        FirstFrame::Skip
+    } else if session_start.is_some_and(|start| captured < start) {
+        FirstFrame::SkipAndRequestKeyframe
+    } else {
+        FirstFrame::Send
+    }
+}
+
+/// How long a goodbye over USB may hold up the exit while it is written.
+const GOODBYE_FLUSH: Duration = Duration::from_millis(250);
+/// Copies of a goodbye over UDP, where any one can be lost, and the pause
+/// between them so a single burst of Wi-Fi loss can't take them all.
+const GOODBYE_COPIES: usize = 3;
+const GOODBYE_GAP: Duration = Duration::from_millis(5);
+
+/// Tells the iPad that an update stopped its stream, and returns once the
+/// message has left. Over UDP that is a short burst, all sent before this
+/// returns and the socket closes; the iPad acts on the first. Over USB one
+/// copy is queued for the link's writer, which dropping the link would abort,
+/// so wait for it to be written.
+async fn say_goodbye(links: &TransportLinks, (peer, datagram): (PeerId, Vec<u8>)) {
+    let sent = if peer.link == LinkId::Udp {
+        let mut sent = Ok(());
+        for copy in 0..GOODBYE_COPIES {
+            if copy > 0 {
+                tokio::time::sleep(GOODBYE_GAP).await;
+            }
+            sent = links.send_to(&datagram, peer).await;
+        }
+        sent
+    } else {
+        match links.send_to(&datagram, peer).await {
+            Ok(()) => links.flush(peer, GOODBYE_FLUSH).await,
+            Err(error) => Err(error),
+        }
+    };
+    match sent {
+        Ok(()) => info!(%peer, "Told the iPad the stream stopped for an update"),
+        Err(error) => warn!(%peer, %error, "Could not tell the iPad the stream stopped"),
+    }
 }
 
 type DeferredControl = VecDeque<LinkEvent>;
@@ -603,6 +675,10 @@ async fn execute_actions(
         }
     }
 
+    if let Some(goodbye) = actions.goodbye {
+        say_goodbye(links, goodbye).await;
+    }
+
     if actions.force_idr {
         shared.force_next_idr.store(true, Ordering::SeqCst);
     }
@@ -639,6 +715,25 @@ async fn execute_actions(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_new_session_starts_with_a_keyframe_captured_after_it_began() {
+        let start = Instant::now();
+        let before = start - Duration::from_secs(17);
+        let after = start + Duration::from_millis(10);
+        assert_eq!(
+            first_frame_gate(false, after, Some(start)),
+            FirstFrame::Skip
+        );
+        // The encoder's leftover startup IDR must not open the session.
+        assert_eq!(
+            first_frame_gate(true, before, Some(start)),
+            FirstFrame::SkipAndRequestKeyframe
+        );
+        assert_eq!(first_frame_gate(true, after, Some(start)), FirstFrame::Send);
+        assert_eq!(first_frame_gate(true, start, Some(start)), FirstFrame::Send);
+    }
+
     use super::*;
     use eternal_wire::v2::control::{
         encode_control, parse_control, ControlMessage, Hello2, Nack, Ping, CAP_DECODE_H264,

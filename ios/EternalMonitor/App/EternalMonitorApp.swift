@@ -19,6 +19,7 @@ struct EternalMonitorApp: App {
                 .preferredColorScheme(.dark)
                 .onAppear {
                     connectionManager.refreshUSBAvailability()
+                    UpdateChecker.shared.checkIfDue()
                     // Automated end-to-end harness: EM_AUTOCONNECT=host:port
                     // connects immediately, bypassing the connect screen.
                     if let target = E2E.autoconnectTarget {
@@ -56,6 +57,7 @@ struct EternalMonitorApp: App {
                 connectionManager.handleAppBackgrounded()
             } else if phase == .active {
                 connectionManager.handleAppForegrounded()
+                UpdateChecker.shared.checkIfDue()
             }
         }
     }

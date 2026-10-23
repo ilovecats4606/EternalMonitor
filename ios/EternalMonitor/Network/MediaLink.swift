@@ -3,12 +3,40 @@ import os
 
 /// Control and video share one link. Both implementations use the same
 /// datagram decoder and session filter on their serial control queue.
+/// Why a media link failed. `message` is the support-log wording; the app
+/// decides what to tell the user from `kind` and `underlying`.
+struct LinkError: Error, CustomStringConvertible {
+    enum Kind: Equatable {
+        case invalidConfiguration
+        case resolve
+        case pathUnavailable
+        case localNetworkDenied
+        case connectionFailed
+        case receive
+        case send
+        case timeout
+        case protocolMismatch
+    }
+
+    let kind: Kind
+    let message: String
+    var underlying: Error?
+
+    init(_ kind: Kind, _ message: String, underlying: Error? = nil) {
+        self.kind = kind
+        self.message = message
+        self.underlying = underlying
+    }
+
+    var description: String { message }
+}
+
 protocol MediaLink: AnyObject {
     var datagrams: MediaDatagrams { get }
     var controlQueue: DispatchQueue { get }
     var isUSB: Bool { get }
     var onConnectionEstablished: (() -> Void)? { get set }
-    var onError: ((String) -> Void)? { get set }
+    var onError: ((LinkError) -> Void)? { get set }
     var onListenerReady: ((UInt16) -> Void)? { get set }
     var onClosed: (() -> Void)? { get set }
     @discardableResult func start(host: String) -> Bool

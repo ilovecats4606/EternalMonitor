@@ -130,6 +130,23 @@ shell. Neither path switches the developer account used by this workspace.
    review status beside it accurate. The current link is
    `https://testflight.apple.com/join/ppc9QfXc`.
 
+### Publish the update after Apple approves the build
+
+Both apps learn about updates from `docs/latest.json`
+(https://eternalmonitor.dev/latest.json). Bump it in the same pull request
+that publishes the matching downloads on `docs/download.html`, and only after
+Apple approves the TestFlight build. Bumping it earlier makes every PC ask to
+update before the matching iPad build can be installed.
+
+1. Copy the Windows version, installer URL and SHA-256 from the GitHub release,
+   and the TestFlight build number, into both `docs/download.html` and
+   `docs/latest.json`.
+2. Run `scripts/check-versions.sh`. It fails when the two files disagree, and CI
+   runs it on every pull request.
+3. After the merge, Windows hosts see the update within a day and iPads within
+   four hours. A host refuses to install when `latest.json` and the release body
+   disagree on the SHA-256, so keep the release body as the workflow wrote it.
+
 Internal testers skip review entirely and get builds immediately, but they
 must be users on your App Store Connect team, so that route only makes sense
 for people you want inside the developer account.
@@ -152,15 +169,15 @@ Use the matching release pair. v0.1 and v2 builds cannot stream together.
 v0.3 keeps the v2 prefix and negotiates new features, but mixing older builds
 is not a supported beta-test configuration.
 
-## Extended display vs mirror
+## Second screen vs mirror
 
 By default the iPad mirrors the primary screen. To test the iPad as a real extended desktop:
-**connect the iPad first**, then on the host's Stream page set **Display** to **"Extended display
-(iPad)"** (also under Settings → Display to stream) and click **Restart now**. Dragging a window past the edge of the main screen should
+at the top of the host's Stream page, next to **Use the iPad as**, click **Second screen** (also under
+Settings → How the iPad shows your PC). A running stream restarts by itself. Dragging a window past the edge of the main screen should
 land it on the iPad. The virtual monitor is created **on demand and only while the iPad is
 connected** — there is intentionally no second display when idle, so don't expect to see it in
 Windows Display settings before connecting. If the extended display can't start, the host shows an
-amber "Extended display unavailable" banner and mirrors the primary screen — re-run the installer
+amber "The second screen couldn't start" banner and mirrors the primary screen — re-run the installer
 so its display task is registered.
 
 ## Build parity and release status

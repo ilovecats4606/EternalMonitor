@@ -146,7 +146,7 @@ final class AudioPlayer {
             measurements.withLock { $0 = stats }
             if E2E.enabled, now - lastLogUs >= 1_000_000 {
                 lastLogUs = now
-                E2E.audio(stats)
+                E2E.audio(stats, timeline: timeline)
             }
         } catch {
             fail(error)

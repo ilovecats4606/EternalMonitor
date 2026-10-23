@@ -1,22 +1,38 @@
-param([string]$Task)
+param([string]$Task, [string]$After)
 $ErrorActionPreference = 'Stop'
 try {
     $service = New-Object -ComObject Schedule.Service
     $service.Connect()
-    $registered = $service.GetFolder('\').GetTask($Task)
-    $deadline = (Get-Date).AddSeconds(15)
-    # Finish any prior invocation before requesting another one. The host
-    # serializes both directions so a late disable cannot undo an enable.
-    while ($registered.State -in @(2,4)) {
-        if ((Get-Date) -gt $deadline) { throw "Previous VDD task timed out: $Task" }
-        Start-Sleep -Milliseconds 50
-        $registered = $service.GetFolder('\').GetTask($Task)
+    # Finish any prior invocation of this task, and of the other direction
+    # ($After), before requesting another one. The host serializes its own
+    # requests, but an Enable it stopped waiting for keeps running in Task
+    # Scheduler; a Disable that finished first would be undone by it.
+    # Waiting for them must not eat into this run's own time.
+    # An install without the other task still runs this one, as before.
+    $waitFor = @($Task)
+    if ($After) {
+        try {
+            [void]$service.GetFolder('\').GetTask($After)
+            $waitFor = @($After, $Task)
+        } catch {
+            # 0x80070002: the task does not exist.
+            if ($_.Exception.GetBaseException().HResult -ne -2147024894) { throw }
+        }
     }
+    $deadline = (Get-Date).AddSeconds(10)
+    foreach ($name in $waitFor) {
+        while ($service.GetFolder('\').GetTask($name).State -in @(2,4)) {
+            if ((Get-Date) -gt $deadline) { throw "Previous VDD task timed out: $name" }
+            Start-Sleep -Milliseconds 50
+        }
+    }
+    $registered = $service.GetFolder('\').GetTask($Task)
     if (!$registered.Enabled -or !$registered.Definition.Settings.AllowDemandStart) {
         throw "VDD task cannot be started: $Task"
     }
     $running = $registered.Run($null)
     if (!$running) { throw "VDD task did not start: $Task" }
+    $deadline = (Get-Date).AddSeconds(15)
     while ($true) {
         if ((Get-Date) -gt $deadline) { throw "VDD task timed out: $Task" }
         try { $running.Refresh() } catch {

@@ -7,13 +7,20 @@
 //! - on Stream, the "Pairing", "USB connection" and "PC audio" rows, and a
 //!   "Connected iPad" card that lists "Decode rate" and "Repaired fragments"
 //!   (or "Waiting for an iPad" when nobody is connected);
-//! - on Settings, the "Encoder input" row.
+//! - on Settings, the "Encoder input" row;
+//! - at the top of Stream, the "Mirror my screen" and "Second screen" choice.
+//! - in the sidebar, "Send feedback" and the GitHub star card (see
+//!   `feedback_panel.rs`).
 
+mod feedback_panel;
 mod icons;
 mod page_performance;
 mod page_settings;
 mod page_stream;
+mod renderer;
 mod theme;
+mod update_banner;
+mod update_toast;
 mod widgets;
 
 use std::collections::VecDeque;
@@ -25,6 +32,7 @@ use qrcode::{Color as QrModuleColor, QrCode};
 use tracing::{info, warn};
 
 use crate::autostart::{first_lan_ipv4, read_startup_registry, set_startup_registry};
+use crate::capture::recovery::CaptureBlock;
 use crate::capture::{enumerate_outputs, OutputInfo};
 use crate::control::{CaptureTarget, GuiControl};
 use crate::settings::SettingsFile;
@@ -51,7 +59,6 @@ struct StatsSnapshot {
     capture_frame_count: u64,
     capture_resolution: (u32, u32),
     encode_fps: f64,
-    encode_time_us: u128,
     encode_frame_count: u64,
     nal_bytes_last: usize,
     bitrate_bps: u32,
@@ -89,7 +96,6 @@ impl StatsSnapshot {
             capture_frame_count: s.capture_frame_count,
             capture_resolution: s.capture_resolution,
             encode_fps: s.encode_fps,
-            encode_time_us: s.encode_time_us,
             encode_frame_count: s.encode_frame_count,
             nal_bytes_last: s.nal_bytes_last,
             bitrate_bps: s.bitrate_bps,
@@ -123,7 +129,10 @@ impl StatsSnapshot {
 struct ClientSnapshot {
     info: Option<ClientInfo>,
     peer: Option<PeerId>,
+    session_id: Option<u32>,
     report: Option<ReceiverReport>,
+    /// Why Windows is withholding the screen from it, if it is.
+    capture_block: Option<CaptureBlock>,
 }
 
 impl ClientSnapshot {
@@ -132,7 +141,9 @@ impl ClientSnapshot {
         Self {
             info: session.client_info(),
             peer: session.peer(),
+            session_id: session.session_id(),
             report: session.last_report(),
+            capture_block: *control.shared.capture_block.lock(),
         }
     }
 
@@ -154,16 +165,21 @@ enum StreamState {
     Off,
     Ready,
     Streaming,
+    /// An iPad is connected, but Windows withholds the screen, so its
+    /// picture is frozen. Capture retries until Windows allows it again.
+    Paused,
 }
 
 impl StreamState {
     fn of(snap: &StatsSnapshot, client: &ClientSnapshot) -> Self {
         if !snap.pipeline_running {
             StreamState::Off
-        } else if client.info.is_some() {
-            StreamState::Streaming
-        } else {
+        } else if client.info.is_none() {
             StreamState::Ready
+        } else if client.capture_block.is_some() {
+            StreamState::Paused
+        } else {
+            StreamState::Streaming
         }
     }
 
@@ -171,20 +187,22 @@ impl StreamState {
         match self {
             StreamState::Off => TEXT_FAINT,
             StreamState::Ready | StreamState::Streaming => ACCENT,
+            StreamState::Paused => WARNING,
         }
     }
 
     fn dot(self) -> widgets::Dot {
         match self {
-            StreamState::Off => widgets::Dot::Idle,
+            StreamState::Off | StreamState::Paused => widgets::Dot::Idle,
             StreamState::Ready => widgets::Dot::Ready,
             StreamState::Streaming => widgets::Dot::Live,
         }
     }
 }
 
-const CAPTURE_AUTO_LABEL: &str = "Main display (mirror)";
-const CAPTURE_VIRTUAL_LABEL: &str = "Extended display (iPad)";
+// The same two names appear on the iPad, in SETUP.md and on the website.
+const CAPTURE_AUTO_LABEL: &str = "Mirror my screen";
+const CAPTURE_VIRTUAL_LABEL: &str = "Second screen";
 // The settings sentinel for the managed virtual display lives in control.rs
 // (shared with the startup preload).
 use crate::control::CAPTURE_VIRTUAL_SENTINEL;
@@ -254,6 +272,7 @@ impl History {
 enum Copied {
     Address,
     Logs,
+    Email,
 }
 
 pub struct AnalyzerApp {
@@ -263,8 +282,15 @@ pub struct AnalyzerApp {
     settings_fps_target: u32,
     settings_encoder_input: crate::encoder::input::EncoderInput,
     settings_check_updates: bool,
-    available_update: crate::updates::AvailableUpdate,
-    update_dismissed: bool,
+    updates: crate::updates::Updater,
+    /// The update popup is on screen; it stays until a button is chosen.
+    update_popup_open: bool,
+    /// When an iPad last had a session, for the popup's quiet period. Starts
+    /// at launch: after a login start, a USB iPad connects within seconds.
+    ipad_last_seen: Option<Instant>,
+    popup_quiet: Duration,
+    /// "Your iPad app is out of date" was dismissed for this run.
+    ipad_notice_dismissed: bool,
     settings_packet_size: u32,
     /// Last settings error worth showing (the autostart registry write or a
     /// pairing reset).
@@ -285,7 +311,12 @@ pub struct AnalyzerApp {
     show_qr_modal: bool,
     qr_cache: Option<(String, QrCode)>,
     copied: Option<(Copied, Instant)>,
+    /// The Send feedback dialog, while open.
+    feedback: Option<feedback_panel::Draft>,
+    feedback_ask: crate::feedback::Ask,
+    star_clicked: bool,
     history: History,
+    quality: QualityMeter,
     logo: Option<(f32, egui::TextureHandle)>,
 }
 
@@ -378,16 +409,28 @@ impl AnalyzerApp {
             }
         }
 
-        let available_update = std::sync::Arc::new(parking_lot::Mutex::new(None));
-        if persisted.check_for_updates {
-            crate::updates::start(available_update.clone());
-        }
+        let updates = {
+            let ctx = cc.egui_ctx.clone();
+            crate::updates::Updater::start(
+                persisted.check_for_updates,
+                control.shared.session.clone(),
+                std::sync::Arc::new(move |version: Option<&str>| {
+                    if let Some(version) = version {
+                        update_toast::show(&ctx, version);
+                    }
+                    ctx.request_repaint();
+                }),
+            )
+        };
         let encoder_input = *control.shared.encoder_input.lock();
         Self {
             settings_encoder_input: encoder_input,
             settings_check_updates: persisted.check_for_updates,
-            available_update,
-            update_dismissed: false,
+            updates,
+            update_popup_open: false,
+            ipad_last_seen: Some(Instant::now()),
+            popup_quiet: popup_quiet(),
+            ipad_notice_dismissed: false,
             settings_packet_size: control.shared.max_dgram.load(Ordering::SeqCst),
             control,
             page: Page::Stream,
@@ -405,7 +448,14 @@ impl AnalyzerApp {
             show_qr_modal: false,
             qr_cache: None,
             copied: None,
+            feedback: None,
+            feedback_ask: crate::feedback::Ask::new(
+                persisted.feedback_sessions,
+                persisted.feedback_ask_done,
+            ),
+            star_clicked: persisted.star_clicked,
             history: History::new(),
+            quality: QualityMeter::default(),
             logo: None,
         }
     }
@@ -443,6 +493,9 @@ impl AnalyzerApp {
             start_on_boot: self.settings_start_on_boot,
             require_pairing: pairing.required,
             auth_token_hex: crate::pairing::token_hex(&pairing.token()),
+            feedback_sessions: self.feedback_ask.long_sessions,
+            feedback_ask_done: self.feedback_ask.done,
+            star_clicked: self.star_clicked,
         };
         file.save();
     }
@@ -532,6 +585,30 @@ impl AnalyzerApp {
         self.restart_pending = true;
     }
 
+    /// The Stream page's mirror / second screen choice. It applies straight
+    /// away: a running stream restarts and the iPad reconnects by itself.
+    fn set_second_screen(&mut self, second: bool, running: bool) {
+        let display = if second {
+            CAPTURE_VIRTUAL_SENTINEL.to_string()
+        } else {
+            String::new()
+        };
+        if self.settings_capture_display == display {
+            return;
+        }
+        self.set_capture_display(display);
+        if running {
+            self.restart_stream();
+        }
+    }
+
+    /// Back to the recommended encoder choices, for the CPU fallback notice.
+    fn reset_video_settings(&mut self) {
+        self.set_encoder_choice(ENCODER_AUTO_LABEL);
+        self.set_encoder_input(crate::encoder::input::EncoderInput::default());
+        self.restart_stream();
+    }
+
     fn refresh_outputs(&mut self) {
         self.available_outputs = enumerate_outputs();
         info!(
@@ -583,9 +660,7 @@ impl AnalyzerApp {
 
     fn set_check_updates(&mut self, enabled: bool) {
         self.settings_check_updates = enabled;
-        if enabled {
-            crate::updates::start(self.available_update.clone());
-        }
+        self.updates.set_auto(enabled);
         self.persist_settings();
     }
 
@@ -627,6 +702,7 @@ impl AnalyzerApp {
 
 impl eframe::App for AnalyzerApp {
     fn on_exit(&mut self) {
+        update_toast::hide();
         if self.settings_dirty_at.take().is_some() {
             self.persist_settings();
         }
@@ -637,6 +713,8 @@ impl eframe::App for AnalyzerApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        renderer::frame_started(ui.ctx());
+        crate::startup::simulate_window_failure();
         let ctx = ui.ctx().clone();
         if let Some(dirty_at) = self.settings_dirty_at {
             if dirty_at.elapsed() >= Duration::from_millis(800) {
@@ -653,6 +731,7 @@ impl eframe::App for AnalyzerApp {
         let snap = StatsSnapshot::take();
         let client = ClientSnapshot::take(&self.control);
         self.history.sample(&snap, Instant::now());
+        self.observe_session(&client);
         if !snap.pipeline_running {
             // A stopped pipeline starts with the new settings anyway.
             self.restart_pending = false;
@@ -682,6 +761,7 @@ impl eframe::App for AnalyzerApp {
                                 ui.set_opacity(shown);
                                 ui.set_max_width(ui.available_width().min(980.0));
                                 ui.spacing_mut().item_spacing.y = 10.0;
+                                self.update_banner(ui, &snap, &client);
                                 match self.page {
                                     Page::Stream => self.stream_page(ui, &snap, &client),
                                     Page::Performance => self.performance_page(ui, &snap),
@@ -694,7 +774,23 @@ impl eframe::App for AnalyzerApp {
         if self.show_qr_modal {
             self.draw_qr_modal(&ctx, &snap);
         }
+        self.update_popup(&ctx, &client);
+        self.draw_feedback_panel(&ctx, &client);
     }
+}
+
+/// [`update_banner::POPUP_QUIET`]. Debug builds only:
+/// `ETERNAL_UPDATE_POPUP_QUIET_MS` shortens it for the GUI tests.
+fn popup_quiet() -> Duration {
+    if cfg!(debug_assertions) {
+        if let Some(ms) = std::env::var("ETERNAL_UPDATE_POPUP_QUIET_MS")
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+        {
+            return Duration::from_millis(ms);
+        }
+    }
+    update_banner::POPUP_QUIET
 }
 
 // ── Sidebar ─────────────────────────────────────────────────────────────────
@@ -740,6 +836,12 @@ impl AnalyzerApp {
                     ui.label(faint(format!("Version {}", env!("CARGO_PKG_VERSION"))));
                     ui.add_space(6.0);
                     sidebar_status(ui, snap, client);
+                    ui.add_space(6.0);
+                    if feedback_panel::sidebar_action(ui, Icon::Mail, "Send feedback").clicked() {
+                        self.open_feedback();
+                    }
+                    ui.add_space(2.0);
+                    self.star_card(ui);
                 });
             });
     }
@@ -832,8 +934,13 @@ fn sidebar_status(ui: &mut egui::Ui, snap: &StatsSnapshot, client: &ClientSnapsh
     let (title, detail) = match state {
         StreamState::Off => ("Stopped".to_string(), "Streaming is off".to_string()),
         StreamState::Ready => ("Ready".to_string(), "Waiting for an iPad".to_string()),
-        StreamState::Streaming => (
-            "Streaming".to_string(),
+        StreamState::Streaming | StreamState::Paused => (
+            if state == StreamState::Paused {
+                "Paused"
+            } else {
+                "Streaming"
+            }
+            .to_string(),
             format!(
                 "{} · {}",
                 client
@@ -982,7 +1089,7 @@ impl AnalyzerApp {
                     );
                     ui.add(
                         egui::Label::new(muted(
-                            "On your iPad, open EternalMonitor, tap Scan QR and point it at this code.",
+                            "On your iPad, open EternalMonitor, tap Scan QR code and point the camera at this code.",
                         ))
                         .wrap(),
                     );
@@ -1093,6 +1200,88 @@ fn friendly_codec(name: &str) -> String {
     format!("{codec} · {engine}")
 }
 
+/// One word for how well the stream is getting through, from one interval
+/// of the iPad's reports: fragments received, repaired and lost, and the
+/// round-trip time.
+fn connection_quality(received: u32, repaired: u32, lost: u32, rtt_ms_x10: u16) -> &'static str {
+    let total = f64::from(received) + f64::from(repaired) + f64::from(lost);
+    if total == 0.0 {
+        return "Measuring";
+    }
+    let loss = 100.0 * f64::from(lost) / total;
+    let rtt_ms = f64::from(rtt_ms_x10) / 10.0;
+    if loss < 0.5 && rtt_ms < 20.0 {
+        "Excellent"
+    } else if loss < 2.0 && rtt_ms < 50.0 {
+        "Good"
+    } else if loss < 6.0 && rtt_ms < 120.0 {
+        "Fair"
+    } else {
+        "Poor"
+    }
+}
+
+/// Rates the stream from the change between consecutive iPad reports, as the
+/// bitrate controller does. The report counters are cumulative for a stream
+/// epoch, so a long healthy session would otherwise hide a bad minute.
+#[derive(Default)]
+struct QualityMeter {
+    previous: Option<(u32, ReceiverReport)>,
+    rating: Option<&'static str>,
+}
+
+impl QualityMeter {
+    fn update(&mut self, session_id: Option<u32>, report: Option<&ReceiverReport>) -> &'static str {
+        let (Some(session_id), Some(report)) = (session_id, report) else {
+            *self = Self::default();
+            return "Measuring";
+        };
+        if self.previous == Some((session_id, *report)) {
+            return self.rating.unwrap_or("Measuring");
+        }
+        // A new session or stream epoch restarts the counters: rate what the
+        // new counters say, as the bitrate controller does.
+        let (received, repaired, lost) = match self.previous {
+            Some((session, prev))
+                if session == session_id
+                    && prev.stream_epoch == report.stream_epoch
+                    && report.frags_received >= prev.frags_received =>
+            {
+                (
+                    report.frags_received - prev.frags_received,
+                    report.frags_repaired.saturating_sub(prev.frags_repaired),
+                    report.frags_lost.saturating_sub(prev.frags_lost),
+                )
+            }
+            _ => (
+                report.frags_received,
+                report.frags_repaired,
+                report.frags_lost,
+            ),
+        };
+        self.previous = Some((session_id, *report));
+        let rating = connection_quality(received, repaired, lost, report.rtt_ms_x10);
+        // An interval with no fragments (a static screen) keeps the last word.
+        if rating != "Measuring" || self.rating.is_none() {
+            self.rating = Some(rating);
+        }
+        self.rating.unwrap_or("Measuring")
+    }
+}
+
+/// Opens Windows Settings at Display, where the screens are arranged.
+fn open_display_settings() {
+    #[cfg(windows)]
+    {
+        if let Err(error) = std::process::Command::new("explorer.exe")
+            .arg("ms-settings:display")
+            .spawn()
+        {
+            warn!(error = %error, "Could not open Windows display settings");
+        }
+    }
+}
+
 fn value_or_unknown(value: &str) -> &str {
     if value.is_empty() {
         "Unknown"
@@ -1128,7 +1317,7 @@ pub fn run_gui(control: GuiControl) -> eframe::Result<()> {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon_256.png"))
         .expect("embedded icon PNG is valid");
 
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("EternalMonitor")
             .with_inner_size([1000.0, 640.0])
@@ -1136,12 +1325,17 @@ pub fn run_gui(control: GuiControl) -> eframe::Result<()> {
             .with_icon(std::sync::Arc::new(icon)),
         ..Default::default()
     };
+    renderer::configure(&mut options.wgpu_options);
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "EternalMonitor",
         options,
         Box::new(|cc| Ok(Box::new(AnalyzerApp::new(cc, control)))),
-    )
+    );
+    if result.is_ok() {
+        renderer::window_closed();
+    }
+    result
 }
 
 #[cfg(test)]

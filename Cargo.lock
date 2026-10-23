@@ -1169,11 +1169,12 @@ checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 
 [[package]]
 name = "eternal-host"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "cc",
  "eframe",
  "egui_kittest",
+ "eternal-updater",
  "eternal-wire",
  "ffmpeg-next",
  "getrandom 0.3.4",
@@ -1185,6 +1186,7 @@ dependencies = [
  "plist",
  "qrcode",
  "regex",
+ "ring",
  "semver",
  "serde",
  "serde_json",
@@ -1200,8 +1202,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "eternal-updater"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows 0.58.0",
+]
+
+[[package]]
 name = "eternal-wire"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "tracing",
 ]
@@ -2185,9 +2195,9 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "1.2.0"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50b7e5b27aa02a74bac8c3f23f448f8d87ff11f92d3aac1a6ed369ee08cc56c1"
+checksum = "4b18443e9c262bfe8fa82f51666e2642c53393f7e5c27b3e1aeab922cff5b9d8"
 dependencies = [
  "libc",
  "log",

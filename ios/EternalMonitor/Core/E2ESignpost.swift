@@ -64,8 +64,15 @@ enum E2E {
         )
     }
 
-    static func audio(_ stats: AudioStats) {
+    static func audio(_ stats: AudioStats, timeline: AudioTimeline) {
         guard enabled else { return }
-        emit("E2E_AUDIO packets=\(stats.packets) decoded=\(stats.decoded) lost=\(stats.lost) buffer_ms=\(stats.bufferMs) rms=\(stats.rms) tone1k_db=\(stats.tone1kDB)")
+        // The wire stream and sequence range let the test match each loss to
+        // a host drop of the same numbering.
+        var range = ""
+        if let session = timeline.sessionId, let epoch = timeline.epoch,
+           let first = timeline.firstSeq, let next = timeline.nextSeq {
+            range = " session_id=\(session) epoch=\(epoch) first_seq=\(first) next_seq=\(next)"
+        }
+        emit("E2E_AUDIO packets=\(stats.packets) decoded=\(stats.decoded) lost=\(stats.lost) buffer_ms=\(stats.bufferMs) rms=\(stats.rms) tone1k_db=\(stats.tone1kDB)\(range)")
     }
 }

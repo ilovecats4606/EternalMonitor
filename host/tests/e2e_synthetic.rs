@@ -32,7 +32,61 @@ use eternal_wire::v2::{classify, Classified};
 /// Tests share process-global env (ETERNAL_*); run them one at a time.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Holds [`ENV_LOCK`] for one test and, when dropped (also while the test
+/// panics), puts the ETERNAL_* variables back as they were. A failed test
+/// then neither poisons the lock for the rest of the binary nor leaves
+/// settings such as ETERNAL_DROP behind for the next test.
+struct TestEnv {
+    before: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+fn test_env() -> TestEnv {
+    let lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    TestEnv {
+        before: eternal_vars(),
+        _lock: lock,
+    }
+}
+
+fn eternal_vars() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    std::env::vars_os()
+        .filter(|(name, _)| name.to_string_lossy().starts_with("ETERNAL_"))
+        .collect()
+}
+
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        for (name, _) in eternal_vars() {
+            std::env::remove_var(name);
+        }
+        for (name, value) in &self.before {
+            std::env::set_var(name, value);
+        }
+    }
+}
+
+#[test]
+fn a_failed_test_neither_poisons_the_env_lock_nor_leaks_its_settings() {
+    let leaked = std::thread::spawn(|| {
+        let _env = test_env();
+        std::env::set_var("ETERNAL_TEST_LEAK", "1");
+        panic!("a test that fails while it holds the env");
+    })
+    .join();
+    assert!(leaked.is_err());
+    let _env = test_env();
+    assert!(std::env::var_os("ETERNAL_TEST_LEAK").is_none());
+}
+
 /// Surface the host's tracing in test output (best effort, once per process).
+///
+/// No thread under test may block on a log sink, as in production. A redirected
+/// stderr on a busy disk stalled FFmpeg's decode-error logging inside the fake
+/// iPad's packet loop for 4-32 s, past the host's 3 s liveness window. FFmpeg
+/// therefore logs through tracing, and live output is bounded and lossy.
 fn init_test_tracing() {
     // Never let a synthetic test claim a physically connected iPad. The USB
     // test replaces this unreachable endpoint with its own loopback listener.
@@ -48,12 +102,23 @@ fn init_test_tracing() {
         assert_eq!(unsafe { pthread_set_qos_class_self_np(0x21, 0) }, 0);
     }
     use tracing_subscriber::EnvFilter;
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_test_writer()
-        .try_init();
+    static LIVE_OUTPUT: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
+        std::sync::OnceLock::new();
+    let subscriber = tracing_subscriber::fmt().with_env_filter(
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+    );
+    // Captured output is an in-memory buffer; --nocapture writes to the real stdout.
+    let nocapture = std::env::args().any(|arg| arg == "--nocapture" || arg == "--no-capture")
+        || std::env::var("RUST_TEST_NOCAPTURE").is_ok_and(|value| value != "0");
+    if nocapture {
+        let (writer, guard) = eternal_host::logging::non_blocking_output(std::io::stdout());
+        if subscriber.with_writer(writer).try_init().is_ok() {
+            let _ = LIVE_OUTPUT.set(guard);
+        }
+    } else {
+        let _ = subscriber.with_test_writer().try_init();
+    }
+    eternal_host::diagnostics::install_ffmpeg_logging();
 }
 
 const SYNTH_W: u32 = 640;
@@ -68,7 +133,7 @@ fn usb_framed_stream_end_to_end() {
     use eternal_wire::v2::control::HOSTCAP_USB;
     use std::sync::atomic::Ordering;
 
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _env = test_env();
     init_test_tracing();
     ffmpeg_next::init().unwrap();
     std::env::set_var("ETERNAL_CAPTURE", "synthetic");
@@ -192,9 +257,10 @@ fn usb_framed_stream_end_to_end() {
         assert_eq!(PIPELINE_STATS.lock().transport_retransmits, 0);
         eprintln!("USB_E2E decoded={decoded} after_recovery={after_recovery} heartbeats={heartbeats} dropped={dropped} recovery_ms={recovery_ms}");
 
-        // A virtual-display startup restarts capture once. That closes USB,
-        // causing another HELLO on the replacement tunnel while the monitor
-        // is still attaching. It must not trigger a second pipeline restart.
+        // A virtual-display startup restarts the pipeline once. The tunnel
+        // must survive that restart: 0.3.1 closed it, the iPad reconnected,
+        // and with Extended display selected the reconnect could trigger the
+        // next restart indefinitely.
         use eternal_host::control::{CaptureTarget, VddStatus};
         use eternal_host::supervisor::CURRENT_GENERATION;
         *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
@@ -203,33 +269,33 @@ fn usb_framed_stream_end_to_end() {
         let ControlMessage::Hello2(mut next_hello) = hello else { unreachable!() };
         next_hello.client_nonce += 1;
         write_datagram(&mut stream, &encode_control(0, 1, &ControlMessage::Hello2(next_hello.clone()))).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while read_datagram(&mut stream).await.is_ok() {}
-        }).await.expect("virtual-display start must close the previous tunnel");
-        drop(stream);
-        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
-        read_preamble(&mut stream).await.unwrap();
-        next_hello.client_nonce += 1;
-        write_datagram(&mut stream, &encode_control(0, 1, &ControlMessage::Hello2(next_hello))).await.unwrap();
         let mut received_ack = false;
         let mut frames = 0;
+        let mut new_epoch = None;
         let deadline = Instant::now() + Duration::from_secs(5);
         while frames < 30 || !received_ack {
-            assert!(Instant::now() < deadline, "USB reconnect must resume media during display startup");
-            let bytes = tokio::time::timeout(Duration::from_secs(2), read_datagram(&mut stream)).await.unwrap().unwrap();
+            assert!(Instant::now() < deadline, "media must resume on the same tunnel after the restart");
+            let bytes = tokio::time::timeout(Duration::from_secs(2), read_datagram(&mut stream))
+                .await
+                .expect("tunnel stays open and active across the restart")
+                .expect("tunnel must not close during the restart");
             if let Ok((_, ControlMessage::HelloAck(ack))) = parse_control(&bytes) {
                 assert_eq!(ack.status, HelloStatus::Ok);
                 received_ack = true;
             } else if let Ok((header, _)) = MediaHeader::decode(&bytes) {
-                if header.frag_index == 0 { frames += 1; }
+                if header.stream_epoch != epoch && header.frag_index == 0 {
+                    new_epoch = Some(header.stream_epoch);
+                    frames += 1;
+                }
             }
         }
+        assert!(new_epoch.is_some(), "the restarted pipeline streams with a new epoch");
         assert_eq!(CURRENT_GENERATION.load(Ordering::SeqCst), original_generation + 1,
             "USB HELLO during attach must not restart capture again");
         assert_eq!(*shared.vdd_status.lock(), VddStatus::Attaching);
         *shared.capture_target.lock() = CaptureTarget::PrimaryAuto;
         *shared.vdd_status.lock() = VddStatus::Inactive;
-        eprintln!("USB_VDD_RECONNECT frames={frames} restarts=1");
+        eprintln!("USB_VDD_RESTART_KEEPS_TUNNEL frames={frames} restarts=1");
         drop(stream);
         let disconnected = Instant::now();
         while shared.client_connected() && disconnected.elapsed() < Duration::from_secs(1) {
@@ -431,7 +497,7 @@ fn audio_stream_end_to_end() {
     use eternal_wire::v2::audio::AudioHeader;
     use eternal_wire::v2::control::{FEATURE_WANTS_AUDIO, HOSTCAP_AUDIO};
     use std::sync::atomic::Ordering;
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _env = test_env();
     init_test_tracing();
     ffmpeg_next::init().unwrap();
     std::env::set_var("ETERNAL_CAPTURE", "synthetic");
@@ -592,9 +658,95 @@ fn audio_stream_end_to_end() {
     }
 }
 
+/// Native first-second audio measurement across repeated connects with the
+/// PC's real WASAPI loopback (inaudible: it only reads the mix).
+#[cfg(windows)]
+#[test]
+#[ignore = "opens the default output for loopback; run natively"]
+fn wasapi_connect_first_second_audio() {
+    use eternal_wire::v2::audio::AudioHeader;
+    use eternal_wire::v2::control::FEATURE_WANTS_AUDIO;
+    use std::sync::atomic::Ordering;
+    let _env = test_env();
+    init_test_tracing();
+    ffmpeg_next::init().unwrap();
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::remove_var("ETERNAL_AUDIO");
+    std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
+    for name in ["ETERNAL_DROP", "ETERNAL_REORDER", "ETERNAL_JITTER_MS"] {
+        std::env::remove_var(name);
+    }
+    let connects: usize = std::env::var("EM_CONNECTS").map_or(8, |value| value.parse().unwrap());
+    let listen_port = free_udp_port();
+    let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
+    *shared.encoder_override.lock() = Some("libx264".into());
+    let (supervisor_tx, supervisor_rx) = mpsc::channel();
+    let supervisor_shared = shared.clone();
+    let supervisor_sender = supervisor_tx.clone();
+    let supervisor = std::thread::spawn(move || {
+        eternal_host::supervisor::run(
+            listen_port,
+            supervisor_shared,
+            GpuInfo::software_fallback(),
+            supervisor_sender,
+            supervisor_rx,
+        )
+    });
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut buffer = [0; 2048];
+        for connect in 0..connects {
+            let mut receiver =
+                FakeReceiver::connect_full(listen_port, CAP_DECODE_H264, FEATURE_WANTS_AUDIO);
+            let (mut packets, mut gaps, mut first) = (0, 0, None);
+            let mut previous: Option<u32> = None;
+            let until = Instant::now() + Duration::from_millis(1500);
+            while Instant::now() < until {
+                receiver.maybe_report(0, 0);
+                let Ok((len, _)) = receiver.socket.recv_from(&mut buffer) else {
+                    continue;
+                };
+                if !matches!(classify(&buffer[..len]), Classified::Audio { .. }) {
+                    continue;
+                }
+                let (header, _) = AudioHeader::decode(&buffer[..len]).unwrap();
+                first.get_or_insert((
+                    header.audio_seq,
+                    eternal_host::clock::host_now_us().saturating_sub(header.capture_ts_us),
+                ));
+                if let Some(previous) = previous {
+                    gaps += header.audio_seq.wrapping_sub(previous).saturating_sub(1);
+                }
+                previous = Some(header.audio_seq);
+                packets += 1;
+            }
+            let stats = eternal_host::stats::PIPELINE_STATS.lock().audio.clone();
+            let (first_seq, first_age_us) = first.unwrap_or((u32::MAX, 0));
+            println!(
+                "CONNECT {connect} packets={packets} first_seq={first_seq} first_age_us={first_age_us} gaps={gaps} dropped={} stale={} queue_full={} send_failed={} device={}",
+                stats.dropped, stats.stale_dropped, stats.capture_queue_dropped, stats.send_failed, stats.device
+            );
+            receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+            drop(receiver);
+            assert_eq!(
+                (first_seq, gaps, stats.dropped),
+                (0, 0, 0),
+                "connect {connect}"
+            );
+            std::thread::sleep(Duration::from_millis(700));
+        }
+    }));
+    shared.audio_enabled.store(false, Ordering::SeqCst);
+    let _ = supervisor_tx.send(SupervisorCommand::Shutdown);
+    supervisor.join().unwrap();
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 #[test]
 fn synthetic_stream_end_to_end_v2() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _env = test_env();
     init_test_tracing();
     let _ = ffmpeg_next::init();
 
@@ -791,7 +943,7 @@ fn synthetic_stream_end_to_end_v2() {
 /// Repair is negotiated and exercised through the real encoder and transport.
 #[test]
 fn lossy_stream_recovers_and_adapts() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _env = test_env();
     init_test_tracing();
     let _ = ffmpeg_next::init();
     std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
@@ -1049,7 +1201,7 @@ fn lossy_stream_recovers_and_adapts() {
 /// down from its 15 Mbps start.
 #[test]
 fn lossy_legacy_stream_uses_keyframe_recovery() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _env = test_env();
     init_test_tracing();
     let _ = ffmpeg_next::init();
 
@@ -1195,7 +1347,7 @@ fn lossy_legacy_stream_uses_keyframe_recovery() {
 fn hevc_stream_negotiates_and_decodes() {
     use eternal_wire::v2::control::{CAP_DECODE_HEVC, CODEC_HEVC};
 
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _env = test_env();
     init_test_tracing();
     let _ = ffmpeg_next::init();
 
@@ -1341,12 +1493,22 @@ fn hevc_stream_negotiates_and_decodes() {
 #[test]
 fn input_relay_maps_touches_end_to_end() {
     use eternal_host::input::{
-        recorder, Injection, KIND_HOVER, KIND_KEY, KIND_MOUSE_ABS, KIND_SCROLL, KIND_TEXT,
-        KIND_TOUCH,
+        desktop_pixel_to_abs, recorder, Injection, VirtualScreen, KIND_HOVER, KIND_KEY,
+        KIND_MOUSE_ABS, KIND_SCROLL, KIND_TEXT, KIND_TOUCH,
     };
     use eternal_wire::v2::control::{InputEvent, FEATURE_WANTS_INPUT};
+    // Off Windows the synthetic output is the whole virtual screen. Absolute
+    // coordinates aim at pixel centres.
+    let screen = VirtualScreen {
+        left: 0,
+        top: 0,
+        width: SYNTH_W,
+        height: SYNTH_H,
+    };
+    let (x0, y0) = desktop_pixel_to_abs(0, 0, screen);
+    let (x1, y1) = desktop_pixel_to_abs(SYNTH_W as i32 - 1, SYNTH_H as i32 - 1, screen);
 
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _env = test_env();
     init_test_tracing();
     let _ = ffmpeg_next::init();
 
@@ -1493,21 +1655,15 @@ fn input_relay_maps_touches_end_to_end() {
     assert_eq!(
         &recorded[..4],
         &[
-            Injection::MoveAbs { x: 0, y: 0 },
-            Injection::LeftDown { x: 0, y: 0 },
-            Injection::MoveAbs { x: 0, y: 0 },
-            Injection::LeftUp { x: 0, y: 0 },
+            Injection::MoveAbs { x: x0, y: y0 },
+            Injection::LeftDown { x: x0, y: y0 },
+            Injection::MoveAbs { x: x0, y: y0 },
+            Injection::LeftUp { x: x0, y: y0 },
         ],
         "tap must inject exactly one click (recorded: {recorded:?})"
     );
-    // Drag to the far corner maps to the absolute-space maximum.
-    assert_eq!(
-        recorded[4],
-        Injection::MoveAbs {
-            x: 65_535,
-            y: 65_535
-        }
-    );
+    // Drag to the far corner maps to the last pixel's centre.
+    assert_eq!(recorded[4], Injection::MoveAbs { x: x1, y: y1 });
     // Scroll: pointer placed at ~center, then a wheel tick down.
     let Injection::MoveAbs { x, y } = recorded[5] else {
         panic!("expected scroll pointer move, got {:?}", recorded[5]);
@@ -1527,11 +1683,11 @@ fn input_relay_maps_touches_end_to_end() {
                 extended: true
             },
             Injection::Unicode(72),
-            Injection::MoveAbs { x: 0, y: 0 },
-            Injection::MoveAbs { x: 0, y: 0 },
-            Injection::MiddleDown { x: 0, y: 0 },
-            Injection::MoveAbs { x: 0, y: 0 },
-            Injection::MiddleUp { x: 0, y: 0 },
+            Injection::MoveAbs { x: x0, y: y0 },
+            Injection::MoveAbs { x: x0, y: y0 },
+            Injection::MiddleDown { x: x0, y: y0 },
+            Injection::MoveAbs { x: x0, y: y0 },
+            Injection::MiddleUp { x: x0, y: y0 },
         ]
     );
     assert_eq!(recorded.len(), 15, "no extra injections: {recorded:?}");
@@ -1572,6 +1728,8 @@ fn input_relay_maps_touches_end_to_end() {
         phase: PenPhase::Down,
         x: 0,
         y: 0,
+        x_norm: 0,
+        y_norm: 0,
         pressure: 256,
         tilt_x: -40,
         tilt_y: 30,
@@ -1612,7 +1770,7 @@ fn input_relay_maps_touches_end_to_end() {
 /// (the client never re-handshakes; its assembler resets on the epoch bump).
 #[test]
 fn encoder_crash_auto_restarts_and_stream_recovers() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _env = test_env();
     init_test_tracing();
     let _ = ffmpeg_next::init();
 
@@ -1741,7 +1899,7 @@ fn encoder_crash_auto_restarts_and_stream_recovers() {
 
 #[test]
 fn pairing_flow_end_to_end() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _env = test_env();
     init_test_tracing();
     ffmpeg_next::init().unwrap();
     std::env::set_var("ETERNAL_CAPTURE", "synthetic");
@@ -1909,7 +2067,7 @@ fn pairing_flow_end_to_end() {
 #[test]
 fn preferred_fps_caps_the_host() {
     use std::sync::atomic::Ordering;
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _env = test_env();
     init_test_tracing();
     ffmpeg_next::init().unwrap();
     std::env::set_var("ETERNAL_CAPTURE", "synthetic");
@@ -1997,4 +2155,133 @@ fn preferred_fps_caps_the_host() {
     if let Err(error) = outcome {
         std::panic::resume_unwind(error);
     }
+}
+
+/// A live client that decodes nothing must keep its session for as long as it
+/// sends reports, or (while typing) only keyboard events, and must expire
+/// about LIVENESS_TIMEOUT after it really goes silent. CI's keyboard scenario
+/// for PR #66 logged "Client liveness expired" during the test; this checks
+/// the host side of that with the real supervisor and transport.
+#[test]
+fn quiet_clients_keep_their_session_until_they_go_silent() {
+    use eternal_host::transport::session::LIVENESS_TIMEOUT;
+
+    let _env = test_env();
+    init_test_tracing();
+    let _ = ffmpeg_next::init();
+    std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    for name in ["ETERNAL_DROP", "ETERNAL_REORDER", "ETERNAL_JITTER_MS"] {
+        std::env::remove_var(name);
+    }
+    let listen_port = free_udp_port();
+    let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
+    *shared.encoder_override.lock() = Some("libx264".to_string());
+    let (supervisor_tx, supervisor_rx) = mpsc::channel();
+    let supervisor = {
+        let (shared, tx) = (shared.clone(), supervisor_tx.clone());
+        std::thread::spawn(move || {
+            eternal_host::supervisor::run(
+                listen_port,
+                shared,
+                GpuInfo::software_fallback(),
+                tx,
+                supervisor_rx,
+            )
+        })
+    };
+
+    #[cfg(not(windows))]
+    let mut receiver = FakeReceiver::connect_with_caps(
+        listen_port,
+        eternal_wire::v2::control::FEATURE_WANTS_INPUT,
+    );
+    #[cfg(windows)]
+    let mut receiver = FakeReceiver::connect(listen_port);
+    let session = receiver.session_id;
+    let mut datagram = [0u8; 2048];
+    // Read (and ignore) video until `until`, without decoding anything.
+    let mut drain_until = |receiver: &FakeReceiver, until: Instant| {
+        while Instant::now() < until {
+            let _ = receiver.socket.recv_from(&mut datagram);
+        }
+    };
+    let still_connected = |phase: &str| {
+        assert!(
+            shared.client_connected(),
+            "{phase}: host dropped a live client"
+        );
+        assert_eq!(shared.session.lock().session_id(), Some(session), "{phase}");
+    };
+
+    // Reports only, as the iPad sends while its decoder is stalled.
+    let phase_end = Instant::now() + LIVENESS_TIMEOUT * 3;
+    let mut sent = 0;
+    let mut last_message;
+    loop {
+        receiver.last_report = Instant::now() - Duration::from_secs(1);
+        receiver.maybe_report(0, 0);
+        last_message = Instant::now();
+        sent += 1;
+        drain_until(&receiver, Instant::now() + Duration::from_millis(500));
+        still_connected("reports only");
+        if Instant::now() >= phase_end {
+            break;
+        }
+    }
+    assert!(sent >= 12, "{sent} reports");
+
+    // Keyboard events only, no reports.
+    #[cfg(not(windows))]
+    {
+        use eternal_host::input::KIND_KEY;
+        use eternal_wire::v2::control::InputEvent;
+        let phase_end = Instant::now() + LIVENESS_TIMEOUT * 3;
+        let mut event_id = 100;
+        while Instant::now() < phase_end {
+            for phase in [0, 2] {
+                event_id += 1;
+                receiver.send(&ControlMessage::InputEvent(InputEvent {
+                    input_ver: 1,
+                    kind: KIND_KEY,
+                    phase,
+                    buttons: 0,
+                    event_id,
+                    x_norm: 0,
+                    y_norm: 0,
+                    pressure_x1000: 0,
+                    scroll_dx: 0,
+                    scroll_dy: 0,
+                    keycode: 0x04,
+                    modifiers: 0,
+                    client_time_us: 0,
+                    tilt_x: 0,
+                    tilt_y: 0,
+                }));
+            }
+            last_message = Instant::now();
+            drain_until(&receiver, Instant::now() + Duration::from_secs(1));
+            still_connected("keyboard only");
+        }
+    }
+
+    // Silence: the session ends one liveness window later, as in 0.3.1.
+    while shared.client_connected() && last_message.elapsed() < LIVENESS_TIMEOUT * 2 {
+        drain_until(&receiver, Instant::now() + Duration::from_millis(20));
+    }
+    let expired_after = last_message.elapsed();
+    assert!(!shared.client_connected(), "a silent client must expire");
+    assert!(
+        expired_after >= LIVENESS_TIMEOUT - Duration::from_millis(300),
+        "expired early: {expired_after:?}"
+    );
+    eprintln!(
+        "QUIET_CLIENT reports_sent={sent} expired_after_ms={}",
+        expired_after.as_millis()
+    );
+
+    shared.stop();
+    let _ = supervisor_tx.send(SupervisorCommand::Shutdown);
+    let _ = supervisor.join();
 }

@@ -13,6 +13,7 @@ struct DisplayView: View {
     // The picture fades in once the view is on screen.
     @State private var appeared = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
 
     var body: some View {
         ZStack {
@@ -62,16 +63,22 @@ struct DisplayView: View {
                         .accessibilityLabel("Show or hide drawing controls")
                         .accessibilityIdentifier("display.drawingControls")
                     }
-                    if showHUD && settings.showHUD {
-                        hudOverlay
-                            .transition(.opacity.combined(with: .move(edge: .top)))
+                    // A hiding HUD slides out for a moment. Touches and
+                    // VoiceOver go to the stream as soon as it starts.
+                    Group {
+                        if showHUD && settings.showHUD {
+                            hudOverlay
+                                .transition(.opacity.combined(with: .move(edge: .top)))
+                        }
                     }
+                    .allowsHitTesting(showHUD)
+                    .accessibilityHidden(!showHUD)
                 }
                 .padding(.top, 12)
                 .padding(.trailing, 16)
 
                 if connectionManager.sessionDrawingMode && !connectionManager.sessionHasPen {
-                    Text("Native Pencil input is unavailable. Check that your Windows host supports Windows Ink.")
+                    Text("Apple Pencil can't draw on this PC. Update EternalMonitor on the PC; Windows 10 needs version 1809 or later.")
                         .font(.app(14, relativeTo: .footnote))
                         .foregroundStyle(Theme.text)
                         .padding(12)
@@ -82,12 +89,16 @@ struct DisplayView: View {
 
                 Spacer()
 
-                if showHUD {
-                    bottomBar
-                        .padding(.horizontal, 16)
-                        .padding(.bottom, 12)
-                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                Group {
+                    if showHUD {
+                        bottomBar
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 12)
+                            .transition(.opacity.combined(with: .move(edge: .bottom)))
+                    }
                 }
+                .allowsHitTesting(showHUD)
+                .accessibilityHidden(!showHUD)
             }
         }
         .statusBarHidden(true)
@@ -120,6 +131,7 @@ struct DisplayView: View {
             if presented { showKeyboard = false; hudDismissTask?.cancel() }
             else { scheduleHUDDismiss() }
         }
+        .onChange(of: voiceOverEnabled) { _, _ in scheduleHUDDismiss() }
         .onChange(of: connectionManager.signalLost) { _, lost in
             if lost { hudDismissTask?.cancel(); showHUD = true }
             else { scheduleHUDDismiss() }
@@ -310,6 +322,18 @@ struct DisplayView: View {
                 .accessibilityIdentifier("display.keyboard")
             }
 
+            Button {
+                settings.pictureFit = settings.pictureFit == .fit ? .fill : .fit
+            } label: {
+                Image(systemName: settings.pictureFit == .fit
+                    ? "arrow.up.left.and.arrow.down.right" : "arrow.down.right.and.arrow.up.left")
+                    .font(.system(size: 15, weight: .medium))
+                    .frame(width: 40, height: 40)
+            }
+            .buttonStyle(PillButtonStyle())
+            .accessibilityLabel(settings.pictureFit == .fit ? "Fill the screen" : "Show the whole picture")
+            .accessibilityIdentifier("display.pictureFit")
+
             Button { showSettings = true } label: {
                 Image(systemName: "gearshape")
                     .font(.system(size: 15, weight: .medium))
@@ -350,7 +374,7 @@ struct DisplayView: View {
             Text("Reconnecting to your PC")
                 .font(.app(18, .semibold, relativeTo: .headline))
                 .foregroundStyle(Theme.text)
-            Text("The picture comes back as soon as the PC answers.")
+            Text("The picture comes back as soon as the PC answers. If the PC went to sleep, wake it.")
                 .font(.app(14, relativeTo: .callout))
                 .foregroundStyle(Theme.textMuted)
                 .multilineTextAlignment(.center)
@@ -384,14 +408,33 @@ struct DisplayView: View {
         }
     }
 
+    /// UI tests launch with `-hudHideSeconds 10` to tap the HUD while it leaves.
+    private var hudHideSeconds: Double {
+        #if DEBUG
+        let slowed = UserDefaults.standard.double(forKey: "hudHideSeconds")
+        if slowed > 0 { return slowed }
+        #endif
+        return 0.3
+    }
+
+    /// VoiceOver reads the HUD at its own pace, so the HUD stays up while
+    /// VoiceOver runs; a tap still hides it. UI tests launch with
+    /// `-assumeVoiceOver YES`.
+    private var voiceOverRunning: Bool {
+        #if DEBUG
+        if UserDefaults.standard.bool(forKey: "assumeVoiceOver") { return true }
+        #endif
+        return voiceOverEnabled
+    }
+
     private func scheduleHUDDismiss() {
         hudDismissTask?.cancel()
         withAnimation(Motion.gentle) { showHUD = true }
-        guard !showKeyboard && !showSettings && !connectionManager.signalLost else { return }
+        guard !showKeyboard && !showSettings && !connectionManager.signalLost && !voiceOverRunning else { return }
         hudDismissTask = Task {
             try? await Task.sleep(for: .seconds(5))
             if !Task.isCancelled {
-                withAnimation(.easeOut(duration: 0.3)) {
+                withAnimation(.easeOut(duration: hudHideSeconds)) {
                     showHUD = false
                 }
             }

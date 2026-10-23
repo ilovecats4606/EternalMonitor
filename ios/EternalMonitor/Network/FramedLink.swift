@@ -7,7 +7,7 @@ final class FramedLink: MediaLink {
     let datagrams = MediaDatagrams()
     let isUSB = true
     var onConnectionEstablished: (() -> Void)?
-    var onError: ((String) -> Void)?
+    var onError: ((LinkError) -> Void)?
     var onListenerReady: ((UInt16) -> Void)?
     var onClosed: (() -> Void)?
     var onPreambleReady: (() -> Void)?
@@ -40,7 +40,7 @@ final class FramedLink: MediaLink {
     func validatePreamble() {
         queue.async { [self] in
             guard let connection else { return }
-            let deadline = DispatchWorkItem { [weak self] in self?.fail("USB handshake timed out.") }
+            let deadline = DispatchWorkItem { [weak self] in self?.fail(LinkError(.timeout, "USB handshake timed out.")) }
             preambleDeadline = deadline
             queue.asyncAfter(deadline: .now() + .seconds(2), execute: deadline)
             connection.stateUpdateHandler = { [weak self, weak connection] state in
@@ -49,7 +49,7 @@ final class FramedLink: MediaLink {
                 case .ready: self.receiveNext()
                 case .failed(let error):
                     SupportDiagnostics.shared.record("error", "usb", "NWConnection failed: \(error)")
-                    self.fail("USB connection failed: \(error.localizedDescription)")
+                    self.fail(LinkError(.connectionFailed, "USB connection failed: \(error.localizedDescription)", underlying: error))
                 default: break
                 }
             }
@@ -75,9 +75,9 @@ final class FramedLink: MediaLink {
     func send(_ data: Data) {
         let write = { [self] in
             guard connection != nil else { return }
-            guard pendingSends.count < 64 else { fail("USB connection stopped responding."); return }
+            guard pendingSends.count < 64 else { fail(LinkError(.timeout, "USB connection stopped responding.")); return }
             do { pendingSends.append(try EMLinkFramer.encode(data)) }
-            catch { fail("Invalid USB packet."); return }
+            catch { fail(LinkError(.protocolMismatch, "Invalid USB packet.")); return }
             sendNext()
         }
         if DispatchQueue.getSpecific(key: queueKey) != nil { write() }
@@ -97,7 +97,7 @@ final class FramedLink: MediaLink {
             self.sending = false
             if let error {
                 SupportDiagnostics.shared.record("error", "usb", "NWConnection send: \(error)")
-                self.fail("USB send failed: \(error.localizedDescription)")
+                self.fail(LinkError(.send, "USB send failed: \(error.localizedDescription)", underlying: error))
             }
             else { self.sendNext() }
         })
@@ -120,17 +120,17 @@ final class FramedLink: MediaLink {
                         for packet in packets { self.datagrams.handle(packet) }
                     } else {
                         guard self.bufferedPackets.count + packets.count <= 64 else {
-                            self.fail("USB data arrived before a session was ready."); return
+                            self.fail(LinkError(.protocolMismatch, "USB data arrived before a session was ready.")); return
                         }
                         self.bufferedPackets.append(contentsOf: packets)
                     }
                 } catch {
-                    self.fail("USB protocol mismatch."); return
+                    self.fail(LinkError(.protocolMismatch, "USB protocol mismatch.")); return
                 }
             }
             if let error {
                 SupportDiagnostics.shared.record("error", "usb", "NWConnection receive: \(error)")
-                self.fail("USB receive failed: \(error.localizedDescription)")
+                self.fail(LinkError(.receive, "USB receive failed: \(error.localizedDescription)", underlying: error))
             }
             else if complete { self.finish() }
             else { self.receiveNext() }
@@ -163,10 +163,10 @@ final class FramedLink: MediaLink {
         datagrams.reset()
     }
 
-    private func fail(_ message: String) {
+    private func fail(_ error: LinkError) {
         guard connection != nil else { return }
-        SupportDiagnostics.shared.record("error", "usb", message)
-        onError?(message)
+        SupportDiagnostics.shared.record("error", "usb", error.message)
+        onError?(error)
         finish()
     }
 

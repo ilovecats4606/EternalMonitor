@@ -23,7 +23,7 @@ AppId={{B7E6F2C4-3A91-4E0D-9C2A-ETERNALMONITOR}}
 AppName=EternalMonitor
 AppVersion={#AppVersion}
 AppVerName=EternalMonitor {#AppVersion}
-AppPublisher=Ali Younes
+AppPublisher=Sideband Studio
 AppPublisherURL=https://github.com/sidebandstudio/EternalMonitor
 AppSupportURL=https://github.com/sidebandstudio/EternalMonitor
 AppUpdatesURL=https://github.com/sidebandstudio/EternalMonitor/releases
@@ -53,6 +53,11 @@ SetupLogging=yes
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
+[Messages]
+; The same requirements the website, README and SETUP.md list.
+WinVersionTooLowError=EternalMonitor needs Windows 10 version 1809 or later, or Windows 11. Update Windows, then run this installer again.
+OnlyOnTheseArchitectures=EternalMonitor needs a 64-bit PC with Windows 10 version 1809 or later, or Windows 11.
+
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
 ; Autostart is handled inside the app (Settings -> "Start with Windows",
@@ -60,6 +65,8 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 
 [Files]
 Source: "{#StagingDir}\EternalMonitor-host.exe"; DestDir: "{app}"; Flags: ignoreversion
+; In-app updates run a copy of this helper from the user's update folder.
+Source: "{#StagingDir}\EternalMonitor-updater.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StagingDir}\*.dll";                   DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StagingDir}\ffmpeg.exe";              DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#StagingDir}\README.md";               DestDir: "{app}"; Flags: ignoreversion isreadme skipifsourcedoesntexist
@@ -87,8 +94,8 @@ Name: "{autodesktop}\EternalMonitor";      Filename: "{app}\EternalMonitor-host.
 ; Replace only this product's named rules so upgrades remain idempotent.
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""EternalMonitor Host UDP"""; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""EternalMonitor Host TCP"""; Flags: runhidden waituntilterminated
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""EternalMonitor Host UDP"" dir=in action=allow program=""{app}\EternalMonitor-host.exe"" protocol=UDP profile=private,public enable=yes"; StatusMsg: "Allowing display traffic through Windows Firewall..."; Flags: runhidden waituntilterminated
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""EternalMonitor Host TCP"" dir=in action=allow program=""{app}\EternalMonitor-host.exe"" protocol=TCP profile=private,public enable=yes"; Flags: runhidden waituntilterminated
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""EternalMonitor Host UDP"" dir=in action=allow program=""{app}\EternalMonitor-host.exe"" protocol=UDP profile=domain,private,public enable=yes"; StatusMsg: "Allowing display traffic through Windows Firewall..."; Flags: runhidden waituntilterminated
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""EternalMonitor Host TCP"" dir=in action=allow program=""{app}\EternalMonitor-host.exe"" protocol=TCP profile=domain,private,public enable=yes"; Flags: runhidden waituntilterminated
 #ifdef IncludeDriver
 ; The vendor setup prompts to uninstall an existing installation even with silent
 ; switches. Preserve an existing driver and install only when it is absent.

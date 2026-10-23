@@ -7,7 +7,7 @@ final class KeyboardRelayTests: XCTestCase {
         let path = try XCTUnwrap(environment["EM_INPUT_HOST_LOG"])
         let before = (try? Data(contentsOf: URL(fileURLWithPath: path)).count) ?? 0
         let app = XCUIApplication()
-        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "YES", "-playPCaudio", "NO"]
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "YES", "-playPCaudio", "NO", "-pictureFit", "fit"]
         app.launchEnvironment["EM_AUTOCONNECT"] = environment["EM_INPUT_HOST"] ?? "127.0.0.1:19875"
         app.launchEnvironment["EM_E2E_LOG"] = "1"
         app.launch()
@@ -33,6 +33,13 @@ final class KeyboardRelayTests: XCTestCase {
         app.keyboards.buttons["Hide keyboard"].tap()
         verifyDismissalAndRestoreHUD(app: app, keyboard: keyboard)
         capture("keyboard-dismissed", app: app)
+        // A slow screenshot can use up the HUD's 5 s timer (CI took 2.3 s
+        // here while the simulator's decoder stalled), and the button can
+        // vanish mid-tap. Let the HUD hide, reveal it, and tap at once.
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: keyboard)
+        waitForExpectations(timeout: 6)
+        revealHUD(app: app)
+        XCTAssertTrue(keyboard.waitForExistence(timeout: 5))
         keyboard.tap()
         XCTAssertTrue(app.buttons["keyboard.done"].waitForExistence(timeout: 5))
         app.buttons["keyboard.done"].tap()
@@ -49,10 +56,24 @@ final class KeyboardRelayTests: XCTestCase {
         // timeout first, then bring the controls back before checking state.
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: keyboard)
         waitForExpectations(timeout: 6)
-        app.tap(withNumberOfTaps: 1, numberOfTouches: 3)
+        revealHUD(app: app)
         XCTAssertTrue(keyboard.waitForExistence(timeout: 5))
         XCTAssertEqual(keyboard.label, "Keyboard")
         XCTAssertTrue(app.buttons["display.disconnect"].exists)
+    }
+
+    /// XCTest spreads a three-finger tap from the top edge to the bottom
+    /// edge. Its bottom finger lands where the sliding bar's Keyboard button
+    /// is near the end of the hide animation, which opened the keyboard
+    /// again in CI. Tap with three fingers together in the middle instead.
+    private func revealHUD(app: XCUIApplication) {
+        let frame = app.frame
+        let tapped = expectation(description: "Three-finger tap")
+        EMTapFingers([-60.0, 0, 60].map { NSValue(cgPoint: CGPoint(x: frame.midX + $0, y: frame.midY)) }) { success, error in
+            XCTAssertTrue(success, error?.localizedDescription ?? "Touch synthesis failed")
+            tapped.fulfill()
+        }
+        wait(for: [tapped], timeout: 10)
     }
 
     private func capture(_ name: String, app: XCUIApplication) {

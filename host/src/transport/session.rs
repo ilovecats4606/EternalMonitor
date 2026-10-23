@@ -48,6 +48,9 @@ pub struct Actions {
     /// Negotiated and session-gated request; the transport checks frag_count
     /// against its stored datagrams before sending anything.
     pub retransmit: Option<(u32, u32, Vec<u16>)>,
+    /// An update stopped this client's stream: tell it, making sure the
+    /// message leaves (see [`Session::begin_update`]).
+    pub goodbye: Option<(PeerId, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +94,12 @@ pub trait ConfigSource {
 
 pub struct Session {
     active: Option<ActiveSession>,
+    /// An update is taking over: new clients are turned away (`Busy`) until it
+    /// either closes the host or gives up. Changed only under the session lock,
+    /// together with the check that nobody is streaming.
+    updating: bool,
+    /// The goodbye for a stream an update stopped, sent by the next tick.
+    goodbye: Option<(PeerId, Vec<u8>)>,
     /// Injected so tests control randomness; production passes a seeded value
     /// derived from process entropy.
     next_session_id: u32,
@@ -101,6 +110,8 @@ impl Session {
     pub fn new(session_id_seed: u32) -> Self {
         Self {
             active: None,
+            updating: false,
+            goodbye: None,
             next_session_id: session_id_seed.max(1),
             legacy_client_warned: false,
         }
@@ -108,6 +119,40 @@ impl Session {
 
     pub fn is_active(&self) -> bool {
         self.active.is_some()
+    }
+
+    /// Starts an update handoff. Atomic with admission: call with the session
+    /// lock held; a client either got in before (and this returns `false`) or
+    /// is refused until [`Self::end_update`]. With `stop_stream` (the user
+    /// chose Stop and update) a client that got in loses its session here and
+    /// is told the host is shutting down.
+    pub fn begin_update(&mut self, stop_stream: bool) -> bool {
+        if let Some(session) = self.active.as_ref() {
+            if !stop_stream {
+                return false;
+            }
+            let (peer, session_id) = (session.peer, session.session_id);
+            info!(%peer, "Stopping the stream for an update");
+            let msg_seq = self.next_msg_seq();
+            let bye = ControlMessage::Bye(ByeReason::HostShuttingDown);
+            self.goodbye = Some((
+                peer,
+                eternal_wire::v2::control::encode_control(session_id, msg_seq, &bye),
+            ));
+            self.active = None;
+        }
+        self.updating = true;
+        true
+    }
+
+    /// The goodbye [`Self::begin_update`] left for a stopped stream, if any.
+    pub fn take_goodbye(&mut self) -> Option<(PeerId, Vec<u8>)> {
+        self.goodbye.take()
+    }
+
+    /// The update handoff failed; clients may connect again.
+    pub fn end_update(&mut self) {
+        self.updating = false;
     }
 
     pub fn session_id(&self) -> Option<u32> {
@@ -280,12 +325,22 @@ impl Session {
 
         // Version gate first.
         if hello.proto_min > 2 || hello.proto_max < 2 {
+            crate::updates::note_ipad_protocol(hello.proto_min, hello.proto_max);
             let ack = self.make_ack(
                 HelloStatus::VersionUnsupported,
                 hello.client_nonce,
                 0,
                 config,
             );
+            actions.replies.push((source, ack));
+            return actions;
+        }
+
+        // An update is about to close the host: don't start a stream it would cut.
+        // The iPad shows Busy ("already streaming"); a retry after the restart works.
+        if self.updating {
+            info!(peer = %source, "Client turned away while an update starts");
+            let ack = self.make_ack(HelloStatus::Busy, hello.client_nonce, 0, config);
             actions.replies.push((source, ack));
             return actions;
         }
@@ -514,6 +569,16 @@ impl Session {
         actions
     }
 
+    /// A new pipeline generation is listening again. The client's heartbeats
+    /// and reports during the restart gap went unheard, so the gap must not
+    /// count against it: 0.3.1 expired live iPads the moment a slow restart
+    /// finished and made them reconnect.
+    pub fn transport_resumed(&mut self, now: Instant) {
+        if let Some(session) = self.active.as_mut() {
+            session.liveness_deadline = session.liveness_deadline.max(now + LIVENESS_TIMEOUT);
+        }
+    }
+
     /// Periodic tick: expire the session when the client has been silent past
     /// the liveness window. Returns the heartbeat to send (if a session is
     /// active and `send_heartbeat` is true).
@@ -524,6 +589,10 @@ impl Session {
         now: Instant,
     ) -> Actions {
         let mut actions = Actions::default();
+        if let Some(goodbye) = self.take_goodbye() {
+            actions.goodbye = Some(goodbye);
+            actions.client_lost = self.active.is_none();
+        }
         let Some(session) = self.active.as_ref() else {
             return actions;
         };
@@ -585,6 +654,7 @@ impl Session {
     /// A legacy (v0.1.x) ETERNALHELLO arrived: no wire reply — the old app
     /// can't parse anything we'd send — but tell the user what happened.
     pub fn note_legacy_hello(&mut self, source: PeerId) {
+        crate::updates::note_legacy_ipad();
         if !self.legacy_client_warned {
             self.legacy_client_warned = true;
             warn!(
@@ -1026,6 +1096,50 @@ mod tests {
     }
 
     #[test]
+    fn an_update_handoff_is_atomic_with_admitting_clients() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+
+        // Nobody streaming: the handoff starts and new clients are turned away.
+        let mut session = Session::new(1);
+        assert!(session.begin_update(false));
+        let refused = session.handle_control(peer, 0, hello(1, 50000), &TestConfig, now);
+        assert_eq!(parse_ack(&refused.replies[0].1).status, HelloStatus::Busy);
+        assert!(refused.new_target.is_none());
+        assert!(!session.is_active(), "no stream for the update to cut");
+
+        // The handoff failed: the same client is admitted again.
+        session.end_update();
+        let admitted = session.handle_control(peer, 0, hello(2, 50000), &TestConfig, now);
+        assert_eq!(admitted.new_target, Some(peer));
+
+        // A client that got in first wins: the handoff does not start.
+        assert!(!session.begin_update(false));
+        let still = session.handle_control(peer, 0, hello(2, 50000), &TestConfig, now);
+        assert_eq!(parse_ack(&still.replies[0].1).status, HelloStatus::Ok);
+        assert!(session.tick(&TestConfig, false, now).replies.is_empty());
+
+        // Unless the user chose Stop and update: that stream ends in the same
+        // step, and the next client is turned away.
+        let id = session.session_id().unwrap();
+        assert!(session.begin_update(true));
+        assert!(!session.is_active());
+        let other = addr([10, 0, 0, 6], 50000);
+        let refused = session.handle_control(other, 0, hello(3, 50000), &TestConfig, now);
+        assert_eq!(parse_ack(&refused.replies[0].1).status, HelloStatus::Busy);
+        // The next tick tells the iPad, once.
+        let ticked = session.tick(&TestConfig, false, now);
+        assert!(ticked.client_lost);
+        assert!(ticked.replies.is_empty());
+        let (to, goodbye) = ticked.goodbye.unwrap();
+        assert_eq!(to, peer);
+        let (header, bye) = eternal_wire::v2::control::parse_control(&goodbye).unwrap();
+        assert_eq!(header.session_id, id);
+        assert_eq!(bye, ControlMessage::Bye(ByeReason::HostShuttingDown));
+        assert!(session.take_goodbye().is_none());
+    }
+
+    #[test]
     fn unsupported_version_is_refused() {
         let mut session = Session::new(1234);
         let now = Instant::now();
@@ -1077,6 +1191,22 @@ mod tests {
         let expired = session.tick(&TestConfig, false, now + LIVENESS_TIMEOUT);
         assert!(expired.client_lost);
         assert!(!session.is_active());
+    }
+
+    #[test]
+    fn a_pipeline_restart_gap_does_not_expire_the_client() {
+        let mut session = Session::new(1234);
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
+        // The transport was down for 11 s (a capture restart with backoff).
+        let resumed = now + Duration::from_secs(11);
+        session.transport_resumed(resumed);
+        assert!(!session.tick(&TestConfig, false, resumed).client_lost);
+        assert!(session.is_active());
+        // A client that stays silent after the restart still expires.
+        let expired = session.tick(&TestConfig, false, resumed + LIVENESS_TIMEOUT);
+        assert!(expired.client_lost);
     }
 
     #[test]

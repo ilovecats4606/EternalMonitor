@@ -22,6 +22,8 @@ final class ControlChannel {
 
     var onSessionEstablished: ((SessionInfo) -> Void)?
     var onRejected: ((HelloStatus) -> Void)?
+    /// The last refusal's version mismatch, if any. Read inside `onRejected`.
+    private(set) var lastMismatch: VersionMismatch?
     /// HELLO2 went unanswered for the whole retry budget.
     var onHandshakeTimeout: (() -> Void)?
     var onHelloAttempt: ((Int, Int) -> Void)?
@@ -228,6 +230,9 @@ final class ControlChannel {
 
         guard ack.status == .ok else {
             clientNonce = 0
+            lastMismatch = helloTemplate.flatMap {
+                VersionMismatch.classify(hostProtocol: ack.acceptedVersion, iPadMin: $0.protoMin, iPadMax: $0.protoMax)
+            }
             onRejected?(ack.status)
             return
         }
@@ -304,17 +309,16 @@ final class ControlChannel {
     func sendBye(_ reason: ByeReason) {
         queue.sync { [self] in
             guard sessionId != 0 else { return }
-            sendMessage(.bye(reason))
-        }
-        // Two more for loss tolerance; these are best-effort and become no-ops
-        // once the socket is gone.
-        for delay in [50, 100] {
-            queue.asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
-                guard let self, self.sessionId != 0 else { return }
-                self.sendMessage(.bye(reason))
-            }
+            // Every copy goes out now, before the caller stops this channel
+            // and the link. Copies delayed by 50 and 100 ms never left:
+            // stop() clears the session first, so a single datagram had to
+            // survive a busy host, and backgrounding the app could lose it.
+            for _ in 0..<Self.byeCopies { sendMessage(.bye(reason)) }
         }
     }
+
+    /// One BYE plus two for loss tolerance.
+    static let byeCopies = 3
 
     private func startPinging() {
         burstPingsRemaining = Self.pingBurstCount

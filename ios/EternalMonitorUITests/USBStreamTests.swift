@@ -21,10 +21,10 @@ final class USBStreamTests: XCTestCase {
         cable("START")
         assertTransport("USB", app: app)
         capture("usb-connected", app: app)
-        app.buttons["display.disconnect"].tap()
-        XCTAssertTrue(app.textFields["connect.host"].waitForExistence(timeout: 5))
+        // A slow screenshot can use up the HUD's timer before the tap.
+        app.tapHUDControl("display.disconnect", until: app.textFields["connect.host"], reveal: .threeFingerTap)
         XCTAssertTrue(app.buttons["connect.usb"].exists)
-        XCTAssertTrue(app.staticTexts["connect.usbStatus"].label.contains("disconnected"))
+        XCTAssertTrue(app.staticTexts["connect.usbStatus"].label.contains("Paused"))
         capture("usb-disconnected", app: app)
     }
 
@@ -44,7 +44,7 @@ final class USBStreamTests: XCTestCase {
 
     private func launchApp(autoconnect: String = "") -> XCUIApplication {
         let app = XCUIApplication()
-        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "YES", "-autoReconnect", "YES"]
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "YES", "-autoReconnect", "YES", "-pictureFit", "fit"]
         app.launchEnvironment["EM_AUTOCONNECT"] = autoconnect
         app.launchEnvironment["EM_E2E_LOG"] = "1"
         app.launch()

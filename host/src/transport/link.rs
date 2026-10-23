@@ -249,6 +249,9 @@ impl VideoQueue {
 #[derive(Default)]
 struct Outbound {
     controls: VecDeque<Vec<u8>>,
+    /// Control datagrams ever queued; [`WriterState::controls_written`]
+    /// catches up as the writer finishes them.
+    controls_queued: u64,
     audio: AudioQueue,
     video: VideoQueue,
 }
@@ -298,21 +301,30 @@ struct WriterState {
     queue: Mutex<Outbound>,
     ready: Notify,
     closed: watch::Sender<bool>,
+    /// Control datagrams fully written to the stream, in queue order.
+    controls_written: watch::Sender<u64>,
     force_idr: Arc<AtomicBool>,
     stats: Arc<FramedStats>,
 }
 
 impl WriterState {
-    fn take_priority(&self) -> Option<Vec<u8>> {
+    /// The next control or audio datagram, and whether it is a control.
+    fn take_priority(&self) -> Option<(Vec<u8>, bool)> {
         let mut queue = self.queue.lock();
         if let Some(control) = queue.controls.pop_front() {
-            return Some(control);
+            return Some((control, true));
         }
         let (audio, dropped) = queue.audio.pop(Instant::now());
         self.stats
             .audio_packets_dropped
             .fetch_add(dropped, Ordering::Relaxed);
-        audio
+        audio.map(|audio| (audio, false))
+    }
+
+    fn wrote(&self, control: bool) {
+        if control {
+            self.controls_written.send_modify(|written| *written += 1);
+        }
     }
 
     fn record_drops(&self, dropped: u64) {
@@ -373,6 +385,7 @@ impl FramedLink {
             queue: Mutex::new(Outbound::default()),
             ready: Notify::new(),
             closed,
+            controls_written: watch::channel(0).0,
             force_idr,
             stats: Arc::new(FramedStats::default()),
         });
@@ -424,6 +437,40 @@ impl FramedLink {
 
     pub fn close_guard(&self) -> CloseGuard {
         CloseGuard(self.state.closed.clone())
+    }
+
+    /// Waits until every control datagram queued so far has been written to
+    /// the stream, for at most `timeout`. Dropping the link aborts its writer,
+    /// so a last message must be flushed first.
+    pub async fn flush(&self, timeout: Duration) -> io::Result<()> {
+        let queued = self.state.queue.lock().controls_queued;
+        let mut written = self.state.controls_written.subscribe();
+        let mut closed = self.state.closed.subscribe();
+        let flushed = async {
+            loop {
+                if *written.borrow_and_update() >= queued {
+                    return Ok(());
+                }
+                if *closed.borrow_and_update() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "USB tunnel closed",
+                    ));
+                }
+                tokio::select! {
+                    _ = written.changed() => {}
+                    _ = closed.changed() => {}
+                }
+            }
+        };
+        tokio::time::timeout(timeout, flushed)
+            .await
+            .unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "USB tunnel did not take the message",
+                ))
+            })
     }
 }
 
@@ -480,6 +527,7 @@ impl Link for FramedLink {
                     ));
                 }
                 queue.controls.push_back(datagram.to_vec());
+                queue.controls_queued += 1;
                 0
             }
         };
@@ -504,16 +552,17 @@ async fn write_loop(mut writer: impl AsyncWrite + Unpin, state: &WriterState) ->
         if *closed.borrow() {
             return Ok(());
         }
-        let (control, frame) = match state.take_priority() {
+        let (priority, frame) = match state.take_priority() {
             Some(packet) => (Some(packet), None),
             None => (None, state.queue.lock().video.pop()),
         };
-        if let Some(packet) = control {
+        if let Some((packet, control)) = priority {
             tokio::select! {
                 biased;
                 _ = closed.changed() => return Ok(()),
                 sent = write_datagram(&mut writer, &packet) => sent?,
             }
+            state.wrote(control);
         } else if let Some((revision, frame)) = frame {
             let count = frame.datagrams.len();
             for (index, packet) in frame.datagrams.into_iter().enumerate() {
@@ -530,12 +579,13 @@ async fn write_loop(mut writer: impl AsyncWrite + Unpin, state: &WriterState) ->
                 }
                 // Audio and control can pass between video datagrams, without
                 // ever interrupting a partly written TCP frame prefix/body.
-                while let Some(priority) = state.take_priority() {
+                while let Some((priority, control)) = state.take_priority() {
                     tokio::select! {
                         biased;
                         _ = closed.changed() => return Ok(()),
                         sent = write_datagram(&mut writer, &priority) => sent?,
                     }
+                    state.wrote(control);
                 }
             }
         } else {
@@ -751,6 +801,36 @@ mod tests {
         assert_eq!(inbound, ping);
         link.send(peer, &ping).await.unwrap();
         assert_eq!(read_datagram(&mut client).await.unwrap(), ping);
+    }
+
+    /// A last message is written before the link goes, and a peer that
+    /// stopped reading holds that up only for the given time.
+    #[tokio::test]
+    async fn flush_waits_for_queued_controls_but_not_forever() {
+        let (host, mut client) = tokio::io::duplex(64);
+        let peer = PeerId::usb(7);
+        let link = FramedLink::connect(host, peer, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        read_preamble(&mut client).await.unwrap();
+        let ping = encode_control(1, 1, &ControlMessage::Ping(Ping { t1_us: 123 }));
+        link.send(peer, &ping).await.unwrap();
+        link.flush(Duration::from_millis(250)).await.unwrap();
+        drop(link);
+        assert_eq!(read_datagram(&mut client).await.unwrap(), ping);
+
+        let (host, mut stalled) = tokio::io::duplex(64);
+        let link = FramedLink::connect(host, peer, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        read_preamble(&mut stalled).await.unwrap();
+        for _ in 0..4 {
+            link.send(peer, &ping).await.unwrap();
+        }
+        let start = Instant::now();
+        let flushed = link.flush(Duration::from_millis(100)).await;
+        assert!(matches!(flushed, Err(e) if e.kind() == io::ErrorKind::TimedOut));
+        assert!(start.elapsed() < Duration::from_millis(500));
     }
 
     #[tokio::test]

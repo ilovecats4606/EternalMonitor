@@ -337,12 +337,10 @@ pub fn run(
             Effect::Restart | Effect::Start => {
                 shared.stop();
                 bounded_join(&mut pipeline, generation);
-                {
-                    let mut stats = PIPELINE_STATS.lock();
-                    stats.reset_for_restart();
+                crate::audio::restart_stats(&PIPELINE_STATS, |stats| {
                     stats.set_target_addr(shared.target_addr.lock().to_string());
                     stats.set_bitrate(shared.abr_current_bps.load(Ordering::SeqCst));
-                }
+                });
                 generation = CURRENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
                 machine.note_started(generation);
                 healthy_since = Instant::now();
