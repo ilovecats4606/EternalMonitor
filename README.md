@@ -18,7 +18,7 @@ and control the PC with touch, a keyboard or Apple Pencil.
 </div>
 
 <p align="center">
-  <img src="docs/assets/og.png" width="860" alt="The EternalMonitor Windows app streaming a desktop to an iPad Pro">
+  <img src="docs/assets/og.png" width="860" alt="The EternalMonitor Windows app ready for an iPad, beside the iPad app's Connect to your PC screen">
 </p>
 
 EternalMonitor streams your Windows desktop to an iPad and sends your input back.
