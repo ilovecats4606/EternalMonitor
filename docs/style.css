@@ -342,27 +342,13 @@ small { font-size: 0.875rem; }
 .shots-stage { display: flow-root; }
 .shot { position: relative; }
 .shot-pc { width: 64%; z-index: 1; }
-/* 16% of the width down from the top of the PC label: the PC block is
-   30px label + 34px title bar + 64% / 2.08 image. */
-.shot-ipad { width: 44%; margin: calc(-14.77% - 64px) 0 0 auto; z-index: 2; }
-.shot-label {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  height: 20px;
-  margin-bottom: 10px;
-  font-size: 0.8125rem;
-  font-weight: 500;
-  line-height: 20px;
-  color: var(--muted);
-}
-.shot-label::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
-.shot-ipad .shot-label { justify-content: flex-end; margin: 10px 0 0; }
-.shots-caption { margin-top: 14px; padding: 0 4px; }
+/* 16% of the width below the PC window's top: the PC block is the 34px
+   title bar + 64% / 2.08 image. */
+.shot-ipad { width: 44%; margin: calc(-14.77% - 34px) 0 0 auto; z-index: 2; }
 @media (max-width: 720px) {
   .shot-pc { width: 88%; }
-  /* PC block: 64px + 88% / 2.08; the iPad starts 30% of the width down. */
-  .shot-ipad { width: 62%; margin-top: calc(-12.3% - 64px); }
+  /* PC block: 34px + 88% / 2.08; the iPad starts 30% of the width down. */
+  .shot-ipad { width: 62%; margin-top: calc(-12.3% - 34px); }
 }
 
 /* --- How it works: the connection clip beside the steps --------------------- */
@@ -1006,7 +992,7 @@ html.js .reveal.visible { opacity: 1; transform: none; }
 @media (max-width: 720px) {
   .caption, .fact .d, .hero-meta, .footer, .status-line, .chip span, .toc,
   .mac-notice, .field label, .field legend, .dl-meta, .nav-link { font-size: 0.9375rem; }
-  .shot-label, .kicker, .btn-sm, .clip-controls .btn, .badge, .sha-label,
+  .kicker, .btn-sm, .clip-controls .btn, .badge, .sha-label,
   .sha .btn-sm, .toc h2 { font-size: 0.875rem; }
   .nav-link .count, .btn .count, .pc-titlebar, .sha code { font-size: 0.8125rem; }
   .fallback pre, .source-body pre { font-size: 0.875rem; }
