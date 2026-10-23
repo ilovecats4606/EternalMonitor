@@ -1,4 +1,4 @@
-use super::page_stream::{audio_summary, usb_cable_notice, usb_summary};
+use super::page_stream::{audio_summary, capture_block_notice, usb_cable_notice, usb_summary};
 use super::*;
 
 #[test]
@@ -109,6 +109,35 @@ fn cable_notice_appears_only_for_a_plugged_in_ipad_without_the_service() {
     let (title, body) = usb_cable_notice(false, 2, false).unwrap();
     assert!(title.contains("Apple Devices is not installed"), "{title}");
     assert!(body.contains("Microsoft Store"), "{body}");
+}
+
+#[test]
+fn a_connected_ipad_without_a_picture_is_not_shown_as_streaming() {
+    let mut snap = StatsSnapshot::take();
+    snap.pipeline_running = true;
+    let mut client = ClientSnapshot {
+        info: Some(ClientInfo {
+            device_name: "iPad".into(),
+            device_id: 1,
+            screen_px: (2388, 1668),
+            refresh_hz: 120,
+            preferred_fps: 60,
+            decoder_caps: 1,
+            feature_caps: 0,
+            connected_at: Instant::now(),
+        }),
+        peer: None,
+        report: None,
+        capture_block: Some(CaptureBlock::UnsupportedOnThisGpu),
+    };
+    // Capture retries this forever while heartbeats stay current.
+    assert!(StreamState::of(&snap, &client) == StreamState::Paused);
+    let (title, body) = capture_block_notice(CaptureBlock::UnsupportedOnThisGpu);
+    assert!(title.contains("graphics card"), "{title}");
+    assert!(body.contains("Power saving"), "{body}");
+
+    client.capture_block = None;
+    assert!(StreamState::of(&snap, &client) == StreamState::Streaming);
 }
 
 #[test]
