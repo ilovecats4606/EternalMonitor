@@ -756,6 +756,22 @@ fn the_app_closes_only_after_the_helper_takes_over() {
 /// Setup installs into its own folder and the helper starts the exe that
 /// asked, so a copy anywhere else would come back as the old version.
 #[test]
+fn the_install_lookup_uses_the_app_id_setup_records() {
+    // Inno turns `{{` into `{` and keeps the rest of AppId as written.
+    let iss = include_str!("../../../installer/EternalMonitor.iss");
+    let app_id = iss
+        .lines()
+        .find_map(|line| line.strip_prefix("AppId="))
+        .expect("EternalMonitor.iss sets AppId")
+        .trim()
+        .replace("{{", "{");
+    assert!(
+        UNINSTALL_KEY.ends_with(&format!("\\{app_id}_is1")),
+        "{UNINSTALL_KEY} is not Setup's entry for AppId {app_id}"
+    );
+}
+
+#[test]
 fn only_the_installed_copy_installs_updates_in_place() {
     let installed = Path::new("C:\\")
         .join("Program Files")

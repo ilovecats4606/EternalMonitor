@@ -473,20 +473,27 @@ fn installs_in_place(exe: &Path, install_dir: Option<&Path>) -> bool {
     plain(dir) == plain(install_dir)
 }
 
+/// Setup's uninstall entry for a per-machine 64-bit install. The .iss writes
+/// `AppId={{...}}`, and Inno unescapes only the `{{`, so every installed
+/// AppId ends in `}}`.
+#[cfg(any(windows, test))]
+const UNINSTALL_KEY: &str =
+    "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{B7E6F2C4-3A91-4E0D-9C2A-ETERNALMONITOR}}_is1";
+
 /// The folder Setup reads from its uninstall entry to install an update into.
 /// `None` when EternalMonitor was never installed.
 #[cfg(windows)]
 fn install_dir() -> Option<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
-    use windows::core::w;
+    use windows::core::{w, PCWSTR};
     use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
     let mut value = [0u16; 1024];
     let mut bytes = std::mem::size_of_val(&value) as u32;
-    // AppId in installer/EternalMonitor.iss; a per-machine 64-bit install.
+    let key: Vec<u16> = UNINSTALL_KEY.encode_utf16().chain([0]).collect();
     let result = unsafe {
         RegGetValueW(
             HKEY_LOCAL_MACHINE,
-            w!("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{B7E6F2C4-3A91-4E0D-9C2A-ETERNALMONITOR}_is1"),
+            PCWSTR(key.as_ptr()),
             w!("Inno Setup: App Path"),
             RRF_RT_REG_SZ,
             None,
