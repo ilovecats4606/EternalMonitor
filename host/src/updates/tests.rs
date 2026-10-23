@@ -25,6 +25,8 @@ fn release(version: &str) -> Release {
         version: version.into(),
         installer: production_installer(version),
         sha256: SHA.into(),
+        recommended: true,
+        note: None,
     }
 }
 
@@ -93,6 +95,72 @@ fn manifest_must_name_a_stable_github_installer_with_a_sha256() {
             String::from_utf8_lossy(&data)
         );
     }
+}
+
+#[test]
+fn manifest_reads_the_optional_recommended_flag_and_note() {
+    let endpoints = Endpoints::production();
+    let with = |windows: serde_json::Value| {
+        let mut entry = serde_json::json!({
+            "version": "0.3.2",
+            "installer": production_installer("0.3.2"),
+            "sha256": SHA,
+        });
+        for (key, value) in windows.as_object().unwrap() {
+            entry[key] = value.clone();
+        }
+        let data = serde_json::json!({ "schema": 1, "windows": entry, "ipad": { "later": 1 } });
+        parse_manifest(data.to_string().as_bytes(), &endpoints).unwrap()
+    };
+    // Missing: recommended, no note. Unknown fields are ignored.
+    let plain = with(serde_json::json!({ "channel": "stable", "size": 9 }));
+    assert_eq!(plain, release("0.3.2"));
+    let soft = with(serde_json::json!({
+        "recommended": false,
+        "note": "  Fixes the second screen on laptops.  ",
+    }));
+    assert!(!soft.recommended);
+    assert_eq!(
+        soft.note.as_deref(),
+        Some("Fixes the second screen on laptops.")
+    );
+    // A note that isn't one short line, or a field of the wrong type, is
+    // dropped instead of stopping the update.
+    for bad in [
+        serde_json::json!({ "note": "" }),
+        serde_json::json!({ "note": "   " }),
+        serde_json::json!({ "note": "Two\nlines" }),
+        serde_json::json!({ "note": "x".repeat(201) }),
+        serde_json::json!({ "note": 7, "recommended": "yes" }),
+        serde_json::json!({ "note": null, "recommended": null }),
+    ] {
+        assert_eq!(with(bad.clone()), release("0.3.2"), "{bad}");
+    }
+    assert_eq!(
+        with(serde_json::json!({ "note": "x".repeat(200) }))
+            .note
+            .map(|n| n.len()),
+        Some(200)
+    );
+}
+
+/// `update-state.json` written by a build without the new fields still loads.
+#[test]
+fn saved_state_from_before_the_popup_still_loads() {
+    let old = serde_json::json!({
+        "checked_at": 10,
+        "latest": {
+            "version": "0.3.3",
+            "installer": production_installer("0.3.3"),
+            "sha256": SHA,
+        },
+        "later": null,
+        "notified": "0.3.3",
+        "pending": null,
+    });
+    let saved: Saved = serde_json::from_value(old).unwrap();
+    assert_eq!(saved.latest, Some(release("0.3.3")));
+    assert_eq!(saved.popup, None);
 }
 
 fn github(tag: &str, body: &str, url: &str, size: u64, extra: serde_json::Value) -> Vec<u8> {
@@ -188,6 +256,45 @@ fn github_release_must_publish_the_same_sha256_and_installer() {
             String::from_utf8_lossy(&data)
         );
     }
+}
+
+/// The release workflow publishes `.github/release-body.md` with the hash in
+/// it. People arriving from 0.3.0 and 0.3.1's "View release" read it, and
+/// this updater must still find the hash.
+#[test]
+fn the_published_release_body_carries_the_installer_hash() {
+    // A Windows checkout (core.autocrlf) has CRLF line endings. release.yml
+    // turns them back into LF before publishing; compare the same text here.
+    let template = include_str!("../../../.github/release-body.md").replace("\r\n", "\n");
+    assert_eq!(template.matches("{{SHA256}}").count(), 1);
+    // Get-FileHash prints uppercase hex. The parser must also take CRLF.
+    let body = template.replace("{{SHA256}}", &SHA.to_uppercase());
+    let release = release("0.3.2");
+    for body in [body.clone(), body.replace('\n', "\r\n")] {
+        assert_eq!(published_sha256(&body).as_deref(), Some(SHA));
+        let data = github(
+            "v0.3.2",
+            &body,
+            &release.installer,
+            9,
+            serde_json::json!({}),
+        );
+        assert_eq!(check_github_release(&data, &release), Ok(9));
+    }
+    // The label comes before any other 64-digit hex the page might show.
+    assert_eq!(template.matches("SHA-256").count(), 1);
+    assert!(template.contains("**EternalMonitor-Setup.exe SHA-256:**\n```\n{{SHA256}}\n```"));
+    for words in [
+        "**Recommended update.** Updating is highly recommended for everyone.",
+        "download **EternalMonitor-Setup.exe** below and run it",
+        "It installs over your current version and keeps your settings.",
+        "open TestFlight and tap **Update**",
+        "(https://eternalmonitor.dev/download.html)",
+        "RELEASE_NOTES.md",
+    ] {
+        assert!(template.contains(words), "{words}");
+    }
+    assert!(!template.contains("Protocol v2"), "stale v0.1.x note");
 }
 
 #[test]
@@ -305,6 +412,7 @@ fn fake_release(published: &[u8], served: Vec<u8>, redirect: Option<&str>) -> (E
         version: "0.3.2".into(),
         installer: format!("{base}/releases/download/v0.3.2/EternalMonitor-Setup.exe"),
         sha256: sha,
+        ..release("0.3.2")
     };
     (endpoints, release)
 }
@@ -541,6 +649,109 @@ fn later_is_remembered_per_version_for_a_day() {
         Some(Notice::Available("0.3.2".into()))
     );
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn popup_shows_once_per_version_then_at_most_every_three_days() {
+    let mut s = state(Saved::default());
+    assert_eq!(s.popup(1000), None, "nothing found yet");
+    s.finish_check(1000, false, Ok(release("0.3.2")));
+    let shown = s.popup(1000).unwrap();
+    assert_eq!(shown.title(), "EternalMonitor 0.3.2 is ready");
+    assert_eq!(shown.message(), "Updating is highly recommended.");
+    assert_eq!(shown.note, None);
+    // Later (or Update now, or Escape) closes it for three days, across
+    // restarts, while the banner stays.
+    s.popup_closed(2000);
+    assert_eq!(s.popup(2000), None);
+    assert_eq!(s.notice(2000), Some(Notice::Available("0.3.2".into())));
+    let mut restarted = state(s.saved.clone());
+    assert_eq!(restarted.popup(2000 + 3 * DAY - 1), None);
+    assert!(restarted.popup(2000 + 3 * DAY).is_some());
+    restarted.popup_closed(2000 + 3 * DAY);
+    assert_eq!(restarted.popup(2000 + 5 * DAY), None);
+    assert!(restarted.popup(2000 + 6 * DAY).is_some());
+    // A newer version shows at once.
+    restarted.finish_check(2000 + 6 * DAY, false, Ok(release("0.3.3")));
+    assert_eq!(
+        restarted.popup(2000 + 6 * DAY).map(|p| p.version),
+        Some("0.3.3".into())
+    );
+}
+
+/// A close time ahead of the clock counts as closed now: the next popup is
+/// three days from the current clock, never at once and never "not for years".
+#[test]
+fn a_clock_set_back_or_far_ahead_waits_three_days_from_now() {
+    let mut s = state(Saved::default());
+    s.finish_check(1000, false, Ok(release("0.3.2")));
+    s.popup_closed(10 * DAY);
+    // The clock goes back one second.
+    assert_eq!(s.popup(10 * DAY - 1), None);
+    assert_eq!(s.saved.popup, Some(("0.3.2".into(), 10 * DAY - 1)));
+    assert_eq!(s.popup(13 * DAY - 2), None);
+    assert!(s.popup(13 * DAY - 1).is_some());
+    // Closed while the clock was years ahead, then corrected.
+    s.saved.popup = Some(("0.3.2".into(), u64::MAX / 2));
+    assert_eq!(s.popup(20 * DAY), None);
+    // Saved that way, so a restart keeps the same three days.
+    let mut restarted = state(s.saved.clone());
+    assert_eq!(restarted.saved.popup, Some(("0.3.2".into(), 20 * DAY)));
+    assert_eq!(restarted.popup(23 * DAY - 1), None);
+    assert!(restarted.popup(23 * DAY).is_some());
+}
+
+#[test]
+fn popup_follows_the_banner_and_the_manifest_wording() {
+    let mut s = state(Saved::default());
+    let soft = Release {
+        recommended: false,
+        note: Some("Fixes audio on some PCs.".into()),
+        ..release("0.3.2")
+    };
+    s.finish_check(1000, false, Ok(soft));
+    let popup = s.popup(1000).unwrap();
+    assert_eq!(popup.message(), "An update is available.");
+    assert_eq!(popup.note.as_deref(), Some("Fixes audio on some PCs."));
+    // The banner's Later hides the popup with it for that day.
+    s.later(1000);
+    assert_eq!(s.popup(1000 + DAY - 1), None);
+    assert!(s.popup(1000 + DAY).is_some());
+    // Not while an update is already under way.
+    s.update_now(true);
+    assert_eq!(s.popup(1000 + DAY), None);
+    s.cancel();
+    assert!(s.popup(1000 + DAY).is_some());
+    // Up to date: nothing.
+    s.finish_check(1000 + DAY, false, Ok(release("0.3.1")));
+    assert_eq!(s.popup(1000 + DAY), None);
+
+    // With automatic checks off, Check now shows the banner but no popup.
+    let mut off = State::new("0.3.1", false, Saved::default());
+    off.begin_check(true);
+    off.finish_check(1000, true, Ok(release("0.3.2")));
+    assert!(off.notice(1000).is_some());
+    assert_eq!(off.popup(1000), None);
+}
+
+#[test]
+fn an_ipad_app_older_than_0_3_2_is_told_to_update() {
+    use eternal_wire::v2::control::{
+        FEATURE_CHECKS_UPDATES, FEATURE_SUPPORTS_NACK, FEATURE_WANTS_AUDIO, FEATURE_WANTS_INPUT,
+    };
+    // Every bit an 0.3.1 iPad sends, and none.
+    let old = FEATURE_WANTS_INPUT | FEATURE_WANTS_AUDIO | FEATURE_SUPPORTS_NACK;
+    assert!(ipad_app_out_of_date(old));
+    assert!(ipad_app_out_of_date(0));
+    assert!(!ipad_app_out_of_date(old | FEATURE_CHECKS_UPDATES));
+    assert!(!ipad_app_out_of_date(FEATURE_CHECKS_UPDATES));
+    assert_eq!(
+        IPAD_OUT_OF_DATE,
+        (
+            "Your iPad app is out of date",
+            "Update it in TestFlight. It's highly recommended."
+        )
+    );
 }
 
 #[test]

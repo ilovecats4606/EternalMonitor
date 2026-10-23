@@ -13,7 +13,9 @@ use eternal_host::settings::SettingsFile;
 use eternal_host::stats::{PipelineStats, PIPELINE_STATS};
 use eternal_host::transport::link::PeerId;
 use eternal_host::transport::session::ConfigSource;
-use eternal_wire::v2::control::{ControlMessage, Hello2, ReceiverReport, StreamConfig};
+use eternal_wire::v2::control::{
+    ByeReason, ControlMessage, Hello2, ReceiverReport, StreamConfig, FEATURE_CHECKS_UPDATES,
+};
 
 struct Fixture;
 impl ConfigSource for Fixture {
@@ -30,6 +32,38 @@ impl ConfigSource for Fixture {
             flags: 0,
             bitrate_bps: 15_000_000,
         }
+    }
+}
+
+const POPUP_QUIET_MS: u64 = 3000;
+
+fn popup_shown(harness: &Harness<'_, AnalyzerApp>) -> bool {
+    harness
+        .query_by_role_and_label(Role::Dialog, "Update ready")
+        .is_some()
+}
+
+/// The popup opens once no iPad has been connected for the quiet period.
+fn wait_for_popup(harness: &mut Harness<'_, AnalyzerApp>) {
+    let deadline = Instant::now() + std::time::Duration::from_millis(POPUP_QUIET_MS + 7000);
+    while !popup_shown(harness) {
+        assert!(Instant::now() < deadline, "the popup never opened");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        harness.run_steps(1);
+    }
+    harness.run_steps(4);
+}
+
+/// Draws frames for `millis` and checks the popup stays closed in each.
+fn no_popup_for(harness: &mut Harness<'_, AnalyzerApp>, millis: u64, why: &str) {
+    let end = Instant::now() + std::time::Duration::from_millis(millis);
+    loop {
+        harness.run_steps(1);
+        assert!(!popup_shown(harness), "{why}");
+        if Instant::now() >= end {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
 
@@ -60,6 +94,8 @@ fn fixture() -> (std::path::PathBuf, SharedControl) {
     std::fs::create_dir_all(dir.join("EternalMonitor")).unwrap();
     // This integration test never touches the user's real settings.
     std::env::set_var("APPDATA", &dir);
+    // The popup's quiet period after an iPad leaves, shortened from 20 s.
+    std::env::set_var("ETERNAL_UPDATE_POPUP_QUIET_MS", POPUP_QUIET_MS.to_string());
     SettingsFile {
         check_for_updates: false,
         ..Default::default()
@@ -96,6 +132,23 @@ fn connect_ipad(shared: &SharedControl) {
 }
 
 fn connect_named(shared: &SharedControl, device_name: &str, frags_lost: u32, frags_repaired: u32) {
+    // A 0.3.2 or later iPad app.
+    connect_app(
+        shared,
+        device_name,
+        frags_lost,
+        frags_repaired,
+        3 | FEATURE_CHECKS_UPDATES,
+    );
+}
+
+fn connect_app(
+    shared: &SharedControl,
+    device_name: &str,
+    frags_lost: u32,
+    frags_repaired: u32,
+    feature_caps: u16,
+) {
     let peer = PeerId::usb(7);
     let now = Instant::now();
     let mut session = shared.session.lock();
@@ -105,10 +158,11 @@ fn connect_named(shared: &SharedControl, device_name: &str, frags_lost: u32, fra
         ControlMessage::Hello2(Hello2 {
             proto_min: 2,
             proto_max: 2,
-            client_nonce: 12,
+            // Each app connects afresh rather than retransmitting.
+            client_nonce: 12 + u32::from(feature_caps),
             listen_port: 9877,
             decoder_caps: 3,
-            feature_caps: 3,
+            feature_caps,
             screen_px_w: 2420,
             screen_px_h: 1668,
             screen_pt_w: 1210,
@@ -149,6 +203,20 @@ fn connect_named(shared: &SharedControl, device_name: &str, frags_lost: u32, fra
         &Fixture,
         now,
     );
+}
+
+/// The connected iPad says goodbye, as when its user taps Disconnect.
+fn disconnect_ipad(shared: &SharedControl) {
+    let mut session = shared.session.lock();
+    let session_id = session.session_id().unwrap();
+    session.handle_control(
+        PeerId::usb(7),
+        session_id,
+        ControlMessage::Bye(ByeReason::UserDisconnect),
+        &Fixture,
+        Instant::now(),
+    );
+    assert!(session.session_id().is_none());
 }
 
 /// Another receiver report from the connected iPad, with cumulative counters.
@@ -320,7 +388,63 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     // The banner sits above every page, Settings included.
     harness.get_by_label("EternalMonitor 99.0.0 is available");
     harness.get_by_label("Version 99.0.0 is ready to install.");
+    // The popup waits for the Stream page, and while the iPad streams, since
+    // this window may be on the screen the iPad shows.
+    assert!(harness
+        .query_by_role_and_label(Role::Dialog, "Update ready")
+        .is_none());
     nav(&mut harness, "Stream");
+    assert!(harness
+        .query_by_role_and_label(Role::Dialog, "Update ready")
+        .is_none());
+    // Nor over another dialog: the stream ends while Send feedback is open.
+    harness
+        .get_all_by_role_and_label(Role::Button, "Send feedback")
+        .next()
+        .expect("the sidebar button")
+        .click();
+    harness.run_steps(4);
+    harness.get_by_label("Tell us how it's going");
+    disconnect_ipad(&shared);
+    harness.run_steps(4);
+    assert!(harness
+        .query_by_role_and_label(Role::Dialog, "Update ready")
+        .is_none());
+    harness.get_by_label("Close").click();
+    wait_for_popup(&mut harness);
+    {
+        let popup = harness.get_by_role_and_label(Role::Dialog, "Update ready");
+        popup.get_by_label("EternalMonitor 99.0.0 is ready");
+        popup.get_by_label("Updating is highly recommended.");
+        popup.get_by_label("Update now opens the download page.");
+        popup.get_by_role_and_label(Role::Button, "Update now");
+    }
+    snapshot(&mut harness, &shared, "update-popup");
+    // A stream that starts puts it away for now; it isn't a Later.
+    connect_ipad(&shared);
+    harness.run_steps(4);
+    assert!(harness
+        .query_by_role_and_label(Role::Dialog, "Update ready")
+        .is_none());
+    harness.get_by_label("EternalMonitor 99.0.0 is available");
+    disconnect_ipad(&shared);
+    wait_for_popup(&mut harness);
+    harness
+        .get_by_role_and_label(Role::Dialog, "Update ready")
+        .get_by_label("Later")
+        .click();
+    harness.run_steps(4);
+    assert!(harness
+        .query_by_role_and_label(Role::Dialog, "Update ready")
+        .is_none());
+    connect_ipad(&shared);
+    harness.run_steps(4);
+    // Later hides the popup for three days, not the banner.
+    nav(&mut harness, "Settings");
+    nav(&mut harness, "Stream");
+    assert!(harness
+        .query_by_role_and_label(Role::Dialog, "Update ready")
+        .is_none());
     harness.get_by_label("EternalMonitor 99.0.0 is available");
     // Setup did not install this test binary, so Update now only opens the
     // download page.
@@ -398,8 +522,206 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     results.extend_harness(&mut harness);
     feedback_and_star(&shared, &dir, &mut results);
     long_feedback_keeps_its_buttons_on_screen(&shared, &mut results);
+
+    // This iPad app works but can't tell its user about updates. A 0.3.2 or
+    // later app, as above, gets no such notice.
+    assert!(harness
+        .query_by_label("Your iPad app is out of date")
+        .is_none());
+    connect_app(&shared, "Test iPad Pro", 10, 20, 3);
+    harness.run_steps(4);
+    harness.get_by_label("Your iPad app is out of date");
+    harness.get_by_label("Update it in TestFlight. It's highly recommended.");
+    harness.get_by_label("OK").click();
+    harness.run_steps(4);
+    assert!(harness
+        .query_by_label("Your iPad app is out of date")
+        .is_none());
+    popup_waits_while_the_ipad_has_a_session(&shared, &dir, &mut results);
+    disconnect_ipad(&shared);
+    popup_waits_after_launch(&shared, &dir, &mut results);
+    update_arrives_while_feedback_is_open(&shared, &dir, &mut results);
     std::fs::remove_dir_all(dir).unwrap();
     results.unwrap();
+}
+
+/// The session, not the pipeline, says whether an iPad is there: a capture
+/// or encoder restart, a display change or the second screen attaching stops
+/// the pipeline briefly while the iPad stays connected. A USB link that drops
+/// and comes back, again and again, never flashes the popup either.
+fn popup_waits_while_the_ipad_has_a_session(
+    shared: &SharedControl,
+    dir: &std::path::Path,
+    results: &mut SnapshotResults,
+) {
+    let checked_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    std::fs::write(
+        dir.join("EternalMonitor/update-state.json"),
+        serde_json::json!({
+            "checked_at": checked_at,
+            "latest": {
+                "version": "99.0.0",
+                "installer": "https://github.com/sidebandstudio/EternalMonitor/releases/download/v99.0.0/EternalMonitor-Setup.exe",
+                "sha256": "0".repeat(64),
+            },
+            "notified": "99.0.0",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    SettingsFile {
+        check_for_updates: true,
+        feedback_ask_done: true,
+        star_clicked: true,
+        ..Default::default()
+    }
+    .save();
+    connect_ipad(shared);
+    let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
+    window.get_by_label("EternalMonitor 99.0.0 is available");
+    no_popup_for(&mut window, 200, "the iPad is streaming");
+
+    // The pipeline restarts; the session stays. Longer than the quiet period.
+    PIPELINE_STATS.lock().pipeline_running = false;
+    no_popup_for(
+        &mut window,
+        POPUP_QUIET_MS + 1000,
+        "the iPad is still connected while the stream restarts",
+    );
+    PIPELINE_STATS.lock().pipeline_running = true;
+    no_popup_for(&mut window, 200, "the stream is back");
+
+    // Three USB drops, each followed by the iPad reconnecting.
+    for _ in 0..3 {
+        shared.session.lock().link_lost(PeerId::usb(7).link);
+        no_popup_for(&mut window, 300, "the iPad is reconnecting");
+        connect_ipad(shared);
+        no_popup_for(&mut window, 100, "the iPad reconnected");
+    }
+    // It stays away this time: the popup opens after the quiet period.
+    shared.session.lock().link_lost(PeerId::usb(7).link);
+    no_popup_for(&mut window, 500, "too soon after the iPad left");
+    wait_for_popup(&mut window);
+    window
+        .get_by_role_and_label(Role::Dialog, "Update ready")
+        .get_by_label("Later")
+        .click();
+    window.run_steps(4);
+    connect_ipad(shared);
+    results.extend_harness(&mut window);
+}
+
+/// An update known at launch waits the quiet period too: after a login
+/// start, a USB iPad connects within seconds and may mirror this window.
+fn popup_waits_after_launch(
+    shared: &SharedControl,
+    dir: &std::path::Path,
+    results: &mut SnapshotResults,
+) {
+    let state = dir.join("EternalMonitor/update-state.json");
+    let mut cached: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    cached["popup"] = serde_json::Value::Null;
+    cached["later"] = serde_json::Value::Null;
+    std::fs::write(&state, cached.to_string()).unwrap();
+    let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
+    window.get_by_label("EternalMonitor 99.0.0 is available");
+    no_popup_for(&mut window, POPUP_QUIET_MS - 1000, "too soon after launch");
+    wait_for_popup(&mut window);
+    window
+        .get_by_role_and_label(Role::Dialog, "Update ready")
+        .get_by_label("Later")
+        .click();
+    window.run_steps(4);
+    results.extend_harness(&mut window);
+}
+
+/// A check that finds an update while Send feedback is open on Stream, with
+/// no iPad connected: the popup waits for the panel to close, so there is
+/// never more than one dialog.
+fn update_arrives_while_feedback_is_open(
+    shared: &SharedControl,
+    dir: &std::path::Path,
+    results: &mut SnapshotResults,
+) {
+    use std::io::{BufRead, BufReader, Write};
+    // A site that answers the check only when told to.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let (answer, answered) = std::sync::mpsc::channel::<()>();
+    let manifest = serde_json::json!({
+        "schema": 1,
+        "windows": {
+            "version": "99.1.0",
+            "installer": format!("{base}/releases/download/v99.1.0/EternalMonitor-Setup.exe"),
+            "sha256": "0".repeat(64),
+        },
+    })
+    .to_string();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap_or(0) > 2 {
+            line.clear();
+        }
+        let _ = answered.recv();
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{manifest}",
+            manifest.len()
+        );
+    });
+    // Never checked, so the window checks as it opens; already announced,
+    // so no notification.
+    std::fs::write(
+        dir.join("EternalMonitor/update-state.json"),
+        serde_json::json!({ "notified": "99.1.0" }).to_string(),
+    )
+    .unwrap();
+    SettingsFile {
+        check_for_updates: true,
+        feedback_ask_done: true,
+        star_clicked: true,
+        ..Default::default()
+    }
+    .save();
+    std::env::set_var("ETERNAL_UPDATE_BASE", &base);
+    let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
+    std::env::remove_var("ETERNAL_UPDATE_BASE");
+    window
+        .get_all_by_role_and_label(Role::Button, "Send feedback")
+        .next()
+        .expect("the sidebar button")
+        .click();
+    window.run_steps(4);
+    window.get_by_label("Tell us how it's going");
+    answer.send(()).unwrap();
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    while window
+        .query_by_label("EternalMonitor 99.1.0 is available")
+        .is_none()
+    {
+        assert!(Instant::now() < deadline, "the check never finished");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        window.run_steps(1);
+    }
+    window.run_steps(4);
+    assert!(
+        window
+            .query_by_role_and_label(Role::Dialog, "Update ready")
+            .is_none(),
+        "the popup must not open over Send feedback"
+    );
+    window.get_by_label("Close").click();
+    wait_for_popup(&mut window);
+    window
+        .get_by_role_and_label(Role::Dialog, "Update ready")
+        .get_by_label("EternalMonitor 99.1.0 is ready");
+    results.extend_harness(&mut window);
 }
 
 /// The text the last frame copied, if any.
@@ -774,6 +1096,29 @@ fn review_screens() {
     save(&mut tall, "settings-full");
     let mut small = harness(&shared, egui::vec2(820.0, 560.0), 1.5);
     save(&mut small, "minimum-size");
+
+    // The update popup with a note from latest.json, with no iPad
+    // connected; then an iPad app older than 0.3.2 connects.
+    let state = dir.join("EternalMonitor/update-state.json");
+    let mut cached: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    cached["latest"]["note"] = "Fixes the second screen on laptops with two graphics cards.".into();
+    cached["popup"] = serde_json::Value::Null;
+    std::fs::write(&state, cached.to_string()).unwrap();
+    SettingsFile {
+        check_for_updates: true,
+        ..Default::default()
+    }
+    .save();
+    disconnect_ipad(&shared);
+    let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
+    wait_for_popup(&mut h);
+    save(&mut h, "update-popup-note");
+    h.get_by_role_and_label(Role::Dialog, "Update ready")
+        .get_by_label("Later")
+        .click();
+    connect_app(&shared, "Test iPad Pro", 10, 20, 3);
+    save(&mut h, "ipad-out-of-date");
     std::fs::remove_dir_all(dir).unwrap();
 
     // Website product shot: realistic names and a healthy link, default window size.

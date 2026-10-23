@@ -387,6 +387,37 @@ fn the_second_screen_notice_says_which_driver_problem_applies() {
 }
 
 #[test]
+fn the_update_popup_says_what_update_now_does_from_here() {
+    use super::update_banner::popup_hint;
+    assert_eq!(
+        popup_hint(true),
+        "Windows will ask for permission, then EternalMonitor restarts."
+    );
+    // A copy Setup would not replace only opens the website.
+    assert_eq!(popup_hint(false), "Update now opens the download page.");
+}
+
+/// The popup never covers a picture the iPad is showing, or another dialog.
+#[test]
+fn the_update_popup_waits_for_the_stream_and_other_dialogs() {
+    use super::update_banner::PopupGate::{self, *};
+    // (open, connected, other dialog, on Stream, busy)
+    assert_eq!(PopupGate::of(false, false, false, true, false), Show);
+    assert_eq!(
+        PopupGate::of(true, false, false, false, true),
+        Show,
+        "stays"
+    );
+    assert_eq!(PopupGate::of(false, false, false, false, false), Wait);
+    assert_eq!(PopupGate::of(false, false, false, true, true), Wait);
+    for open in [false, true] {
+        for (connected, other) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(PopupGate::of(open, connected, other, true, false), Hide);
+        }
+    }
+}
+
+#[test]
 fn feedback_details_leave_out_names_and_addresses() {
     use crate::feedback::{body, mailto, Kind};
     let client = ClientSnapshot {
@@ -445,4 +476,45 @@ fn feedback_details_leave_out_names_and_addresses() {
         },
     );
     assert!(body(Kind::Idea, "", Some(&idle)).contains("Setup: Mirror, no iPad connected"));
+}
+
+/// A session counts as nearby, and so does one that ended less than the
+/// quiet period ago, so a reconnecting iPad never flashes the popup.
+#[test]
+fn the_update_popup_waits_until_no_ipad_has_been_connected_for_a_while() {
+    use super::update_banner::{ipad_nearby, POPUP_QUIET};
+    assert!(POPUP_QUIET >= Duration::from_secs(15) && POPUP_QUIET <= Duration::from_secs(30));
+    let quiet = Duration::from_secs(20);
+    let start = Instant::now();
+    let mut last = None;
+    assert!(
+        !ipad_nearby(false, &mut last, start, quiet),
+        "never connected"
+    );
+    assert!(ipad_nearby(true, &mut last, start, quiet));
+    // Three drops and reconnects, a few seconds apart.
+    for cycle in 1..=3u64 {
+        let lost = start + Duration::from_secs(5 * cycle);
+        assert!(ipad_nearby(true, &mut last, lost, quiet));
+        assert!(ipad_nearby(
+            false,
+            &mut last,
+            lost + Duration::from_millis(1),
+            quiet
+        ));
+        assert!(ipad_nearby(
+            false,
+            &mut last,
+            lost + Duration::from_secs(3),
+            quiet
+        ));
+    }
+    let gone = start + Duration::from_secs(15);
+    assert!(ipad_nearby(
+        false,
+        &mut last,
+        gone + quiet - Duration::from_millis(1),
+        quiet
+    ));
+    assert!(!ipad_nearby(false, &mut last, gone + quiet, quiet));
 }
