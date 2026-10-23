@@ -30,6 +30,9 @@ Windows changes.
   firewall case), the PC answered but sent no picture, the connection was lost,
   the cable was unplugged, and Local Network access is off. Technical detail
   stays in Connection details and the support log.
+- A search for PCs that fails for a reason other than Local Network access
+  says **Couldn't search for PCs** and offers **Search again**. Only a Local
+  Network denial sends you to Settings.
 - Windows notices for the CPU encoder fallback and a second screen that
   couldn't start use plain words and offer **Use recommended settings**,
   **Try again** or **Download installer**. Encoder, packet size, HEVC and the

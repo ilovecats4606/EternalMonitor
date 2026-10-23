@@ -4,13 +4,21 @@ import SwiftUI
 /// Debug builds only: put the UI in a state that normally needs a live PC,
 /// for screenshots and design review. Never opens a connection.
 ///
-/// `EM_UI_PREVIEW=display|quality|connecting|error|error-no-picture|error-pairing-code|error-router|error-updating|mismatch|pairing|settings|recent`.
+/// `EM_UI_PREVIEW=display|quality|connecting|error|error-no-picture|error-pairing-code|error-router|error-updating|mismatch|pairing|settings|recent|searchFailed|searchBlocked`.
 /// Launch with `-allowUSB NO` so the USB listener stays off as well.
 enum UIPreview {
     static let mode = ProcessInfo.processInfo.environment["EM_UI_PREVIEW"] ?? ""
     static var showsBackdrop: Bool { mode == "display" || mode == "quality" }
     static var opensQuality: Bool { mode == "quality" }
     static var opensSettings: Bool { mode == "settings" }
+    /// The Bonjour error every search fails with.
+    static var searchErrorCode: Int? {
+        switch mode {
+        case "searchFailed": return -72000
+        case "searchBlocked": return -65570
+        default: return nil
+        }
+    }
 
     @MainActor static func apply(to manager: ConnectionManager) {
         switch mode {

@@ -71,6 +71,24 @@ final class ConnectScreenTests: XCTestCase {
         shot.name = "pairing-code-as-address"; shot.lifetime = .keepAlways; add(shot)
     }
 
+    /// A search that fails for a reason other than Local Network access
+    /// offers Search again, not Settings.
+    func testAFailedSearchOffersSearchAgain() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO"]
+        app.launchEnvironment["EM_UI_PREVIEW"] = "searchFailed"
+        app.launch()
+        let title = app.staticTexts["connect.scanProblemTitle"]
+        XCTAssertTrue(title.waitForExistence(timeout: 15), app.debugDescription)
+        XCTAssertEqual(title.label, "Couldn't search for PCs")
+        XCTAssertTrue(app.buttons["Search again"].exists)
+        XCTAssertFalse(app.buttons["Open Settings"].exists)
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "search-failed"; shot.lifetime = .keepAlways; add(shot)
+        app.buttons["Search again"].tap()
+        XCTAssertTrue(title.waitForExistence(timeout: 15))
+    }
+
     /// An address where nothing answers ends in plain words and a retry,
     /// not a transport trace.
     func testUnreachablePCSaysWhatToDo() {

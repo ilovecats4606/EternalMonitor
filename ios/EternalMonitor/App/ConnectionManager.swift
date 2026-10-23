@@ -916,13 +916,15 @@ final class ConnectionManager: ObservableObject {
     }
 
     /// Try the last connection again: the cable when that is what failed,
-    /// otherwise the last PC address.
+    /// otherwise the last PC address. Cable advice kept after a Wi-Fi
+    /// fallback ran out still means the cable, though Wi-Fi was tried last.
     func retry() {
         guard state == .disconnected else { return }
+        let cable = transportMode == "USB" || problem == .usbFailed
         endReconnectCycle()
         problem = nil
         connectionError = nil
-        if transportMode == "USB" {
+        if cable {
             resumeUSBConnections()
         } else if let target = lastTarget {
             connect(host: target.host, port: target.port)
