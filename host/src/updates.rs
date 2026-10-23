@@ -456,21 +456,27 @@ fn installed_helper(app: &Path) -> Option<PathBuf> {
     .find(|path| path.is_file())
 }
 
-/// Setup installs into the folder it installed into before (Program Files
-/// the first time), and the helper starts the exe that asked for the update
-/// again. So only the installed copy updates itself. A portable or self-built
-/// copy would come back as the old version, and Setup would point the
-/// firewall rules away from it; Update now opens the website for those.
+/// The host exe Setup installs (`installer/EternalMonitor.iss`).
+const INSTALLED_EXE: &str = "EternalMonitor-host.exe";
+
+/// Setup replaces `EternalMonitor-host.exe` in the folder it installed into
+/// before (Program Files the first time), and the helper starts the exe that
+/// asked for the update again. So only that exe updates itself. A portable,
+/// renamed or self-built copy would come back as the old version, and Setup
+/// would point the firewall rules away from it; Update now opens the website
+/// for those.
 fn installs_in_place(exe: &Path, install_dir: Option<&Path>) -> bool {
-    let (Some(dir), Some(install_dir)) = (exe.parent(), install_dir) else {
+    let Some(install_dir) = install_dir else {
         return false;
     };
+    // Final paths where the files exist, so short (8.3) names are expanded.
     let plain = |path: &Path| {
-        path.to_string_lossy()
-            .trim_end_matches(['\\', '/'])
-            .to_lowercase()
+        let path = crate::single_instance::canonical(path)
+            .to_string_lossy()
+            .to_lowercase();
+        path.strip_prefix(r"\\?\").unwrap_or(&path).to_string()
     };
-    plain(dir) == plain(install_dir)
+    plain(exe) == plain(&install_dir.join(INSTALLED_EXE))
 }
 
 /// Setup's uninstall entry for a per-machine 64-bit install. The .iss writes

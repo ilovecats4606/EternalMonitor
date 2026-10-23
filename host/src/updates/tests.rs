@@ -772,6 +772,16 @@ fn the_install_lookup_uses_the_app_id_setup_records() {
 }
 
 #[test]
+fn the_installed_host_is_the_exe_setup_installs() {
+    let iss = include_str!("../../../installer/EternalMonitor.iss");
+    let source = format!(r#"Source: "{{#StagingDir}}\{INSTALLED_EXE}"; DestDir: "{{app}}";"#);
+    assert!(
+        iss.lines().any(|line| line.starts_with(&source)),
+        "EternalMonitor.iss does not install {INSTALLED_EXE} into {{app}}"
+    );
+}
+
+#[test]
 fn only_the_installed_copy_installs_updates_in_place() {
     let installed = Path::new("C:\\")
         .join("Program Files")
@@ -786,6 +796,21 @@ fn only_the_installed_copy_installs_updates_in_place() {
     assert!(installs_in_place(&exe, Some(&trailing)));
     let other_case = PathBuf::from(installed.to_string_lossy().to_uppercase());
     assert!(installs_in_place(&exe, Some(&other_case)));
+
+    // A renamed copy beside the installed host: Setup replaces
+    // EternalMonitor-host.exe, and the helper would start this one again.
+    let renamed = installed.join("EternalMonitor-host-old.exe");
+    assert!(!installs_in_place(&renamed, Some(&installed)));
+    // A build from source copied into the install folder.
+    let other_name = installed.join("eternal-host.exe");
+    assert!(!installs_in_place(&other_name, Some(&installed)));
+    // Setup's own exe, spelled differently.
+    assert!(installs_in_place(
+        &installed.join("ETERNALMONITOR-HOST.EXE"),
+        Some(&installed)
+    ));
+    let verbatim = PathBuf::from(format!(r"\\?\{}", exe.display()));
+    assert!(installs_in_place(&verbatim, Some(&installed)));
 
     // The zip from the release page, unpacked in Downloads.
     let portable = Path::new("C:\\")
@@ -805,6 +830,38 @@ fn only_the_installed_copy_installs_updates_in_place() {
     // Never installed: Setup would install into Program Files.
     assert!(!installs_in_place(&portable, None));
     assert!(!installs_in_place(&exe, None));
+}
+
+/// The registry can record the install folder by its short (8.3) name.
+#[cfg(windows)]
+#[test]
+fn a_short_install_folder_name_matches_the_installed_host() {
+    use std::os::windows::process::CommandExt;
+    let installed =
+        std::env::temp_dir().join(format!("EternalMonitor install {}", std::process::id()));
+    std::fs::create_dir_all(&installed).unwrap();
+    let exe = installed.join("EternalMonitor-host.exe");
+    std::fs::write(&exe, b"").unwrap();
+    std::fs::write(installed.join("EternalMonitor-host-old.exe"), b"").unwrap();
+    let output = std::process::Command::new("cmd")
+        .raw_arg(format!(
+            "/c for %I in (\"{}\") do @echo %~sI",
+            installed.display()
+        ))
+        .output()
+        .unwrap();
+    let short = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let results = [
+        installs_in_place(&exe, Some(&short)),
+        installs_in_place(&short.join("EternalMonitor-host.exe"), Some(&installed)),
+        installs_in_place(&short.join("EternalMonitor-host-old.exe"), Some(&installed)),
+    ];
+    std::fs::remove_dir_all(&installed).unwrap();
+    if short == installed {
+        eprintln!("8.3 names are off for {}; skipped", installed.display());
+        return;
+    }
+    assert_eq!(results, [true, true, false], "{}", short.display());
 }
 
 #[test]
