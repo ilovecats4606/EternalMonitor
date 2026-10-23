@@ -348,7 +348,17 @@ small { font-size: 0.875rem; }
   white-space: nowrap;
 }
 .stage-ipad { position: relative; }
+/* A signal runs along the link: a full-width layer moved by its own width,
+   carrying one dot, so only transform and opacity change. */
+.stage-line::after {
+  content: "";
+  position: absolute;
+  inset: -3px 0;
+  background: radial-gradient(circle at 4px 50%, #fff 0 2px, var(--accent) 3px, transparent 5px) no-repeat;
+  opacity: 0;
+}
 @media (prefers-reduced-motion: no-preference) {
+  .stage-line::after { animation: stage-signal 2.6s ease-in-out 1.8s infinite; }
   .stage-ipad { animation: stage-slide 1s var(--ease-out) 0.2s both; }
   .stage-line { animation: stage-draw 0.6s ease-out 0.9s both; }
   .stage-chip { animation: stage-fade 0.5s ease-out 1.3s both; }
@@ -356,6 +366,7 @@ small { font-size: 0.875rem; }
 @keyframes stage-slide { from { opacity: 0; transform: translateX(18%); } to { opacity: 1; transform: none; } }
 @keyframes stage-draw { from { transform: scaleX(0); } to { transform: scaleX(1); } }
 @keyframes stage-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes stage-signal { 0% { transform: translateX(-4px); opacity: 0; } 15%, 80% { opacity: 1; } 100% { transform: translateX(calc(100% - 8px)); opacity: 0; } }
 @media (max-width: 720px) {
   .stage { grid-template-columns: 1fr; justify-items: center; }
   .stage-pc { width: 100%; }
@@ -363,6 +374,7 @@ small { font-size: 0.875rem; }
   .stage-line { left: calc(50% - 1px); right: auto; top: 0; bottom: 0; width: 2px; height: auto; transform-origin: center top;
     background: linear-gradient(180deg, rgba(var(--accent-rgb), 0.15), var(--accent) 50%, rgba(var(--accent-rgb), 0.15)); }
   .stage-ipad { width: 78%; }
+  .stage-line::after { display: none; }
   @media (prefers-reduced-motion: no-preference) {
     .stage-ipad { animation-name: stage-rise; }
     .stage-line { animation-name: stage-draw-down; }
