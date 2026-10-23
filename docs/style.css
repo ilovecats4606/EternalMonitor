@@ -728,6 +728,9 @@ small { font-size: 0.875rem; }
   .get { grid-template-columns: 1fr; }
 }
 
+/* Card titles stay modest next to the large section headlines. */
+.card-head h2, .card-head h3 { font-size: clamp(1.5rem, 1.2rem + 0.8vw, 1.875rem); letter-spacing: -0.03em; line-height: 1.1; }
+
 /* --- FAQ ---------------------------------------------------------------------- */
 
 .faq { border-top: 1px solid var(--border); }
