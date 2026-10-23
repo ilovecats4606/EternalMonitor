@@ -17,6 +17,9 @@ const BATCH_SIZE: usize = 4;
 const WAKE: &str = "";
 /// Longest a normal quit waits for uploads. Unsent batches stay in the outbox.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+/// After that, how long a quit lets the upload thread finish writing the
+/// queue it holds. A few small files take milliseconds.
+const FINAL_WRITE_WAIT: Duration = Duration::from_millis(250);
 static SENDER: OnceLock<mpsc::SyncSender<String>> = OnceLock::new();
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
@@ -155,8 +158,9 @@ pub struct UploadGuard {
     _uploader: Option<Uploader>,
 }
 
-/// The upload thread. Dropping it waits at most [`SHUTDOWN_WAIT`]; if a request
-/// is still in flight, the queued lines are written to the outbox from here.
+/// The upload thread. Dropping it waits at most [`SHUTDOWN_WAIT`] and
+/// [`FINAL_WRITE_WAIT`]; if a request is still in flight, the queued lines are
+/// written to the outbox from here.
 struct Uploader {
     stop: std::sync::Arc<AtomicBool>,
     /// Wakes a thread waiting for lines, so an idle quit does not wait out
@@ -204,9 +208,16 @@ impl Drop for Uploader {
             return;
         }
         // The thread is inside a request and holds no lock; keep what it has
-        // not written yet and let the process exit without it.
-        let Ok(receiver) = self.receiver.lock() else {
-            return;
+        // not written yet and let the process exit without it. A thread that
+        // holds the lock is writing the queue itself. Waiting for the lock
+        // made the quit last as long as that write.
+        let receiver = match self.receiver.try_lock() {
+            Ok(receiver) => receiver,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let _ = self.done.recv_timeout(FINAL_WRITE_WAIT);
+                return;
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => return,
         };
         if !enabled() {
             // Sharing was turned off during the stalled request. Clear what
@@ -492,8 +503,8 @@ fn run(
     Ok(())
 }
 /// Writes the events this thread holds and those still queued, all under the
-/// receiver lock. The shutdown fallback takes that lock, so it cannot find the
-/// queue empty and let the process exit while drained events are unwritten.
+/// receiver lock. A shutdown fallback that finds the lock taken leaves the
+/// queue to this write instead of draining it.
 fn finish(
     directory: &Path,
     receiver: &Mutex<mpsc::Receiver<String>>,
@@ -678,7 +689,8 @@ mod tests {
         };
         // The acknowledgement arrives just before the deadline, and the
         // worker is still writing the drained queue when the wait runs out.
-        *PAUSED_OUTBOX.lock().unwrap() = Some((directory.clone(), Duration::from_millis(1500)));
+        // The write stalls far longer than a quit may wait.
+        *PAUSED_OUTBOX.lock().unwrap() = Some((directory.clone(), Duration::from_secs(5)));
         let (sender, uploader) = Uploader::spawn(config, directory.clone());
         std::thread::sleep(Duration::from_millis(300));
         for index in 0..10 {
@@ -686,14 +698,28 @@ mod tests {
                 .send(format!("2026-10-21T17:11:31Z  INFO last line {index}"))
                 .unwrap();
         }
+        let started = std::time::Instant::now();
         drop(uploader);
-        let messages = outbox_messages(&directory);
-        let kept = (0..10)
-            .filter(|index| {
-                let line = format!("last line {index}");
-                messages.iter().any(|m| m.ends_with(&line))
-            })
-            .count();
+        let waited = started.elapsed();
+        assert!(
+            waited < SHUTDOWN_WAIT + Duration::from_millis(600),
+            "quit waited {waited:?}"
+        );
+        // Whoever drained the queue writes all of it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let (kept, messages) = loop {
+            let messages = outbox_messages(&directory);
+            let kept = (0..10)
+                .filter(|index| {
+                    let line = format!("last line {index}");
+                    messages.iter().any(|m| m.ends_with(&line))
+                })
+                .count();
+            if kept == 10 || std::time::Instant::now() >= deadline {
+                break (kept, messages);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
         assert_eq!(kept, 10, "{messages:?}");
         let _ = fs::remove_dir_all(directory);
     }
