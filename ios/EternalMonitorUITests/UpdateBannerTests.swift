@@ -81,6 +81,23 @@ final class UpdateBannerTests: XCTestCase {
         later.tap()
     }
 
+    /// The feedback sheet (Mail, or the copy sheet without Mail) on its own.
+    func testFeedbackSheetComesBeforeThePopup() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-checkForUpdates", "YES",
+                               "-updateDismissedBuild", "0", "-updatePopupClosedBuild", "0", "-feedbackAskDone", "YES"]
+        app.launchEnvironment["EM_UPDATE_MANIFEST"] = manifest
+        app.launchEnvironment["EM_UI_PREVIEW"] = "feedback"
+        app.launch()
+        let done = app.buttons["feedback.done"]
+        XCTAssertTrue(done.waitForExistence(timeout: 15))
+        let later = app.buttons["updatePopup.later"]
+        XCTAssertFalse(later.waitForExistence(timeout: 3), "not over the feedback sheet")
+        done.tap()
+        XCTAssertTrue(later.waitForExistence(timeout: 10), "shows once the sheet closes")
+        later.tap()
+    }
+
     func testFirstLaunchShowsThePopupOnce() {
         let withNote = #"{"schema":1,"ipad":{"version":"9.9.9","build":999,"note":"Fixes Apple Pencil pressure in drawing apps."}}"#
         let app = launch(manifest: withNote, keepPopup: true)
