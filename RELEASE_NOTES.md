@@ -21,11 +21,14 @@ an iPad on 0.3.1 still works with the Windows changes.
   differ.
 - The PC window opens on graphics drivers that crashed 0.3.1 at startup. If
   the host can't start or stops unexpectedly, it names the error and log file,
-  and a helper process reports the crash and turns the second screen off.
+  and a helper process reports the crash and tries to turn the second screen
+  off.
   Opening EternalMonitor again brings the running window to the front.
 - A USB connection stays up when the stream restarts. Capture blocked by the
   lock screen or a display change retries by itself. A hung or missing display
-  task no longer stalls the stream or leaves the second screen behind at quit.
+  task no longer stalls the stream. At quit, EternalMonitor tries to turn the
+  second screen off even while Windows' display task is slow, and if it can't,
+  a helper process tries again.
 - PC audio starts cleanly and survives a large packet. With no iPad connected
   the PC no longer encodes its screen.
 - The installer allows display traffic on work or school networks and names
@@ -40,8 +43,10 @@ On a PC where 0.3.1 closed right after opening, install this build: the window
 should appear, or a message should name the error and log file. Send that file
 with the time.
 
-Install 0.3.1 on Windows, click **Update now** when the banner appears, approve
-the prompt, and check that 0.3.2 opens. Try once while streaming, with
+On a PC with 0.3.1, download the 0.3.2 installer and run it over 0.3.1;
+0.3.1's banner only offers **View release**. From 0.3.2 on, **Update now**
+installs a later build in place: once one is out, click it, approve the
+prompt, and check that the new version opens, once while streaming with
 **Stop and update**. On the iPad, tap **Open TestFlight** from the banner.
 
 With a second monitor left of the main display, touch each corner of the iPad
