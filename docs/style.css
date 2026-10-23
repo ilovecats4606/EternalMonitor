@@ -571,25 +571,7 @@ small { font-size: 0.875rem; }
 .tablet.portrait .screen { border-radius: 6% / 4.5%; }
 .tablet .screen img { width: 100%; }
 
-/* --- Feature rows ---------------------------------------------------------- */
-
-.feature {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: clamp(32px, 6vw, 80px);
-  align-items: center;
-  padding: clamp(40px, 6vw, 72px) 0;
-  border-top: 1px solid var(--border);
-}
-.feature:first-of-type { border-top: 0; padding-top: 0; }
-.feature:last-of-type { padding-bottom: 0; }
-.feature.flip .feature-text { order: 2; }
-.feature-text { max-width: 440px; }
-.feature-text h3 { font-size: clamp(1.5rem, 1.1rem + 1.4vw, 2rem); letter-spacing: -0.03em; }
-.feature-text p { margin-top: 14px; color: var(--muted); }
-.feature-text .caption { margin-top: 18px; }
-.feature-media { position: relative; }
-.feature-media .caption { margin-top: 12px; text-align: center; }
+/* --- Pair: Windows QR dialog beside the iPad pairing sheet -------------------- */
 
 .pair {
   display: grid;
@@ -605,11 +587,6 @@ small { font-size: 0.875rem; }
   box-shadow: 0 24px 60px -24px rgba(0, 0, 0, 0.85);
 }
 
-@media (max-width: 860px) {
-  .feature { grid-template-columns: 1fr; gap: 28px; }
-  .feature.flip .feature-text { order: 0; }
-  .feature-text { max-width: none; }
-}
 
 /* --- Facts ------------------------------------------------------------------- */
 
