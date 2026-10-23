@@ -47,8 +47,9 @@ https://testflight.apple.com/join/ppc9QfXc
 
 If Windows asks about EternalMonitor in a Windows Security Alert, tick
 Private networks and click Allow access. On Windows 11 the prompt is called
-Windows Security, with Allow and Cancel: click Allow. If you clicked Cancel
-and the iPad can't find the PC, run EternalMonitor-Setup.exe again.
+Windows Security and asks "Do you want to allow public and private networks
+to access this app?" Click Allow. If you clicked Cancel and the iPad can't
+find the PC, run EternalMonitor-Setup.exe again.
 
 3. Connect with a USB cable (optional)
 --------------------------------------
@@ -100,6 +101,8 @@ Messages are quoted as the apps show them. The apps use curly apostrophes
 in a few places, so search for a few words rather than the whole line.
 
 What the iPad says, and what to do:
+- "Couldn't search for PCs": tap Search again, or scan the QR code or type
+  the Address shown in this window.
 - "Your PC didn't answer": check that this window says "Ready for your
   iPad", the PC is awake, and both are on the same Wi-Fi, not a guest
   network. If so, a firewall is probably blocking EternalMonitor: run
@@ -139,6 +142,8 @@ What this window says, and what to do:
 - "Video is using the processor instead of the graphics card": click
   "Use recommended settings" if shown. Otherwise update your graphics driver
   from NVIDIA, AMD or Intel, then click Restart.
+- "Streaming to ... is paused": Windows stopped sharing the screen. Follow
+  the message above it; the picture comes back by itself.
 - "Your PC is showing the lock screen or a permission prompt": unlock the
   PC or answer the prompt. The picture comes back by itself.
 - "Update the iPad app to connect": on the iPad, open TestFlight and tap
