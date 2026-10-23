@@ -706,7 +706,8 @@ mod tests {
     }
 
     /// The sharing setting is process-wide. Tests that need it on hold this;
-    /// a test that turns it off holds it exclusively.
+    /// a test that turns it off holds it exclusively. So does a test that
+    /// stalls the outbox, which holds every outbox write in the process.
     static SHARING: std::sync::RwLock<()> = std::sync::RwLock::new(());
     fn sharing_on() -> std::sync::RwLockReadGuard<'static, ()> {
         SHARING
@@ -815,7 +816,9 @@ mod tests {
 
     #[test]
     fn quitting_while_an_outbox_write_stalls_is_bounded() {
-        let _sharing = sharing_on();
+        let _sharing = SHARING
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let directory = std::env::temp_dir().join(id().unwrap());
         fs::create_dir_all(&directory).unwrap();
         let config = Config {
