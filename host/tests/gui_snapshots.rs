@@ -397,6 +397,7 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     let mut results = SnapshotResults::new();
     results.extend_harness(&mut harness);
     feedback_and_star(&shared, &dir, &mut results);
+    long_feedback_keeps_its_buttons_on_screen(&shared, &mut results);
     std::fs::remove_dir_all(dir).unwrap();
     results.unwrap();
 }
@@ -430,6 +431,63 @@ fn opened_url(harness: &Harness<'_, AnalyzerApp>) -> Option<String> {
 fn settings_file(dir: &std::path::Path) -> SettingsFile {
     let text = std::fs::read_to_string(dir.join("EternalMonitor/settings.json")).unwrap();
     serde_json::from_str(&text).unwrap()
+}
+
+/// A long message never pushes the dialog's buttons out of the window, at
+/// the smallest window size or the default one.
+fn long_feedback_keeps_its_buttons_on_screen(
+    shared: &SharedControl,
+    results: &mut SnapshotResults,
+) {
+    let message = (1..=35)
+        .map(|n| format!("Line {n}: the picture stutters when I drag a window."))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for (name, size) in [
+        ("feedback-panel-long-minimum", egui::vec2(820.0, 560.0)),
+        ("feedback-panel-long", egui::vec2(1040.0, 720.0)),
+    ] {
+        let mut window = harness(shared, size, 1.0);
+        nav(&mut window, "Settings");
+        window
+            .get_all_by_role_and_label(Role::Button, "Send feedback")
+            .next()
+            .expect("the sidebar button")
+            .click();
+        window.run_steps(4);
+        window.get_by_role(Role::MultilineTextInput).click();
+        window.run_steps(2);
+        window
+            .get_by_role(Role::MultilineTextInput)
+            .type_text(&message);
+        window.run_steps(6);
+        // The box keeps the caret in view as typing goes on.
+        window.get_by_role(Role::MultilineTextInput).type_text("!");
+        window.run_steps(6);
+        let typed = window
+            .get_by_role(Role::MultilineTextInput)
+            .value()
+            .unwrap_or_default();
+        assert_eq!(typed.lines().count(), 35, "{typed}");
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        for label in [
+            "Open in my email app",
+            "Copy message",
+            "Copy with logs",
+            "Close",
+        ] {
+            let rect = window.get_by_role_and_label(Role::Button, label).rect();
+            assert!(
+                screen.contains_rect(rect),
+                "{name}: {label} at {rect:?} is outside {screen:?}"
+            );
+        }
+        window.get_by_label("Tell us how it's going");
+        window.get_by_label("No email app? Write to").hover();
+        window.run_steps(4);
+        snapshot(&mut window, shared, name);
+        results.extend_harness(&mut window);
+    }
 }
 
 /// Send feedback, the one-time ask after three long sessions, and the GitHub

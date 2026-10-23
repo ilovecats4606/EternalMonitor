@@ -170,55 +170,52 @@ impl AnalyzerApp {
                 );
                 ui.add_space(8.0);
 
-                let before = draft.kind;
-                widgets::segmented(
-                    ui,
-                    &mut draft.kind,
-                    &[
-                        (Kind::Problem, Kind::Problem.label()),
-                        (Kind::Idea, Kind::Idea.label()),
-                        (Kind::Praise, Kind::Praise.label()),
-                    ],
-                );
-                ui.add_space(4.0);
-                let hint = match draft.kind {
-                    Kind::Problem => "What happened, and what were you doing when it did?",
-                    Kind::Idea => "What would make EternalMonitor better for you?",
-                    Kind::Praise => "What do you like about EternalMonitor?",
-                };
-                let edited = ui
-                    .add(
-                        egui::TextEdit::multiline(&mut draft.message)
-                            .hint_text(egui::RichText::new(hint).color(TEXT_FAINT))
-                            .font(FontId::new(BODY, FontFamily::Proportional))
-                            .desired_rows(5)
-                            .desired_width(f32::INFINITY)
-                            .margin(Margin::symmetric(10, 8)),
-                    )
-                    .changed();
-                if edited || draft.kind != before {
-                    draft.note = None;
-                }
-                widgets::paragraph(ui, faint(kind_reply(draft.kind)));
-                ui.add_space(6.0);
+                // Everything between the greeting and the buttons scrolls, so
+                // a long message or a small window never pushes the buttons
+                // off screen.
+                let pinned = PINNED_HEIGHT + if draft.note.is_some() { 40.0 } else { 0.0 };
+                let body_height = (ui.ctx().content_rect().height() - pinned).max(110.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("feedback-body")
+                    .max_height(body_height)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        let before = draft.kind;
+                        widgets::segmented(
+                            ui,
+                            &mut draft.kind,
+                            &[
+                                (Kind::Problem, Kind::Problem.label()),
+                                (Kind::Idea, Kind::Idea.label()),
+                                (Kind::Praise, Kind::Praise.label()),
+                            ],
+                        );
+                        ui.add_space(4.0);
+                        if message_box(ui, &mut draft) || draft.kind != before {
+                            draft.note = None;
+                        }
+                        widgets::paragraph(ui, faint(kind_reply(draft.kind)));
+                        ui.add_space(6.0);
 
-                let mut include = !draft.exclude_details;
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    widgets::toggle(ui, &mut include, "Include app and PC details");
-                    ui.label(egui::RichText::new("Include app and PC details").color(TEXT));
-                });
-                if include == draft.exclude_details {
-                    draft.exclude_details = !include;
-                    draft.note = None;
-                }
-                if include {
-                    widgets::paragraph(ui, faint(details.summary()));
-                }
-                widgets::paragraph(
-                    ui,
-                    faint("To include logs, click Copy with logs and paste into your email. Logs can include this PC's name and network addresses."),
-                );
+                        let mut include = !draft.exclude_details;
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            widgets::toggle(ui, &mut include, "Include app and PC details");
+                            ui.label(egui::RichText::new("Include app and PC details").color(TEXT));
+                        });
+                        if include == draft.exclude_details {
+                            draft.exclude_details = !include;
+                            draft.note = None;
+                        }
+                        if include {
+                            widgets::paragraph(ui, faint(details.summary()));
+                        }
+                        widgets::paragraph(
+                            ui,
+                            faint("To include logs, click Copy with logs and paste into your email. Logs can include this PC's name and network addresses."),
+                        );
+                    });
                 ui.add_space(10.0);
 
                 let width = ui.available_width();
@@ -335,6 +332,54 @@ impl AnalyzerApp {
             self.feedback = Some(draft);
         }
     }
+}
+
+/// Room the dialog keeps outside its scrolling middle: margins, greeting,
+/// buttons and the email line.
+const PINNED_HEIGHT: f32 = 330.0;
+/// The message box shows five to eight lines, then scrolls inside itself.
+const MESSAGE_ROW: f32 = 18.0;
+
+/// The message box, with its own border so the border stays put while long
+/// text scrolls inside it. Returns whether the text changed.
+fn message_box(ui: &mut Ui, draft: &mut Draft) -> bool {
+    let id = ui.make_persistent_id("feedback-message");
+    let focused = ui.memory(|m| m.has_focus(id));
+    let hint = match draft.kind {
+        Kind::Problem => "What happened, and what were you doing when it did?",
+        Kind::Idea => "What would make EternalMonitor better for you?",
+        Kind::Praise => "What do you like about EternalMonitor?",
+    };
+    let mut changed = false;
+    Frame::new()
+        .fill(CANVAS)
+        .stroke(Stroke::new(
+            1.0,
+            if focused { ACCENT } else { BORDER_STRONG },
+        ))
+        .corner_radius(8.0)
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("feedback-message-scroll")
+                .min_scrolled_height(MESSAGE_ROW * 5.0)
+                .max_height(MESSAGE_ROW * 8.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    changed = ui
+                        .add(
+                            egui::TextEdit::multiline(&mut draft.message)
+                                .id(id)
+                                .frame(Frame::NONE)
+                                .hint_text(egui::RichText::new(hint).color(TEXT_FAINT))
+                                .font(FontId::new(BODY, FontFamily::Proportional))
+                                .desired_rows(5)
+                                .desired_width(f32::INFINITY),
+                        )
+                        .changed();
+                });
+        });
+    changed
 }
 
 /// A line under the message box that answers the kind chosen.
