@@ -454,9 +454,16 @@ small { font-size: 0.875rem; }
 
 .pair {
   display: grid;
-  grid-template-columns: 1.55fr 1fr;
+  grid-template-columns: 1fr 1fr;
   gap: 16px;
   align-items: end;
+/* A Windows dialog on its own: the crop follows its rounded edge. */
+.dialog-shot img {
+  width: 100%;
+  border-radius: 3.7% / 2.7%;
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 24px 60px -24px rgba(0, 0, 0, 0.85);
+}
 }
 
 @media (max-width: 860px) {
