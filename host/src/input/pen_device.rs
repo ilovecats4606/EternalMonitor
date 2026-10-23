@@ -9,7 +9,10 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use super::pen_contact::{Outcome, PenContact, PenTarget, PointerKind, INPUT_STALE, STUCK_TRIAL};
-use super::{desktop_pixel_to_abs, CaptureGeometry, Injection, PenPhase, PenSample, VirtualScreen};
+use super::{
+    desktop_pixel_to_abs, norm_to_output_pixel, CaptureGeometry, Injection, PenPhase, PenSample,
+    VirtualScreen,
+};
 
 /// After Windows refuses a device, ask again at most this often.
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -62,7 +65,12 @@ enum MouseEvent {
 #[derive(Debug, Clone, Copy)]
 struct Waiting {
     event: MouseEvent,
+    /// The desktop pixel, used when no capture rect is known and for a
+    /// release kept owed, which goes where the pointer last went.
     at: (i32, i32),
+    /// The sample's wire position, mapped onto the capture rect current
+    /// when the event is sent, so it follows a display that moved.
+    norm: Option<(u16, u16)>,
     received: Instant,
     ink: bool,
 }
@@ -256,7 +264,7 @@ impl<A: PenApi> PenDevice<A> {
         output: Option<CaptureGeometry>,
         now: Instant,
     ) {
-        self.pump(now);
+        self.pump(output, now);
         let starts = match sample.phase {
             PenPhase::Down => true,
             PenPhase::Hover => !self.hovering,
@@ -264,13 +272,13 @@ impl<A: PenApi> PenDevice<A> {
         };
         self.hovering = sample.phase == PenPhase::Hover;
         if self.mouse_busy() {
-            return self.mouse_for(sample, now, now);
+            return self.mouse_for(sample, now, output, now);
         }
         if starts {
             self.revive(now);
         }
         if !self.available() {
-            return self.mouse_for(sample, now, now);
+            return self.mouse_for(sample, now, output, now);
         }
         let mut target = Target {
             slot: &mut self.slot,
@@ -279,7 +287,7 @@ impl<A: PenApi> PenDevice<A> {
             now,
         };
         self.contact.deliver(sample, output, now, &mut target);
-        self.hand_over(now);
+        self.hand_over(output, now);
     }
 
     /// The session ended or was taken over. Native input ends as
@@ -298,14 +306,14 @@ impl<A: PenApi> PenDevice<A> {
             self.contact.reset(&mut target);
         }
         self.drop_mouse_input("reset", now);
-        self.pump(now);
+        self.pump(None, now);
     }
 
     /// Called on every refresh tick: retry mouse input Windows refused, and
-    /// deliver samples Windows was not ready for, mapped onto `output`, the
-    /// current capture rect.
+    /// deliver samples Windows was not ready for, both mapped onto `output`,
+    /// the current capture rect.
     pub fn flush(&mut self, output: Option<CaptureGeometry>, now: Instant) {
-        self.pump(now);
+        self.pump(output, now);
         if !self.available() || self.contact.pending().is_none() {
             return;
         }
@@ -317,7 +325,7 @@ impl<A: PenApi> PenDevice<A> {
             now,
         };
         self.contact.flush(output, now, &mut target);
-        self.hand_over(now);
+        self.hand_over(output, now);
     }
 
     /// Whether the refresh tick has work even without a device: mouse input
@@ -332,9 +340,9 @@ impl<A: PenApi> PenDevice<A> {
 
     /// Send the samples `PenContact` gave up on to the mouse, oldest first,
     /// each still aged from when it was received.
-    fn hand_over(&mut self, now: Instant) {
+    fn hand_over(&mut self, output: Option<CaptureGeometry>, now: Instant) {
         for (sample, received) in self.contact.take_abandoned() {
-            self.mouse_for(sample, received, now);
+            self.mouse_for(sample, received, output, now);
         }
     }
 
@@ -344,8 +352,14 @@ impl<A: PenApi> PenDevice<A> {
     /// is pressed at its first sample on the mouse; anything else releases
     /// a button that will be held. The mouse is therefore never pressed
     /// twice or released without a press, and a new stroke's press follows
-    /// the last stroke's release.
-    fn mouse_for(&mut self, sample: PenSample, received: Instant, now: Instant) {
+    /// the last stroke's release. `output` is the current capture rect.
+    fn mouse_for(
+        &mut self,
+        sample: PenSample,
+        received: Instant,
+        output: Option<CaptureGeometry>,
+        now: Instant,
+    ) {
         let want = matches!(sample.phase, PenPhase::Down | PenPhase::Move);
         self.mouse.wanted = want;
         let events: &[MouseEvent] = match (want, self.mouse.planned) {
@@ -356,34 +370,41 @@ impl<A: PenApi> PenDevice<A> {
             (false, false) => &[],
         };
         self.mouse.planned = want;
-        let at = (sample.x, sample.y);
+        let (at, norm) = ((sample.x, sample.y), Some((sample.x_norm, sample.y_norm)));
         self.mouse
             .waiting
             .extend(events.iter().map(|&event| Waiting {
                 event,
                 at,
+                norm,
                 received,
                 ink: want,
             }));
-        self.pump(now);
+        self.pump(output, now);
     }
 
-    /// Offer Windows the waiting input, oldest first, placed on the virtual
-    /// screen as it is now. What it inserts leaves the queue and sets the
-    /// button state; the rest waits for the next sample, tick or reset.
-    /// Stale ink is dropped first, so a late call never inserts it.
-    fn pump(&mut self, now: Instant) {
+    /// Offer Windows the waiting input, oldest first, placed on `output`,
+    /// the capture rect current now, and on the virtual screen as it is now.
+    /// What it inserts leaves the queue and sets the button state; the rest
+    /// waits for the next sample, tick or reset. Stale ink is dropped first,
+    /// so a late call never inserts it.
+    fn pump(&mut self, output: Option<CaptureGeometry>, now: Instant) {
         self.expire_mouse(now);
         if self.mouse.waiting.is_empty() {
             return;
         }
+        let at = |waiting: &Waiting| match (waiting.norm, output) {
+            (Some((x, y)), Some(output)) => norm_to_output_pixel(x, y, output),
+            _ => waiting.at,
+        };
         let screen = self.slot.api.screen();
         let inputs: Vec<_> = self
             .mouse
             .waiting
             .iter()
             .map(|waiting| {
-                let (x, y) = desktop_pixel_to_abs(waiting.at.0, waiting.at.1, screen);
+                let (x, y) = at(waiting);
+                let (x, y) = desktop_pixel_to_abs(x, y, screen);
                 match waiting.event {
                     MouseEvent::Move => Injection::MoveAbs { x, y },
                     MouseEvent::Press => Injection::LeftDown { x, y },
@@ -394,7 +415,7 @@ impl<A: PenApi> PenDevice<A> {
         let inserted = self.slot.api.send_mouse(&inputs).min(inputs.len());
         for waiting in self.mouse.waiting.drain(..inserted) {
             match waiting.event {
-                MouseEvent::Move => self.mouse.at = waiting.at,
+                MouseEvent::Move => self.mouse.at = at(&waiting),
                 MouseEvent::Press => self.mouse.pressed = true,
                 MouseEvent::Release => self.mouse.pressed = false,
             }
@@ -417,7 +438,8 @@ impl<A: PenApi> PenDevice<A> {
         if !self.mouse.waiting.iter().any(stale) {
             return;
         }
-        let (mut held, mut at, mut press_owed) = (self.mouse.pressed, self.mouse.at, false);
+        let (mut held, mut press_owed) = (self.mouse.pressed, false);
+        let (mut at, mut norm) = (self.mouse.at, None);
         let mut kept = VecDeque::with_capacity(self.mouse.waiting.len());
         for waiting in std::mem::take(&mut self.mouse.waiting) {
             match waiting.event {
@@ -429,7 +451,7 @@ impl<A: PenApi> PenDevice<A> {
                     press_owed |= waiting.event == MouseEvent::Press;
                 }
                 MouseEvent::Move => {
-                    at = waiting.at;
+                    (at, norm) = (waiting.at, waiting.norm);
                     kept.push_back(waiting);
                     if std::mem::take(&mut press_owed) && waiting.ink {
                         kept.push_back(Waiting {
@@ -445,7 +467,11 @@ impl<A: PenApi> PenDevice<A> {
                 }
                 MouseEvent::Release if held => {
                     held = false;
-                    kept.push_back(Waiting { at, ..waiting });
+                    kept.push_back(Waiting {
+                        at,
+                        norm,
+                        ..waiting
+                    });
                 }
                 MouseEvent::Release => {
                     #[cfg(test)]
@@ -479,6 +505,7 @@ impl<A: PenApi> PenDevice<A> {
             self.mouse.waiting.push_back(Waiting {
                 event: MouseEvent::Release,
                 at: self.mouse.at,
+                norm: None,
                 received: now,
                 ink: false,
             });
@@ -2527,6 +2554,66 @@ mod tests {
             device.slot.api.mouse,
             [Injection::MoveAbs { x, y }, Injection::LeftDown { x, y }]
         );
+    }
+
+    #[test]
+    fn refused_mouse_input_follows_the_captured_display_when_it_moves() {
+        // Sol's case: SendInput refuses a tap at the centre of a 2360x1640
+        // display right of the primary, and the display moves to the
+        // primary's left before the retry. The tap must land on the display
+        // where it is now, not on the primary's right edge.
+        let before = CaptureGeometry {
+            left: 2560,
+            top: 0,
+            width: 2360,
+            height: 1640,
+        };
+        let after = CaptureGeometry {
+            left: -2360,
+            ..before
+        };
+        let mut device = PenDevice::new(FakeApi::new(&[false]));
+        device.slot.api.screen = VirtualScreen {
+            left: 0,
+            top: 0,
+            width: 4920,
+            height: 1640,
+        };
+        device.slot.api.mouse_limit = 0;
+        let start = Instant::now();
+        let (x, y) = super::super::norm_to_output_pixel(32_768, 32_768, before);
+        assert_eq!((x, y), (3739, 819));
+        for phase in [PenPhase::Down, PenPhase::Up] {
+            let Injection::Pen(sample) = pen_xy(phase, x, y) else {
+                unreachable!()
+            };
+            let sample = PenSample {
+                x_norm: 32_768,
+                y_norm: 32_768,
+                ..sample
+            };
+            device.deliver(sample, device.slot.api.screen, Some(before), start);
+        }
+        let moved = VirtualScreen {
+            left: -2360,
+            top: 0,
+            width: 4920,
+            height: 1640,
+        };
+        device.slot.api.screen = moved;
+        device.slot.api.mouse_limit = usize::MAX;
+        device.flush(Some(after), start + Duration::from_millis(20));
+        let (x, y) = desktop_pixel_to_abs(-1181, 819, moved);
+        assert_eq!(
+            device.slot.api.mouse,
+            [
+                Injection::MoveAbs { x, y },
+                Injection::LeftDown { x, y },
+                Injection::MoveAbs { x, y },
+                Injection::LeftUp { x, y },
+            ]
+        );
+        assert!(!device.slot.api.button);
     }
 
     #[test]
