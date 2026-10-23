@@ -427,7 +427,6 @@ small { font-size: 0.875rem; }
   font-weight: 500;
   color: var(--muted);
   cursor: pointer;
-  transition: background-color 0.2s ease-out, color 0.2s ease-out;
 }
 .sw label:hover { color: var(--text); }
 #mode-mirror:checked ~ .sw label[for="mode-mirror"],
@@ -441,9 +440,19 @@ small { font-size: 0.875rem; }
 
 .swap { position: relative; }
 .swap img { display: block; width: 100%; }
-.swap .swap-b { position: absolute; inset: 0; height: 100%; opacity: 0; transition: opacity 0.45s ease-out; }
+/* The inactive capture is hidden from assistive technology as well as from
+   sight: visibility flips at the end of the fade out and at the start of the
+   fade in, so only the shown capture is in the accessibility tree. */
+.swap .swap-a { visibility: visible; transition: visibility 0s; }
+.swap .swap-b {
+  position: absolute; inset: 0; height: 100%;
+  opacity: 0; visibility: hidden;
+  transition: opacity 0.45s ease-out, visibility 0s linear 0.45s;
+}
 #mode-second:checked ~ .modes .swap-b,
-#pic-fill:checked ~ .fill-tablet .swap-b { opacity: 1; }
+#pic-fill:checked ~ .fill-tablet .swap-b { opacity: 1; visibility: visible; transition: opacity 0.45s ease-out, visibility 0s; }
+#mode-second:checked ~ .modes .swap-a,
+#pic-fill:checked ~ .fill-tablet .swap-a { visibility: hidden; transition: visibility 0s linear 0.45s; }
 
 .modes {
   display: grid;
@@ -484,7 +493,8 @@ small { font-size: 0.875rem; }
   .displays { height: 150px; max-width: 360px; width: 100%; margin-inline: auto; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .swap .swap-b, .d-ipad, .sw label { transition: none; }
+  .swap .swap-a, .swap .swap-b, #mode-second:checked ~ .modes .swap-a, #mode-second:checked ~ .modes .swap-b,
+  #pic-fill:checked ~ .fill-tablet .swap-a, #pic-fill:checked ~ .fill-tablet .swap-b, .d-ipad { transition: none; }
 }
 
 .tiles {
