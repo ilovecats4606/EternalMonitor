@@ -641,24 +641,9 @@ small { font-size: 0.875rem; }
 
 /* --- Studio / closing ------------------------------------------------------ */
 
-.studio {
-  display: grid;
-  grid-template-columns: 1.2fr 1fr;
-  gap: clamp(32px, 6vw, 72px);
-  align-items: center;
-}
+.studio { max-width: 720px; }
 .studio p { color: var(--muted); }
 .studio-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 24px; }
-.scene {
-  border-radius: var(--r-lg);
-  overflow: hidden;
-  border: 1px solid var(--border);
-}
-.scene img { width: 100%; }
-@media (max-width: 860px) {
-  .studio { grid-template-columns: 1fr; }
-  .studio .scene { order: -1; }
-}
 
 /* --- Footer ------------------------------------------------------------------ */
 
