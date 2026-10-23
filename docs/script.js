@@ -55,39 +55,19 @@
     reveals.forEach(function (el) { el.classList.add('visible'); });
   }
 
-  /* --- Hero film ------------------------------------------------------------
-     The short loop plays silently when it scrolls into view, unless the
-     visitor prefers reduced motion. "Full version" swaps in the longer cut
-     with native controls. */
-  var film = document.getElementById('film');
-  var filmFrame = film && film.closest('.film-frame');
-  var filmStage = film && film.closest('.film-stage');
-  if (film && filmFrame) {
-    var playBtn = document.getElementById('film-play');
-    var fullBtn = document.getElementById('film-full');
-    var loop = { mp4: film.getAttribute('data-loop-mp4'), webm: film.getAttribute('data-loop-webm') };
-    var full = { mp4: film.getAttribute('data-full-mp4'), webm: film.getAttribute('data-full-webm') };
+  /* --- Connection clip -------------------------------------------------------
+     The short clip in How it works plays silently while it is in view,
+     unless the visitor prefers reduced motion; the Play button covers both. */
+  var clip = document.getElementById('clip');
+  if (clip) {
+    var playBtn = document.getElementById('clip-play');
     var wantsPlay = !reducedMotion;
-    var inView = false;
-    // Without JS the film keeps its native controls; with JS the buttons
-    // below take over until the full version brings them back.
-    film.removeAttribute('controls');
+    // Without JS the clip keeps its native controls; with JS the button takes over.
+    clip.removeAttribute('controls');
 
-    var setSources = function (src) {
-      while (film.firstChild) film.removeChild(film.firstChild);
-      // H.264 first: hardware decoding everywhere, including iPad and Safari.
-      [['mp4', 'video/mp4'], ['webm', 'video/webm']].forEach(function (pair) {
-        if (!src[pair[0]]) return;
-        var s = document.createElement('source');
-        s.src = src[pair[0]];
-        s.type = pair[1];
-        film.appendChild(s);
-      });
-      film.load();
-    };
     var setPlayLabel = function () {
       if (!playBtn) return;
-      var playing = !film.paused && !film.ended;
+      var playing = !clip.paused && !clip.ended;
       playBtn.querySelector('.label').textContent = playing ? 'Pause' : 'Play';
       playBtn.setAttribute('aria-pressed', playing ? 'true' : 'false');
       // SVG elements have no `hidden` property, so toggle the attribute.
@@ -95,42 +75,23 @@
       playBtn.querySelector('.ico-pause').toggleAttribute('hidden', !playing);
     };
     var tryPlay = function () {
-      var p = film.play();
+      var p = clip.play();
       if (p && p.catch) p.catch(function () { wantsPlay = false; setPlayLabel(); });
     };
-
-    setSources(loop);
-    film.addEventListener('play', setPlayLabel);
-    film.addEventListener('pause', setPlayLabel);
+    clip.addEventListener('play', setPlayLabel);
+    clip.addEventListener('pause', setPlayLabel);
     setPlayLabel();
 
     if ('IntersectionObserver' in window) {
       new IntersectionObserver(function (entries) {
-        inView = entries[0].isIntersecting;
-        if (film.controls) return;
-        if (inView && wantsPlay) tryPlay(); else if (!inView) film.pause();
-      }, { threshold: 0.35 }).observe(filmFrame);
+        if (entries[0].isIntersecting) { if (wantsPlay) tryPlay(); } else clip.pause();
+      }, { threshold: 0.35 }).observe(clip);
     } else if (wantsPlay) {
       tryPlay();
     }
-
     if (playBtn) {
       playBtn.addEventListener('click', function () {
-        if (film.paused) { wantsPlay = true; tryPlay(); } else { wantsPlay = false; film.pause(); }
-      });
-    }
-    if (fullBtn && full.mp4) {
-      fullBtn.addEventListener('click', function (event) {
-        event.preventDefault();
-        film.pause();
-        film.loop = false;
-        film.setAttribute('controls', '');
-        film.setAttribute('aria-label', 'EternalMonitor, the full video');
-        (filmStage || filmFrame).classList.add('has-controls');
-        setSources(full);
-        film.currentTime = 0;
-        tryPlay();
-        film.focus();
+        if (clip.paused) { wantsPlay = true; tryPlay(); } else { wantsPlay = false; clip.pause(); }
       });
     }
   }

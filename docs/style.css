@@ -332,63 +332,59 @@ small { font-size: 0.875rem; }
   .hero-actions { margin-top: 22px; }
 }
 
-/* --- Film ------------------------------------------------------------------ */
+/* --- Hero screenshots -------------------------------------------------------
+   The Windows window and the iPad overlap. Percentage margins follow the
+   stage's width, so the iPad's top sits at a fixed share of the width. */
 
-.film { margin-top: clamp(32px, 3.5vw, 44px); }
-.film-stage { position: relative; }
-.film-frame {
-  position: relative;
-  aspect-ratio: 16 / 9;
-  border-radius: var(--r-lg);
-  overflow: hidden;
-  background: #000;
-  border: 1px solid var(--border);
-  box-shadow: 0 30px 80px -30px rgba(0, 0, 0, 0.9);
-}
-.film-frame video {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  background: #000;
-}
-.film-controls {
-  position: absolute;
-  right: 14px;
-  bottom: 14px;
+.shots { margin-top: clamp(32px, 3.5vw, 44px); }
+.shots-stage { display: flow-root; }
+.shot { position: relative; }
+.shot-pc { width: 64%; z-index: 1; }
+/* 16% of the width down from the top of the PC label: the PC block is
+   30px label + 34px title bar + 64% / 2.08 image. */
+.shot-ipad { width: 44%; margin: calc(-14.77% - 64px) 0 0 auto; z-index: 2; }
+.shot-label {
   display: flex;
+  align-items: center;
   gap: 8px;
-  z-index: 2;
-}
-.film-controls .btn {
-  height: 36px;
-  padding: 0 12px;
+  height: 20px;
+  margin-bottom: 10px;
   font-size: 0.8125rem;
-  border-radius: 8px;
-  background: rgba(10, 10, 11, 0.72);
-  color: var(--text);
-  border-color: rgba(255, 255, 255, 0.14);
-  -webkit-backdrop-filter: blur(10px);
-  backdrop-filter: blur(10px);
+  font-weight: 500;
+  line-height: 20px;
+  color: var(--muted);
 }
-.film-controls .btn:hover { background: rgba(26, 26, 29, 0.9); }
-.film-controls .btn svg { width: 14px; height: 14px; }
-.film-stage.has-controls .film-controls { display: none; }
-/* Without JS the video's own controls play it; only the full-version link stays. */
-.no-js #film-play { display: none; }
-.no-js .film-controls { position: static; justify-content: flex-end; margin-top: 10px; }
+.shot-label::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+.shot-ipad .shot-label { justify-content: flex-end; margin: 10px 0 0; }
+.shots-caption { margin-top: 14px; padding: 0 4px; }
 @media (max-width: 720px) {
-  .film-controls { position: static; justify-content: flex-end; margin-top: 10px; }
-  .film-controls .btn { background: var(--raised); -webkit-backdrop-filter: none; backdrop-filter: none; }
+  .shot-pc { width: 88%; }
+  /* PC block: 64px + 88% / 2.08; the iPad starts 30% of the width down. */
+  .shot-ipad { width: 62%; margin-top: calc(-12.3% - 64px); }
+  .shot-label { font-size: 0.75rem; }
 }
-.film-caption {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: space-between;
-  gap: 8px 24px;
-  margin-top: 14px;
-  padding: 0 4px;
+
+/* --- How it works: the connection clip beside the steps --------------------- */
+
+.how {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+  gap: clamp(28px, 4vw, 56px);
+  align-items: start;
 }
-.film-caption p { max-width: 720px; }
+.clip video { display: block; width: 100%; height: auto; background: #000; }
+.clip-controls { display: flex; justify-content: flex-end; margin-top: 12px; }
+.clip-controls .btn { height: 36px; padding: 0 12px; font-size: 0.8125rem; border-radius: 8px; }
+.clip-controls .btn svg { width: 14px; height: 14px; }
+.clip .caption { margin-top: 12px; }
+/* Without JS the video's own controls play it. */
+.no-js .clip-controls { display: none; }
+.how .steps { grid-template-columns: 1fr; gap: 12px; }
+.how .step { padding: 20px 22px; }
+.how .step::before { margin-bottom: 12px; }
+@media (max-width: 860px) {
+  .how { grid-template-columns: 1fr; }
+}
 
 /* --- Device frames ---------------------------------------------------------- */
 

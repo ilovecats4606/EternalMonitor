@@ -83,33 +83,28 @@
           </p>
         </div>
 
-        <figure class="film">
-          <div class="film-stage">
-          <div class="film-frame">
-            <video id="film" controls muted playsinline loop preload="none"
-                   poster="assets/film-poster.jpg"
-                   width="1920" height="1080"
-                   aria-label="EternalMonitor in use: the Windows app shows its address, pairing code and QR code; in a real session recorded in the iPad Simulator, the iPad app connects, takes the six-digit code and shows the live stream with its own connection measurements; the Windows app switches between Mirror my screen and Second screen"
-                   data-loop-mp4="assets/film-loop.mp4" data-loop-webm="assets/film-loop.webm"
-                   data-full-mp4="assets/film-full.mp4" data-full-webm="assets/film-full.webm">
-              <source src="assets/film-loop.mp4" type="video/mp4">
-              <source src="assets/film-loop.webm" type="video/webm">
-              <a href="assets/film-full.mp4">Download the video (MP4)</a>
-            </video>
-          </div>
-            <div class="film-controls">
-              <button type="button" class="btn btn-secondary" id="film-play" aria-pressed="false">
-                <svg class="ico-play" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4 2.5v11l9-5.5z"/></svg>
-                <svg class="ico-pause" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" hidden><path d="M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z"/></svg>
-                <span class="label">Play</span>
-              </button>
-              <a href="assets/film-full.mp4" class="btn btn-secondary" id="film-full">Watch the full version</a>
+        <figure class="shots" aria-labelledby="shots-caption">
+          <div class="shots-stage">
+            <div class="shot shot-pc">
+              <p class="shot-label">Windows app</p>
+              <div class="pc-window">
+                <div class="pc-titlebar" aria-hidden="true">
+                  <span class="t"><img src="assets/icon.png" alt="" width="14" height="14">EternalMonitor</span>
+                  <span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span>
+                </div>
+                <img src="assets/host-ready.webp" srcset="assets/host-ready.webp 1040w, assets/host-ready@2x.webp 2080w" sizes="(max-width: 720px) 88vw, 720px" width="2080" height="1000" fetchpriority="high" decoding="async" alt="The Windows app's Stream page saying Ready for your iPad, with Mirror my screen selected, the PC's address, a six-digit pairing code, a QR code button, and Waiting for an iPad.">
+              </div>
+            </div>
+            <div class="shot shot-ipad">
+              <div class="tablet">
+                <div class="screen">
+                  <img src="assets/ipad-connect.webp" srcset="assets/ipad-connect.webp 1210w, assets/ipad-connect@2x.webp 2420w" sizes="(max-width: 720px) 62vw, 500px" width="2420" height="1668" decoding="async" alt="The iPad app's Connect to your PC screen: fields for the PC's address and port, Connect, Scan QR code and Find PCs buttons, one PC found on the network with its address blurred, and a USB cable row.">
+                </div>
+              </div>
+              <p class="shot-label">iPad app</p>
             </div>
           </div>
-          <figcaption class="film-caption caption">
-            <p>Made from the real apps. The iPad shots are one real session recorded in Apple's Simulator, streaming the PC app's test pattern over loopback on a Mac, with the app's own measurements. The Windows app is shown as its UI tests render it.</p>
-            <p>Silent, 29 seconds.</p>
-          </figcaption>
+          <figcaption id="shots-caption" class="caption shots-caption">Screenshots of the two apps, before they connect. The address and pairing code on the PC are examples.</figcaption>
         </figure>
       </div>
     </section>
@@ -226,20 +221,43 @@
           <h2 id="how-title">Three steps, about ten minutes.</h2>
           <p>One installer on the PC, one app on the iPad. The <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md" target="_blank" rel="noopener">setup guide</a> has every button name.</p>
         </div>
-        <ol class="steps reveal">
-          <li class="step">
-            <h3>Install on your PC</h3>
-            <p>Run the installer from the <a href="download.html">download page</a>. It sets up the app and the driver that lets the iPad be a second screen.</p>
-          </li>
-          <li class="step">
-            <h3>Open the iPad app</h3>
-            <p>Get it through TestFlight. Tap your PC when it appears, scan the QR code the PC shows, or plug in a USB cable.</p>
-          </li>
-          <li class="step">
-            <h3>Pair once, then work</h3>
-            <p>Type the six-digit code the first time on Wi-Fi. Your screen is mirrored at first. Choose <strong>Second screen</strong> on the PC to extend it.</p>
-          </li>
-        </ol>
+        <div class="how reveal">
+          <figure class="clip">
+            <div class="tablet">
+              <div class="screen">
+                <video id="clip" controls muted playsinline loop preload="none"
+                       poster="assets/connect-clip-poster.jpg" width="1210" height="834"
+                       aria-describedby="clip-note">
+                  <source src="assets/connect-clip.mp4" type="video/mp4">
+                  <source src="assets/connect-clip.webm" type="video/webm">
+                  <a href="assets/connect-clip.mp4">Download the clip (MP4)</a>
+                </video>
+              </div>
+            </div>
+            <div class="clip-controls">
+              <button type="button" class="btn btn-secondary" id="clip-play" aria-pressed="false">
+                <svg class="ico-play" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4 2.5v11l9-5.5z"/></svg>
+                <svg class="ico-pause" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" hidden><path d="M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z"/></svg>
+                <span class="label">Play</span>
+              </button>
+            </div>
+            <figcaption id="clip-note" class="caption">A real connection, recorded from the iPad app. On the other end was a test copy of EternalMonitor that sends a striped test picture instead of a desktop, so the speed numbers in the corner don't reflect a real network.</figcaption>
+          </figure>
+          <ol class="steps">
+            <li class="step">
+              <h3>Install on your PC</h3>
+              <p>Run the installer from the <a href="download.html">download page</a>. It sets up the app and the driver that lets the iPad be a second screen.</p>
+            </li>
+            <li class="step">
+              <h3>Connect the iPad</h3>
+              <p>Get the iPad app through TestFlight. Tap your PC when it appears, scan the QR code it shows, or type its address. With a USB cable it connects by itself.</p>
+            </li>
+            <li class="step">
+              <h3>Type the code once</h3>
+              <p>The first time on Wi-Fi, type the six-digit code the PC shows. Then you're on: your screen is mirrored, and <strong>Second screen</strong> on the PC extends it.</p>
+            </li>
+          </ol>
+        </div>
       </div>
     </section>
 
