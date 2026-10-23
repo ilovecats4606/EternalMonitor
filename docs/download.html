@@ -38,6 +38,7 @@
       </a>
       <div class="nav-links">
         <a href="./#how" class="nav-link hide-sm">How it works</a>
+        <a href="updates.html" class="nav-link hide-sm">Updates</a>
         <a href="known-issues.html" class="nav-link hide-sm">Known issues</a>
         <a href="https://github.com/sidebandstudio/EternalMonitor" class="nav-link" target="_blank" rel="noopener">
           <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
@@ -52,9 +53,8 @@
   <main id="main">
     <section class="page-head">
       <div class="container">
-        <span class="kicker">Download</span>
-        <h1>Two apps. Install both from the same version.</h1>
-        <p class="lead">The Windows installer comes from GitHub Releases and the iPad app from a public TestFlight beta. New here? The <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md" target="_blank" rel="noopener">setup guide</a> walks through every step, USB included.</p>
+        <h1>Download</h1>
+        <p class="lead">Install both apps from the same version. Stuck? The <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md" target="_blank" rel="noopener">setup guide</a> has every step.</p>
       </div>
     </section>
 
@@ -65,11 +65,10 @@
           <h2>Windows</h2>
           <span class="badge badge-accent" id="release-version" data-win-version>v0.3.1</span>
         </div>
-        <p>One installer with the app and the virtual display driver for the second screen. Streams over Wi-Fi or USB with PC audio, pairing, keyboard control and Apple Pencil through Windows Ink.</p>
         <ul class="specs" aria-label="Requirements">
-          <li>Windows 10 version 1809 or later, or Windows 11, 64-bit</li>
-          <li>NVIDIA, AMD or Intel graphics. Without a card that can encode video, the picture uses the processor and may lag.</li>
-          <li>For USB: Apple's free <a href="https://apps.microsoft.com/detail/9np83lwlpz9k" target="_blank" rel="noopener">Apple Devices</a> app, open while you stream. It needs Windows 10 version 22H2 (build 19045) or Windows 11.</li>
+          <li>Windows 10 (1809 or later) or 11, 64-bit</li>
+          <li>NVIDIA, AMD or Intel graphics</li>
+          <li>For USB: Apple's free <a href="https://apps.microsoft.com/detail/9np83lwlpz9k" target="_blank" rel="noopener">Apple Devices</a> app, open while you stream (Windows 10 22H2 or 11)</li>
         </ul>
         <div class="dl-actions">
           <a href="https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.1/EternalMonitor-Setup.exe" id="download-btn" class="btn btn-primary btn-block btn-lg">
@@ -84,7 +83,7 @@
         </div>
         <div class="notice" style="margin-top:18px">
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 2.5 18 16.5H2z"/><path d="M10 8v3.5"/><circle cx="10" cy="14" r=".6" fill="currentColor"/></svg>
-          <span>Windows shows <strong>Windows protected your PC</strong> because the installer is not code-signed yet. For a file from this page, click <strong>More info</strong>, then <strong>Run anyway</strong>. To be sure, compare the file's SHA-256 with the one above.</span>
+          <span>Not code-signed yet: on <strong>Windows protected your PC</strong>, click <strong>More info</strong>, then <strong>Run anyway</strong>. The SHA-256 above lets you check the file.</span>
         </div>
       </article>
 
@@ -94,12 +93,10 @@
           <h2>iPad</h2>
           <span class="badge badge-accent">TestFlight beta</span>
         </div>
-        <p>Shows your PC's screen and sends touch, Apple Pencil pressure and tilt, and keyboard input back. Drawing mode ignores your palm on the canvas.</p>
         <ul class="specs" aria-label="Requirements">
           <li>An iPad with iPadOS 17 or later</li>
           <li>TestFlight, free from the App Store</li>
-          <li>Apple Pencil for pressure and tilt. The USB-C Pencil has no pressure sensor.</li>
-        </ul>
+                  </ul>
         <div class="dl-actions">
           <a href="https://testflight.apple.com/join/ppc9QfXc" id="testflight-link" class="btn btn-primary btn-block btn-lg" target="_blank" rel="noopener">Join the TestFlight beta</a>
           <p class="dl-meta">Matching build: <span data-ipad-version>v0.3.1, build 166</span>. Open to everyone.</p>
@@ -109,7 +106,6 @@
           <li>Open the invite link on the iPad, then tap <strong>Accept</strong> and <strong>Install</strong>.</li>
           <li>Open EternalMonitor. Tap your PC when it appears, scan its QR code, or plug in a cable.</li>
         </ol>
-        <p class="status-line"><span class="dot" aria-hidden="true"></span><span>Both apps tell you when the other one needs an update.</span></p>
       </article>
     </section>
 
@@ -117,10 +113,9 @@
       <div class="container">
         <div class="feedback reveal">
           <div class="feedback-intro">
-            <span class="kicker">Feedback</span>
             <h2 id="feedback-title">Tell us how it went :)</h2>
-            <p>We're a small studio. We read every message, and your feedback shapes what we fix next. A bug, a setup that took too long, a drawing app that didn't behave, or just what you're using your iPad for: all of it helps.</p>
-            <p>Sending opens your mail app with the message filled in and addressed to <a href="mailto:hello@sideband.studio">hello@sideband.studio</a>, so you can add screenshots or the host log before it goes.</p>
+            <p>We read every message, and your feedback shapes what we fix next. Bugs, ideas, or what you use your iPad for.</p>
+            <p>It opens your mail app, addressed to <a href="mailto:hello@sideband.studio">hello@sideband.studio</a>.</p>
             <ul class="ways">
               <li><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 4.5h14v9H8.5L5 16.5v-3H3z"/></svg><span>Prefer GitHub? <a href="https://github.com/sidebandstudio/EternalMonitor/issues/new/choose" target="_blank" rel="noopener">Open an issue</a>. TestFlight's own <strong>Send Beta Feedback</strong> reaches us too.</span></li>
               <li><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M10 2.3l2.3 4.8 5.3.7-3.9 3.7.9 5.2L10 14.2l-4.6 2.5.9-5.2L2.4 7.8l5.3-.7z"/></svg><span>Like it? <a href="https://github.com/sidebandstudio/EternalMonitor" target="_blank" rel="noopener">A star on GitHub</a> helps other people find it.</span></li>
@@ -190,7 +185,7 @@
       <div class="narrow">
         <div class="notice">
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10" cy="10" r="7.5"/><path d="M10 9v5M10 6.5v.2"/></svg>
-          <span id="diag-title">Both apps share diagnostics with support while they run: device details, errors and stream statistics, including PC names and network addresses. Screen content, audio and pairing codes are never sent. Turn it off in Settings. <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md#automatic-diagnostics" target="_blank" rel="noopener">What is sent, exactly.</a></span>
+          <span id="diag-title">Both apps send diagnostics while they run, including PC names and network addresses. Never your screen, audio or pairing codes. Turn it off in Settings. <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md#automatic-diagnostics" target="_blank" rel="noopener">Details</a>.</span>
         </div>
       </div>
     </section>
@@ -229,6 +224,7 @@ xcodegen generate
       <nav class="footer-links" aria-label="Footer">
         <a href="./">Home</a>
         <a href="known-issues.html">Known issues</a>
+        <a href="updates.html">Updates</a>
         <a href="https://github.com/sidebandstudio/EternalMonitor/blob/main/SETUP.md" target="_blank" rel="noopener">Setup guide</a>
         <a href="https://github.com/sidebandstudio/EternalMonitor" target="_blank" rel="noopener">GitHub</a>
         <a href="mailto:hello@sideband.studio">hello@sideband.studio</a>
