@@ -131,6 +131,13 @@ enum ConnectionProblem: Equatable {
         }
     }
 
+    /// Whether the card offers Report this problem. Not while a reconnect
+    /// is still running: that card is a status, not a failure yet.
+    var canReport: Bool {
+        if case .reconnecting = self { return false }
+        return true
+    }
+
     var actions: [Action] {
         switch self {
         case .localNetworkBlocked: return [.openSettings]

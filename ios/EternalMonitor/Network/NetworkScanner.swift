@@ -202,6 +202,9 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
             // discovery diagnostic — surface every resolved host so we
             // can tell whether mDNS is finding the right machine.
             print("[mDNS] Found: \(host.name) at \(host.address ?? "no IPv4 yet"):\(host.port)")
+            if let version = PCVersions.version(fromTXT: sender.txtRecordData()) {
+                PCVersions.record(version, name: host.name, address: host.address)
+            }
             merge(host)
             if host.address != nil {
                 resolvingServices.removeValue(forKey: key)
