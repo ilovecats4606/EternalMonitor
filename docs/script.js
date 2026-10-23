@@ -126,10 +126,25 @@
     var STARS_KEY = 'gh-stars-v2';
     var STARS_TTL = 6 * 3600000;
     var isCount = function (text) { return typeof text === 'string' && /^\d+(\.\d+)?[kKmM]?$/.test(text); };
+    var SVG = 'http://www.w3.org/2000/svg';
+    var goldStar = function () {
+      // Decorative: the count's own text already says "stars".
+      var svg = document.createElementNS(SVG, 'svg');
+      svg.setAttribute('class', 'count-star');
+      svg.setAttribute('viewBox', '0 0 16 16');
+      svg.setAttribute('aria-hidden', 'true');
+      svg.setAttribute('focusable', 'false');
+      var path = document.createElementNS(SVG, 'path');
+      path.setAttribute('d', 'M8 1.1l2.15 4.36 4.81.7-3.48 3.39.82 4.79L8 12.08l-4.3 2.26.82-4.79L1.04 6.16l4.81-.7z');
+      svg.appendChild(path);
+      return svg;
+    };
     var showStars = function (text) {
       // Screen readers hear "GitHub, 180 stars", not a bare number.
       starEls.forEach(function (el) {
-        el.textContent = text;
+        el.textContent = '';
+        el.appendChild(goldStar());
+        el.appendChild(document.createTextNode(text));
         var unit = document.createElement('span');
         unit.className = 'visually-hidden';
         unit.textContent = text === '1' ? ' star' : ' stars';
