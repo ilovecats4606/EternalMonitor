@@ -314,15 +314,16 @@ small { font-size: 0.875rem; }
   color: var(--faint);
 }
 
-/* Wide screens: headline left, the rest right, so the film starts high
-   enough to show most of the real apps in the first screen. */
-@media (min-width: 960px) {
+/* Wide screens: headline left, the rest right, so the screenshots start high
+   enough to fill most of the first screen. Only once both buttons fit side
+   by side; the headline lines up with the lead's first line. */
+@media (min-width: 1100px) {
   .hero-text {
     max-width: none;
     display: grid;
     grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
     column-gap: 64px;
-    align-items: end;
+    align-items: start;
     text-align: left;
   }
   .hero-text h1 { grid-row: 1 / span 3; margin: 0; }
