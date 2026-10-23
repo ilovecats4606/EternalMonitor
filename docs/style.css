@@ -258,6 +258,8 @@ small { font-size: 0.875rem; }
   color: var(--text);
 }
 .btn .count { color: inherit; min-width: 2em; text-align: left; }
+/* No count yet (offline, or GitHub rate-limited): no gap either. */
+.count:empty { display: none; }
 .nav .btn { margin-left: 6px; }
 
 @media (max-width: 720px) {

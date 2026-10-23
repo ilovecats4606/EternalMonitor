@@ -101,7 +101,14 @@
   if (starEls.length) {
     var showStars = function (n) {
       var text = n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1).replace(/\.0$/, '') + 'k' : String(n);
-      starEls.forEach(function (el) { el.textContent = text; });
+      // Screen readers hear "GitHub, 180 stars", not a bare number.
+      starEls.forEach(function (el) {
+        el.textContent = text;
+        var unit = document.createElement('span');
+        unit.className = 'visually-hidden';
+        unit.textContent = n === 1 ? ' star' : ' stars';
+        el.appendChild(unit);
+      });
     };
     var cached = null;
     try { cached = JSON.parse(sessionStorage.getItem('gh-stars') || 'null'); } catch (e) {}
