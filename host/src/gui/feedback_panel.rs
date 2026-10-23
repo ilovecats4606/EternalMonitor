@@ -259,7 +259,7 @@ impl AnalyzerApp {
                         Note::CopiedLogs => "Copied with logs. Paste it into an email to hello@sideband.studio",
                         Note::NoLogs => "Copied, but there were no logs to add. Paste it into an email to hello@sideband.studio",
                         Note::Opened => "Your email app should open with the message ready. If nothing opens, click Copy message instead.",
-                        Note::Shortened => "Your message is long, so the email has the start of it. The full text is on your clipboard to paste in.",
+                        Note::Shortened => "Your message is long, so the email has a shortened version. The full text is on your clipboard to paste in.",
                     };
                     ui.add_space(2.0);
                     widgets::paragraph(

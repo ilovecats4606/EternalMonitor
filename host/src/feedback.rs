@@ -11,8 +11,11 @@ pub const EMAIL: &str = "hello@sideband.studio";
 /// Mail apps cut longer `mailto:` links, so the whole link stays under this.
 pub const MAILTO_LIMIT: usize = 1800;
 
-/// Said at the end of an email whose message had to be shortened.
-pub const SHORTENED: &str = "[Message shortened. The full text is on your clipboard.]";
+/// Said at the end of an email that had to be shortened to fit the link.
+pub const SHORTENED: &str = "[Shortened to fit. The full text is on your clipboard.]";
+
+/// A detail longer than this many characters is cut in a `mailto:` link.
+pub const DETAIL_LIMIT: usize = 80;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Kind {
@@ -105,12 +108,18 @@ pub fn subject(kind: Kind) -> String {
 
 /// The email text: the message, then the details if included.
 pub fn body(kind: Kind, message: &str, details: Option<&Details>) -> String {
+    compose(
+        kind,
+        message,
+        &details.map(Details::lines).unwrap_or_default(),
+    )
+}
+
+fn compose(kind: Kind, message: &str, details: &[String]) -> String {
     let message = message.trim();
     let mut text = String::from(message);
     let mut footer = vec![format!("Kind: {}", kind.label())];
-    if let Some(details) = details {
-        footer.extend(details.lines());
-    }
+    footer.extend(details.iter().cloned());
     if !text.is_empty() {
         text.push_str("\n\n");
     }
@@ -133,9 +142,11 @@ pub fn with_logs(message: &str, logs: &str) -> String {
     format!("{message}\n\n-- EternalMonitor log --\n{}", logs.trim_end())
 }
 
-/// A `mailto:` link no longer than [`MAILTO_LIMIT`]. A long message is cut
-/// at a character boundary and the second value is true; the details always
-/// fit, since they are a few short lines.
+/// A `mailto:` link never longer than [`MAILTO_LIMIT`]. When the whole
+/// email doesn't fit, each detail is cut to [`DETAIL_LIMIT`] characters, the
+/// longest details are dropped while even the note alone wouldn't fit, and
+/// then the message is cut at a character boundary. The second value is true
+/// when anything was left out, so the caller copies the full text.
 pub fn mailto(kind: Kind, message: &str, details: Option<&Details>) -> (String, bool) {
     let link = |body: &str| {
         format!(
@@ -144,15 +155,24 @@ pub fn mailto(kind: Kind, message: &str, details: Option<&Details>) -> (String, 
             encode(body)
         )
     };
-    let whole = link(&body(kind, message, details));
+    let mut lines = details.map(Details::lines).unwrap_or_default();
+    let whole = link(&compose(kind, message, &lines));
     if whole.len() <= MAILTO_LIMIT {
         return (whole, false);
     }
     let message = message.trim();
     let marked = |kept: &str| format!("{}\n{SHORTENED}", kept.trim_end());
-    // Measured around one kept character, since body() trims a message
+    lines = lines.iter().map(|line| clip_detail(line)).collect();
+    // Measured around one kept character, since compose() trims a message
     // that is only the note.
-    let fixed = link(&body(kind, &marked("x"), details)).len() - 1;
+    let fixed = |lines: &[String]| link(&compose(kind, &marked("x"), lines)).len() - 1;
+    while fixed(&lines) > MAILTO_LIMIT {
+        let Some(longest) = (0..lines.len()).max_by_key(|&i| encode(&lines[i]).len()) else {
+            break;
+        };
+        lines.remove(longest);
+    }
+    let fixed = fixed(&lines);
     let mut budget = MAILTO_LIMIT.saturating_sub(fixed);
     let mut end = 0;
     for (i, c) in message.char_indices() {
@@ -163,7 +183,22 @@ pub fn mailto(kind: Kind, message: &str, details: Option<&Details>) -> (String, 
         budget -= cost;
         end = i + c.len_utf8();
     }
-    (link(&body(kind, &marked(&message[..end]), details)), true)
+    (link(&compose(kind, &marked(&message[..end]), &lines)), true)
+}
+
+/// "Graphics: <a very long name>" with the value cut to [`DETAIL_LIMIT`]
+/// characters, ending in an ellipsis.
+fn clip_detail(line: &str) -> String {
+    let (label, value) = line.split_once(": ").unwrap_or(("", line));
+    if value.chars().count() <= DETAIL_LIMIT {
+        return line.to_string();
+    }
+    let kept: String = value.chars().take(DETAIL_LIMIT - 1).collect();
+    if label.is_empty() {
+        format!("{kept}…")
+    } else {
+        format!("{label}: {kept}…")
+    }
 }
 
 /// Percent-encodes everything but RFC 3986's unreserved characters. Line
@@ -422,6 +457,63 @@ mod tests {
         assert!(full_text(Kind::Problem, &message, Some(&details())).contains(&message));
         let (url, shortened) = mailto(Kind::Problem, "short", Some(&details()));
         assert!(!shortened && !query(&url, "body").contains(SHORTENED));
+    }
+
+    #[test]
+    fn huge_details_never_push_the_link_past_the_limit() {
+        // The review's probe: long Unicode graphics card names made a 2,666
+        // character link while only the message was cut.
+        let card = "NVIDIA GeForce RTX 5080 グラフィックス・アクセラレーター 拡張版 🙂🙂🙂";
+        let mut huge = details();
+        huge.graphics = vec![card.repeat(3); 4];
+        huge.windows = Some("Windows 11 ".to_string() + &"Ünïcödé ".repeat(40));
+        assert!(
+            format!(
+                "mailto:x?body={}",
+                encode(&body(Kind::Problem, "", Some(&huge)))
+            )
+            .len()
+                > 2600
+        );
+        for message in ["", "It froze", &"word ".repeat(2000), &"画".repeat(3000)] {
+            for kind in [Kind::Problem, Kind::Idea, Kind::Praise] {
+                let (url, shortened) = mailto(kind, message, Some(&huge));
+                assert!(
+                    url.len() <= MAILTO_LIMIT,
+                    "{}: {}",
+                    message.len(),
+                    url.len()
+                );
+                assert!(shortened);
+                let text = query(&url, "body");
+                assert!(text.contains(SHORTENED), "{text}");
+                // The short lines survive; a cut detail ends in an ellipsis.
+                assert!(
+                    text.contains("Kind: ") && text.contains("App: EternalMonitor"),
+                    "{text}"
+                );
+                assert!(text.contains("Setup: Second screen, USB"), "{text}");
+                for line in text
+                    .lines()
+                    .filter(|l| l.starts_with("PC: ") || l.starts_with("Graphics: "))
+                {
+                    let value = line.split_once(": ").unwrap().1;
+                    assert!(
+                        value.chars().count() <= DETAIL_LIMIT && value.ends_with('…'),
+                        "{line}"
+                    );
+                }
+            }
+        }
+        // Each detail is cut before any is dropped: one long card name stays.
+        let mut one = details();
+        one.graphics = vec![card.repeat(8)];
+        let (url, shortened) = mailto(Kind::Idea, "Hi", Some(&one));
+        assert!(shortened && url.len() <= MAILTO_LIMIT);
+        let text = query(&url, "body");
+        assert!(text.starts_with("Hi\r\n"), "{text}");
+        assert!(text.contains("Graphics: NVIDIA GeForce RTX 5080"), "{text}");
+        assert_eq!(clip_detail("PC: short"), "PC: short");
     }
 
     #[test]
