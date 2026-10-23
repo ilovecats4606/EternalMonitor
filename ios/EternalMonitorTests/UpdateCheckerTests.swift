@@ -101,6 +101,25 @@ final class UpdateCheckerTests: XCTestCase {
         XCTAssertEqual(later?.note, "Fixes Pencil pressure.")
     }
 
+    func testThisAppTellsThePCItChecksForUpdates() {
+        // 0.3.1 sent only bits 0 to 2, so the PC reads a missing bit 4 as an older app.
+        XCTAssertEqual(Hello2.featureChecksUpdates, 1 << 4)
+        for bit in [Hello2.featureWantsInput, Hello2.featureWantsAudio, Hello2.featureSupportsNack] {
+            XCTAssertEqual(bit & Hello2.featureChecksUpdates, 0)
+        }
+        for input in [false, true] {
+            for audio in [false, true] {
+                for usb in [false, true] {
+                    let caps = ConnectionManager.featureCaps(wantsInput: input, wantsAudio: audio, isUSB: usb)
+                    XCTAssertNotEqual(caps & Hello2.featureChecksUpdates, 0)
+                    XCTAssertEqual(caps & Hello2.featureWantsInput != 0, input)
+                    XCTAssertEqual(caps & Hello2.featureWantsAudio != 0, audio)
+                    XCTAssertEqual(caps & Hello2.featureSupportsNack != 0, !usb)
+                }
+            }
+        }
+    }
+
     func testVersionCompare() {
         XCTAssertLessThan(AppVersion("0.3.9")!, AppVersion("0.3.10")!)
         XCTAssertLessThan(AppVersion("0.9.0")!, AppVersion("1.0.0")!)

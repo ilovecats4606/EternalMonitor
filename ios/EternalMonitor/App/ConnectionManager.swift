@@ -85,6 +85,13 @@ final class ConnectionManager: ObservableObject {
     /// Set with `connectionError` when the PC and iPad versions differ.
     @Published var versionMismatch: VersionMismatch?
     @Published var pairingPrompt: PairingSheetModel?
+
+    /// HELLO2 feature bits. Every build says it checks for its own updates,
+    /// so the PC tells only older iPad apps to update.
+    nonisolated static func featureCaps(wantsInput: Bool, wantsAudio: Bool, isUSB: Bool) -> UInt16 {
+        (wantsInput ? Hello2.featureWantsInput : 0) | (wantsAudio ? Hello2.featureWantsAudio : 0)
+            | (isUSB ? 0 : Hello2.featureSupportsNack) | Hello2.featureChecksUpdates
+    }
     private var awaitingPairing = false
     private var explicitPairingToken: Data?
     private let pairingStore = PairingStore.shared
@@ -622,8 +629,7 @@ final class ConnectionManager: ObservableObject {
             screenPtH: UInt16(clamping: Int(screen.bounds.height)),
             refreshHz: UInt8(clamping: screen.maximumFramesPerSecond),
             decoderCaps: Hello2.capDecodeH264 | Hello2.capDecodeHEVC,
-            featureCaps: (wantsInput ? Hello2.featureWantsInput : 0)
-                | (wantsAudio ? Hello2.featureWantsAudio : 0) | (isUSB ? 0 : Hello2.featureSupportsNack),
+            featureCaps: Self.featureCaps(wantsInput: wantsInput, wantsAudio: wantsAudio, isUSB: isUSB),
             deviceId: DeviceIdentity.load(),
             preferredFPS: drawing.preferredFPS(UserDefaults.standard.frameRatePreference(), maximum: screen.maximumFramesPerSecond),
             authToken: pairingToken

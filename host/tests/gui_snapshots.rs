@@ -13,7 +13,9 @@ use eternal_host::settings::SettingsFile;
 use eternal_host::stats::{PipelineStats, PIPELINE_STATS};
 use eternal_host::transport::link::PeerId;
 use eternal_host::transport::session::ConfigSource;
-use eternal_wire::v2::control::{ControlMessage, Hello2, ReceiverReport, StreamConfig};
+use eternal_wire::v2::control::{
+    ControlMessage, Hello2, ReceiverReport, StreamConfig, FEATURE_CHECKS_UPDATES,
+};
 
 struct Fixture;
 impl ConfigSource for Fixture {
@@ -96,6 +98,23 @@ fn connect_ipad(shared: &SharedControl) {
 }
 
 fn connect_named(shared: &SharedControl, device_name: &str, frags_lost: u32, frags_repaired: u32) {
+    // A 0.3.2 or later iPad app.
+    connect_app(
+        shared,
+        device_name,
+        frags_lost,
+        frags_repaired,
+        3 | FEATURE_CHECKS_UPDATES,
+    );
+}
+
+fn connect_app(
+    shared: &SharedControl,
+    device_name: &str,
+    frags_lost: u32,
+    frags_repaired: u32,
+    feature_caps: u16,
+) {
     let peer = PeerId::usb(7);
     let now = Instant::now();
     let mut session = shared.session.lock();
@@ -105,10 +124,11 @@ fn connect_named(shared: &SharedControl, device_name: &str, frags_lost: u32, fra
         ControlMessage::Hello2(Hello2 {
             proto_min: 2,
             proto_max: 2,
-            client_nonce: 12,
+            // Each app connects afresh rather than retransmitting.
+            client_nonce: 12 + u32::from(feature_caps),
             listen_port: 9877,
             decoder_caps: 3,
-            feature_caps: 3,
+            feature_caps,
             screen_px_w: 2420,
             screen_px_h: 1668,
             screen_pt_w: 1210,
@@ -420,6 +440,20 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     harness.run_steps(4);
     harness.get_by_label("Poor");
 
+    // This iPad app works but can't tell its user about updates. A 0.3.2 or
+    // later app, as above, gets no such notice.
+    assert!(harness
+        .query_by_label("Your iPad app is out of date")
+        .is_none());
+    connect_app(&shared, "Test iPad Pro", 10, 20, 3);
+    harness.run_steps(4);
+    harness.get_by_label("Your iPad app is out of date");
+    harness.get_by_label("Update it in TestFlight. It's highly recommended.");
+    harness.get_by_label("OK").click();
+    harness.run_steps(4);
+    assert!(harness
+        .query_by_label("Your iPad app is out of date")
+        .is_none());
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -544,7 +578,8 @@ fn review_screens() {
     let mut small = harness(&shared, egui::vec2(820.0, 560.0), 1.5);
     save(&mut small, "minimum-size");
 
-    // The update popup with a note from latest.json.
+    // The update popup with a note from latest.json, over a stream from an
+    // iPad app older than 0.3.2; then that iPad's notice.
     let state = dir.join("EternalMonitor/update-state.json");
     let mut cached: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
@@ -556,8 +591,13 @@ fn review_screens() {
         ..Default::default()
     }
     .save();
+    connect_app(&shared, "Test iPad Pro", 10, 20, 3);
     let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
     save(&mut h, "update-popup-note");
+    h.get_by_role_and_label(Role::Dialog, "Update ready")
+        .get_by_label("Later")
+        .click();
+    save(&mut h, "ipad-out-of-date");
     std::fs::remove_dir_all(dir).unwrap();
 
     // Website product shot: realistic names and a healthy link, default window size.

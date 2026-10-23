@@ -281,6 +281,8 @@ pub struct AnalyzerApp {
     updates: crate::updates::Updater,
     /// The update popup is on screen; it stays until a button is chosen.
     update_popup_open: bool,
+    /// "Your iPad app is out of date" was dismissed for this run.
+    ipad_notice_dismissed: bool,
     settings_packet_size: u32,
     /// Last settings error worth showing (the autostart registry write or a
     /// pairing reset).
@@ -414,6 +416,7 @@ impl AnalyzerApp {
             settings_check_updates: persisted.check_for_updates,
             updates,
             update_popup_open: false,
+            ipad_notice_dismissed: false,
             settings_packet_size: control.shared.max_dgram.load(Ordering::SeqCst),
             control,
             page: Page::Stream,

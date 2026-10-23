@@ -1084,6 +1084,20 @@ impl State {
     }
 }
 
+// ── An older iPad app ───────────────────────────────────────────────────────
+
+/// A connected iPad whose app is older than 0.3.2: it streams, but it can't
+/// tell its user about updates, so the PC does.
+pub fn ipad_app_out_of_date(feature_caps: u16) -> bool {
+    feature_caps & eternal_wire::v2::control::FEATURE_CHECKS_UPDATES == 0
+}
+
+/// Title and body of the PC's notice for [`ipad_app_out_of_date`].
+pub const IPAD_OUT_OF_DATE: (&str, &str) = (
+    "Your iPad app is out of date",
+    "Update it in TestFlight. It's highly recommended.",
+);
+
 // ── Version mismatch ────────────────────────────────────────────────────────
 
 /// Which side must update when an iPad cannot connect.

@@ -1,6 +1,6 @@
 //! The update banner above every page, the update popup, the update rows in
-//! Settings, and the notice shown when an iPad cannot connect because of a
-//! version difference.
+//! Settings, and the notices shown when an iPad cannot connect because of a
+//! version difference or runs an older app.
 
 use eframe::egui::{self, vec2, Color32, Frame, Margin, Rect, Sense, Stroke, Ui};
 
@@ -8,7 +8,7 @@ use super::icons::{self, Icon};
 use super::theme::*;
 use super::widgets::{self, Tone, GAP};
 use super::{update_toast, AnalyzerApp, ClientSnapshot, Page, StatsSnapshot, StreamState};
-use crate::updates::{CheckStatus, Notice, OlderSide, WEBSITE_DOWNLOAD};
+use crate::updates::{CheckStatus, Notice, OlderSide, IPAD_OUT_OF_DATE, WEBSITE_DOWNLOAD};
 
 /// The popup's last line: what Update now does from here.
 pub(super) fn popup_hint(installs_in_place: bool, streaming: bool) -> &'static str {
@@ -242,6 +242,26 @@ impl AnalyzerApp {
                 self.update_action(ctx, action);
             }
         }
+    }
+
+    /// Stream page: the connected iPad's app is older than 0.3.2. It works,
+    /// but only the PC can say an update is waiting. Hidden for the rest of
+    /// this run once dismissed.
+    pub(super) fn ipad_update_notice(&mut self, ui: &mut Ui, client: &ClientSnapshot) {
+        let old_app = client
+            .info
+            .as_ref()
+            .is_some_and(|info| crate::updates::ipad_app_out_of_date(info.feature_caps));
+        if !old_app || self.ipad_notice_dismissed {
+            return;
+        }
+        let (title, body) = IPAD_OUT_OF_DATE;
+        widgets::banner(ui, ACCENT, Icon::Download, title, body, 60.0, |ui| {
+            if widgets::button(ui, Tone::Secondary, None, "OK").clicked() {
+                self.ipad_notice_dismissed = true;
+            }
+        });
+        ui.add_space(GAP - 10.0);
     }
 
     fn update_action(&mut self, ctx: &egui::Context, action: Action) {

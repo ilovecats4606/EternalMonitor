@@ -713,6 +713,26 @@ fn popup_follows_the_banner_and_the_manifest_wording() {
 }
 
 #[test]
+fn an_ipad_app_older_than_0_3_2_is_told_to_update() {
+    use eternal_wire::v2::control::{
+        FEATURE_CHECKS_UPDATES, FEATURE_SUPPORTS_NACK, FEATURE_WANTS_AUDIO, FEATURE_WANTS_INPUT,
+    };
+    // Every bit an 0.3.1 iPad sends, and none.
+    let old = FEATURE_WANTS_INPUT | FEATURE_WANTS_AUDIO | FEATURE_SUPPORTS_NACK;
+    assert!(ipad_app_out_of_date(old));
+    assert!(ipad_app_out_of_date(0));
+    assert!(!ipad_app_out_of_date(old | FEATURE_CHECKS_UPDATES));
+    assert!(!ipad_app_out_of_date(FEATURE_CHECKS_UPDATES));
+    assert_eq!(
+        IPAD_OUT_OF_DATE,
+        (
+            "Your iPad app is out of date",
+            "Update it in TestFlight. It's highly recommended."
+        )
+    );
+}
+
+#[test]
 fn update_waits_for_the_stream_to_stop() {
     let mut s = state(Saved::default());
     s.finish_check(1000, false, Ok(release("0.3.2")));
