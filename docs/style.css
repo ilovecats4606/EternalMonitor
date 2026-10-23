@@ -119,13 +119,13 @@ p a:hover, li a:hover, dd a:hover, .prose a:hover, .notice a:hover, .lead a:hove
 }
 
 h1, h2, h3, h4 {
-  font-weight: 600;
+  font-weight: 500;
   letter-spacing: -0.025em;
   line-height: 1.12;
   text-wrap: balance;
 }
-h1 { font-size: clamp(2.5rem, 1.2rem + 5.4vw, 4.6rem); letter-spacing: -0.04em; line-height: 1.02; }
-h2 { font-size: clamp(1.75rem, 1rem + 2.8vw, 2.5rem); letter-spacing: -0.03em; }
+h1 { font-size: clamp(2.75rem, 1rem + 4.6vw, 5rem); letter-spacing: -0.045em; line-height: 1; }
+h2 { font-size: clamp(2.125rem, 1rem + 3vw, 3.5rem); letter-spacing: -0.04em; line-height: 1.04; }
 h3 { font-size: 1.25rem; letter-spacing: -0.015em; line-height: 1.3; }
 h4 { font-size: 1.0625rem; letter-spacing: -0.01em; }
 p { text-wrap: pretty; }
@@ -290,12 +290,12 @@ small { font-size: 0.875rem; }
 /* --- Hero ------------------------------------------------------------------ */
 
 .hero { padding: clamp(40px, 5vw, 64px) 0 0; }
-.hero-text { max-width: 860px; margin-inline: auto; text-align: center; }
-.hero-text h1 { margin-inline: auto; font-size: clamp(2.5rem, 1rem + 3.6vw, 3.6rem); }
+.hero-text { max-width: 980px; margin-inline: auto; text-align: center; }
+.hero-text h1 { margin-inline: auto; }
 .hero-text .lead {
   max-width: 660px;
-  margin: 18px auto 0;
-  font-size: clamp(1.0625rem, 0.95rem + 0.5vw, 1.25rem);
+  margin: 20px auto 0;
+  font-size: clamp(1.125rem, 1rem + 0.5vw, 1.375rem);
   line-height: 1.55;
   color: var(--muted);
 }
@@ -316,40 +316,60 @@ small { font-size: 0.875rem; }
   color: var(--faint);
 }
 
-/* Wide screens: headline left, the rest right, so the screenshots start high
-   enough to fill most of the first screen. Only once both buttons fit side
-   by side; the headline lines up with the lead's first line. */
-@media (min-width: 1100px) {
-  .hero-text {
-    max-width: none;
-    display: grid;
-    grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
-    column-gap: 64px;
-    align-items: start;
-    text-align: left;
-  }
-  .hero-text h1 { grid-row: 1 / span 3; margin: 0; }
-  .hero-text .lead { max-width: none; margin: 0; font-size: 1.125rem; }
-  .hero-actions, .hero-meta { justify-content: flex-start; }
-  .hero-actions { margin-top: 22px; }
+/* --- Hero stage --------------------------------------------------------------
+   The Windows window, a USB or Wi-Fi link, and the iPad showing the PC. The
+   iPad slides in once and the link draws across; with reduced motion (or no
+   animation support) everything simply sits in place. */
+
+.stage {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) minmax(150px, 0.3fr) minmax(0, 1fr);
+  align-items: center;
+  margin-top: clamp(36px, 4.5vw, 64px);
 }
-
-/* --- Hero screenshots -------------------------------------------------------
-   The Windows window and the iPad overlap. Percentage margins follow the
-   stage's width, so the iPad's top sits at a fixed share of the width. */
-
-.shots { margin-top: clamp(32px, 3.5vw, 44px); }
-.shots-stage { display: flow-root; }
-.shot { position: relative; }
-.shot-pc { width: 64%; z-index: 1; }
-/* 16% of the width below the PC window's top: the PC block is the 34px
-   title bar + 64% / 2.08 image. */
-.shot-ipad { width: 44%; margin: calc(-14.77% - 34px) 0 0 auto; z-index: 2; }
+.stage-link { position: relative; height: 44px; display: grid; place-items: center; }
+.stage-line {
+  position: absolute;
+  left: -8px;
+  right: -8px;
+  top: calc(50% - 1px);
+  height: 2px;
+  background: linear-gradient(90deg, rgba(var(--accent-rgb), 0.15), var(--accent) 50%, rgba(var(--accent-rgb), 0.15));
+  transform-origin: left center;
+}
+.stage-chip {
+  position: relative;
+  padding: 5px 11px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--raised);
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+.stage-ipad { position: relative; }
+@media (prefers-reduced-motion: no-preference) {
+  .stage-ipad { animation: stage-slide 1s var(--ease-out) 0.2s both; }
+  .stage-line { animation: stage-draw 0.6s ease-out 0.9s both; }
+  .stage-chip { animation: stage-fade 0.5s ease-out 1.3s both; }
+}
+@keyframes stage-slide { from { opacity: 0; transform: translateX(18%); } to { opacity: 1; transform: none; } }
+@keyframes stage-draw { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+@keyframes stage-fade { from { opacity: 0; } to { opacity: 1; } }
 @media (max-width: 720px) {
-  .shot-pc { width: 88%; }
-  /* PC block: 34px + 88% / 2.08; the iPad starts 30% of the width down. */
-  .shot-ipad { width: 62%; margin-top: calc(-12.3% - 34px); }
+  .stage { grid-template-columns: 1fr; justify-items: center; }
+  .stage-pc { width: 100%; }
+  .stage-link { height: 52px; width: 100%; }
+  .stage-line { left: calc(50% - 1px); right: auto; top: 0; bottom: 0; width: 2px; height: auto; transform-origin: center top;
+    background: linear-gradient(180deg, rgba(var(--accent-rgb), 0.15), var(--accent) 50%, rgba(var(--accent-rgb), 0.15)); }
+  .stage-ipad { width: 78%; }
+  @media (prefers-reduced-motion: no-preference) {
+    .stage-ipad { animation-name: stage-rise; }
+    .stage-line { animation-name: stage-draw-down; }
+  }
 }
+@keyframes stage-rise { from { opacity: 0; transform: translateY(12%); } to { opacity: 1; transform: none; } }
+@keyframes stage-draw-down { from { transform: scaleY(0); } to { transform: scaleY(1); } }
 
 /* --- How it works: the connection clip beside the steps --------------------- */
 
