@@ -563,6 +563,34 @@ mod tests {
     }
 
     #[test]
+    fn a_holder_that_never_lets_go_delays_a_disable_by_at_most_the_bound() {
+        let path = owner_file("hung-holder");
+        let lock = owner_file("hung-holder-lock");
+        // Another process stuck in its own driver change.
+        let _hung = super::super::lock::try_lock(&lock).unwrap();
+        let started = std::time::Instant::now();
+        let mut ran = false;
+        assert!(change_at(
+            &path,
+            &lock,
+            false,
+            || {},
+            |_| {
+                ran = true;
+                true
+            }
+        ));
+        let waited = started.elapsed();
+        assert!(ran, "the Disable never ran");
+        assert!(
+            waited >= LOCK_WAIT && waited < LOCK_WAIT + std::time::Duration::from_secs(2),
+            "waited {waited:?}"
+        );
+        drop(_hung);
+        fs::remove_file(lock).unwrap();
+    }
+
+    #[test]
     fn a_hosts_own_turn_off_leaves_another_hosts_record() {
         let path = owner_file("startup");
         let lock = owner_file("startup-lock");
