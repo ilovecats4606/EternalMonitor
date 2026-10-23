@@ -133,7 +133,9 @@ struct UpdateBannerModel: Equatable {
 }
 
 /// The Connect screen's popup: once per build, then at most every three days
-/// after Later or Open TestFlight. The banner stays either way.
+/// after Later or Open TestFlight. The banner stays either way. A close time
+/// ahead of the clock (it was set back) counts as now, so the next popup is
+/// three days from this clock, neither at once nor never.
 struct UpdatePopupModel: Equatable {
     static let closeInterval: TimeInterval = 3 * 24 * 60 * 60
 
@@ -154,7 +156,7 @@ struct UpdatePopupModel: Equatable {
     ) -> UpdatePopupModel? {
         guard automatic, let available, installed.isOlder(than: available) else { return nil }
         if let closed, closed.build == available.build,
-           now.timeIntervalSince(closed.at) < closeInterval, closed.at <= now {
+           now.timeIntervalSince(min(closed.at, now)) < closeInterval {
             return nil
         }
         return UpdatePopupModel(
@@ -212,7 +214,8 @@ final class UpdateChecker: ObservableObject {
     private let source: Source
     private var checking = false
 
-    init(defaults: UserDefaults = .standard, source: Source = UpdateChecker.defaultSource, installed: InstalledApp = .current) {
+    init(defaults: UserDefaults = .standard, source: Source = UpdateChecker.defaultSource, installed: InstalledApp = .current,
+         now: Date = Date()) {
         self.defaults = defaults
         self.source = source
         self.installed = installed
@@ -235,6 +238,15 @@ final class UpdateChecker: ObservableObject {
         if popupBuild > 0, let at = defaults.object(forKey: Key.popupAt) as? Date {
             popupClosed = (popupBuild, at)
         }
+        settlePopupClock(now: now)
+    }
+
+    /// Rewrites a popup close time from a clock that was ahead as now, so it
+    /// can't hold the popup back for longer than three days.
+    private func settlePopupClock(now: Date) {
+        guard let closed = popupClosed, closed.at > now else { return }
+        popupClosed = (closed.build, now)
+        defaults.set(now, forKey: Key.popupAt)
     }
 
     nonisolated static var defaultSource: Source {
@@ -284,6 +296,7 @@ final class UpdateChecker: ObservableObject {
     }
 
     func checkIfDue(now: Date = Date()) {
+        settlePopupClock(now: now)
         guard automatic, !checking else { return }
         switch source {
         case .disabled:

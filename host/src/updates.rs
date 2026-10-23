@@ -915,14 +915,21 @@ impl State {
 
     /// Once per version while the banner offers it, then at most every
     /// three days after it is closed. Never when automatic checks are off.
-    fn popup(&self, now: u64) -> Option<Popup> {
+    fn popup(&mut self, now: u64) -> Option<Popup> {
+        // Closed "in the future" means the clock was set back: count it as
+        // closed now, so the next reminder is three days from this clock,
+        // neither at once nor never.
+        if let Some((_, at)) = self.saved.popup.as_mut() {
+            *at = (*at).min(now);
+        }
         if !self.auto || !matches!(self.notice(now), Some(Notice::Available(_))) {
             return None;
         }
         let release = self.available()?;
-        let closed = self.saved.popup.as_ref().is_some_and(|(version, at)| {
-            *version == release.version && *at <= now && now - at < POPUP_INTERVAL
-        });
+        let closed =
+            self.saved.popup.as_ref().is_some_and(|(version, at)| {
+                *version == release.version && now - at < POPUP_INTERVAL
+            });
         (!closed).then(|| Popup {
             version: release.version.clone(),
             recommended: release.recommended,
@@ -1330,7 +1337,7 @@ impl Updater {
     }
 
     pub fn popup(&self) -> Option<Popup> {
-        self.state.lock().popup(now_secs())
+        self.with(|state| state.popup(now_secs()))
     }
 
     /// Later, Update now or closing the popup.

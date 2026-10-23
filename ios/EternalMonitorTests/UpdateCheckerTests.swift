@@ -67,7 +67,10 @@ final class UpdateCheckerTests: XCTestCase {
         let closed = (build: 170, at: now)
         XCTAssertNil(make(available, closed, now.addingTimeInterval(3 * day - 1)))
         XCTAssertNotNil(make(available, closed, now.addingTimeInterval(3 * day)))
-        XCTAssertNotNil(make(available, closed, now.addingTimeInterval(-60)), "a clock set back doesn't hide it for good")
+        // A clock set back counts as closed now: not at once, and back three days from this clock.
+        let rolledBack = now.addingTimeInterval(-1)
+        XCTAssertNil(make(available, closed, rolledBack), "a clock set back must not show it at once")
+        XCTAssertNil(make(available, closed, now.addingTimeInterval(-60)))
         let next = UpdateManifest.IPad(version: "0.3.2", build: 171, testflight: nil)
         XCTAssertNotNil(make(next, closed, now), "a newer build shows at once")
         XCTAssertNil(make(nil, nil, now))
@@ -99,6 +102,34 @@ final class UpdateCheckerTests: XCTestCase {
         let later = relaunched.popup(now: now.addingTimeInterval(UpdatePopupModel.closeInterval))
         XCTAssertEqual(later?.message, "An update is available.")
         XCTAssertEqual(later?.note, "Fixes Pencil pressure.")
+    }
+
+    @MainActor
+    func testAClockSetBackOrFarAheadWaitsThreeDaysFromNow() throws {
+        let suite = "UpdateCheckerTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let installed = InstalledApp(version: "0.3.1", build: 166)
+        let data = Data(#"{"schema":1,"ipad":{"version":"0.3.2","build":170}}"#.utf8)
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let checker = UpdateChecker(defaults: defaults, source: .injected(data), installed: installed, now: now)
+        checker.checkIfDue(now: now)
+
+        // Closed, then the clock goes back one second.
+        checker.closePopup(now: now)
+        let back = now.addingTimeInterval(-1)
+        checker.checkIfDue(now: back)
+        XCTAssertNil(checker.popup(now: back))
+        XCTAssertNil(checker.popup(now: back.addingTimeInterval(UpdatePopupModel.closeInterval - 1)))
+        XCTAssertNotNil(checker.popup(now: back.addingTimeInterval(UpdatePopupModel.closeInterval)))
+
+        // Closed while the clock was ten years ahead, then corrected: three days at most.
+        checker.closePopup(now: now.addingTimeInterval(10 * 365 * 86_400))
+        let relaunched = UpdateChecker(defaults: defaults, source: .disabled, installed: installed, now: now)
+        XCTAssertEqual(relaunched.popupClosed?.at, now, "rewritten as closed now")
+        XCTAssertEqual(defaults.object(forKey: "updatePopupClosedAt") as? Date, now)
+        XCTAssertNil(relaunched.popup(now: now.addingTimeInterval(UpdatePopupModel.closeInterval - 1)))
+        XCTAssertNotNil(relaunched.popup(now: now.addingTimeInterval(UpdatePopupModel.closeInterval)))
     }
 
     func testThisAppTellsThePCItChecksForUpdates() {

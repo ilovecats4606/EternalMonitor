@@ -669,14 +669,34 @@ fn popup_shows_once_per_version_then_at_most_every_three_days() {
     restarted.popup_closed(2000 + 3 * DAY);
     assert_eq!(restarted.popup(2000 + 5 * DAY), None);
     assert!(restarted.popup(2000 + 6 * DAY).is_some());
-    // A clock set back doesn't hide it for good.
-    assert!(restarted.popup(1500).is_some());
     // A newer version shows at once.
     restarted.finish_check(2000 + 6 * DAY, false, Ok(release("0.3.3")));
     assert_eq!(
         restarted.popup(2000 + 6 * DAY).map(|p| p.version),
         Some("0.3.3".into())
     );
+}
+
+/// A close time ahead of the clock counts as closed now: the next popup is
+/// three days from the current clock, never at once and never "not for years".
+#[test]
+fn a_clock_set_back_or_far_ahead_waits_three_days_from_now() {
+    let mut s = state(Saved::default());
+    s.finish_check(1000, false, Ok(release("0.3.2")));
+    s.popup_closed(10 * DAY);
+    // The clock goes back one second.
+    assert_eq!(s.popup(10 * DAY - 1), None);
+    assert_eq!(s.saved.popup, Some(("0.3.2".into(), 10 * DAY - 1)));
+    assert_eq!(s.popup(13 * DAY - 2), None);
+    assert!(s.popup(13 * DAY - 1).is_some());
+    // Closed while the clock was years ahead, then corrected.
+    s.saved.popup = Some(("0.3.2".into(), u64::MAX / 2));
+    assert_eq!(s.popup(20 * DAY), None);
+    // Saved that way, so a restart keeps the same three days.
+    let mut restarted = state(s.saved.clone());
+    assert_eq!(restarted.saved.popup, Some(("0.3.2".into(), 20 * DAY)));
+    assert_eq!(restarted.popup(23 * DAY - 1), None);
+    assert!(restarted.popup(23 * DAY).is_some());
 }
 
 #[test]
