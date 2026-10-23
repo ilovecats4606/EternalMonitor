@@ -263,9 +263,11 @@ fn github_release_must_publish_the_same_sha256_and_installer() {
 /// this updater must still find the hash.
 #[test]
 fn the_published_release_body_carries_the_installer_hash() {
-    let template = include_str!("../../../.github/release-body.md");
+    // A Windows checkout (core.autocrlf) has CRLF line endings. release.yml
+    // turns them back into LF before publishing; compare the same text here.
+    let template = include_str!("../../../.github/release-body.md").replace("\r\n", "\n");
     assert_eq!(template.matches("{{SHA256}}").count(), 1);
-    // Get-FileHash prints uppercase hex, and a Windows checkout may use CRLF.
+    // Get-FileHash prints uppercase hex. The parser must also take CRLF.
     let body = template.replace("{{SHA256}}", &SHA.to_uppercase());
     let release = release("0.3.2");
     for body in [body.clone(), body.replace('\n', "\r\n")] {
