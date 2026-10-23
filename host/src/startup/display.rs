@@ -24,14 +24,35 @@ fn paths() -> Option<(PathBuf, PathBuf)> {
     Some((directory.join(OWNER_FILE), directory.join(LOCK_FILE)))
 }
 
+/// Longest a driver change waits for another process's change to finish.
+/// A holder stuck in a hung driver task must not hold this host's start or
+/// quit with it.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Wait for the driver lock, calling `waiting` meanwhile. A lock that cannot
-/// be opened does not stop the driver change, as a record that cannot be
-/// written does not.
-fn hold(lock: &Path, mut waiting: impl FnMut()) -> Option<super::lock::Locked> {
+/// be opened, or is still held after [`LOCK_WAIT`], does not stop the driver
+/// change, as a record that cannot be written does not.
+fn hold(lock: &Path, waiting: impl FnMut()) -> Option<super::lock::Locked> {
+    hold_for(lock, LOCK_WAIT, waiting)
+}
+
+fn hold_for(
+    lock: &Path,
+    wait: std::time::Duration,
+    mut waiting: impl FnMut(),
+) -> Option<super::lock::Locked> {
+    let deadline = std::time::Instant::now() + wait;
     loop {
         match super::lock::try_lock(lock) {
             Ok(locked) => return Some(locked),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        waited_ms = wait.as_millis() as u64,
+                        "Another process held the virtual display driver lock; changing the driver without it"
+                    );
+                    return None;
+                }
                 waiting();
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
@@ -516,6 +537,28 @@ mod tests {
         assert!(!cleans_up(Some(0), false));
         assert!(cleans_up(Some(1), false));
         fs::remove_dir_all(crash).unwrap();
+        fs::remove_file(lock).unwrap();
+    }
+
+    #[test]
+    fn a_driver_lock_held_too_long_does_not_stop_the_change() {
+        let lock = owner_file("held-lock");
+        let held = super::super::lock::try_lock(&lock).unwrap();
+        let started = std::time::Instant::now();
+        let mut waits = 0;
+        let got = hold_for(&lock, std::time::Duration::from_millis(300), || waits += 1);
+        let waited = started.elapsed();
+        assert!(got.is_none(), "took a lock another holder has");
+        assert!(waits > 0, "never reported the wait");
+        assert!(
+            waited >= std::time::Duration::from_millis(300)
+                && waited < std::time::Duration::from_secs(3),
+            "waited {waited:?}"
+        );
+        // Once the holder lets go, the lock is taken at once.
+        drop(held);
+        assert!(hold_for(&lock, std::time::Duration::from_millis(300), || {}).is_some());
+        assert_eq!(LOCK_WAIT, std::time::Duration::from_secs(5));
         fs::remove_file(lock).unwrap();
     }
 
