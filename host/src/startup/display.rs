@@ -2,7 +2,9 @@
 //! whole machine, so the failure reporter of a host that ended abnormally
 //! turns it off only when that host owned it and no other EternalMonitor host
 //! of this install is running, which may be using it. Hosts only write the
-//! record; a driver change never waits for it.
+//! record; a driver change never waits for it. Every driver change holds the
+//! driver lock, shared by every process of the user, so a reporter's turn-off
+//! and a new host's turn-on never overlap.
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
@@ -12,30 +14,60 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 const OWNER_FILE: &str = "virtual-display-owner";
+const LOCK_FILE: &str = "virtual-display.lock";
 /// Why the reporter leaves the display alone after most ends: no host had it on.
 pub(crate) const NO_OWNER: &str = "no host turned it on";
 
-fn owner_path() -> Option<PathBuf> {
-    Some(crate::settings::app_data_dir()?.join(OWNER_FILE))
+/// The owner record and the driver lock.
+fn paths() -> Option<(PathBuf, PathBuf)> {
+    let directory = crate::settings::app_data_dir()?;
+    Some((directory.join(OWNER_FILE), directory.join(LOCK_FILE)))
+}
+
+/// Wait for the driver lock, calling `waiting` meanwhile. A lock that cannot
+/// be opened does not stop the driver change, as a record that cannot be
+/// written does not.
+fn hold(lock: &Path, mut waiting: impl FnMut()) -> Option<super::lock::Locked> {
+    loop {
+        match super::lock::try_lock(lock) {
+            Ok(locked) => return Some(locked),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                waiting();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Could not lock the virtual display driver");
+                return None;
+            }
+        }
+    }
 }
 
 /// Make a driver change for this host: turning the display on records this
 /// process as its owner first, and a completed turn-off removes the record if
 /// it names this process. Another host's record stays, for its reporter.
-pub(crate) fn change(enabled: bool, run: impl FnOnce() -> bool) -> bool {
-    match owner_path() {
-        Some(path) => change_at(&path, enabled, run),
-        None => run(),
+/// `progress` runs while another change holds the driver, then goes to `run`.
+pub(crate) fn change<P: FnMut()>(enabled: bool, progress: P, run: impl FnOnce(P) -> bool) -> bool {
+    match paths() {
+        Some((path, lock)) => change_at(&path, &lock, enabled, progress, run),
+        None => run(progress),
     }
 }
 
-fn change_at(path: &Path, enabled: bool, run: impl FnOnce() -> bool) -> bool {
+fn change_at<P: FnMut()>(
+    path: &Path,
+    lock: &Path,
+    enabled: bool,
+    mut progress: P,
+    run: impl FnOnce(P) -> bool,
+) -> bool {
+    let _driver = hold(lock, &mut progress);
     if enabled {
         if let Err(error) = record(path, ProcessId::current()) {
             tracing::warn!(%error, "Could not record the virtual display's owner");
         }
     }
-    let done = run();
+    let done = run(progress);
     if done && !enabled {
         delete_if_owned(path, ProcessId::current(), || true, true);
     }
@@ -81,12 +113,13 @@ pub(crate) fn disable_for_ended(
     other_host: impl FnMut() -> Option<ProcessId>,
     disable: impl FnOnce() -> bool,
 ) -> Result<bool, String> {
-    let path = owner_path().ok_or("there is no app data folder")?;
-    disable_for_ended_at(&path, ended, other_host, disable)
+    let (path, lock) = paths().ok_or("there is no app data folder")?;
+    disable_for_ended_at(&path, &lock, ended, other_host, disable)
 }
 
 fn disable_for_ended_at(
     path: &Path,
+    lock: &Path,
     ended: ProcessId,
     mut other_host: impl FnMut() -> Option<ProcessId>,
     disable: impl FnOnce() -> bool,
@@ -110,7 +143,9 @@ fn disable_for_ended_at(
     };
     check(&mut other_host)?;
     // Again just before the driver changes: the process scan takes a while,
-    // and a replacement host may have started or turned the display on.
+    // and a replacement host may have started or turned the display on. From
+    // here a host that turns it on waits until the turn-off is done.
+    let _driver = hold(lock, || {});
     check(&mut other_host)?;
     let done = disable();
     if done {
@@ -384,27 +419,37 @@ mod tests {
     #[test]
     fn turning_the_display_on_records_the_owner_and_turning_it_off_clears_it() {
         let path = owner_file("change");
-        assert!(change_at(&path, true, || true));
+        let lock = owner_file("change-lock");
+        assert!(change_at(&path, &lock, true, || {}, |_| true));
         assert_eq!(owner_at(&path), Some(ProcessId::current()));
         // A failed turn-off leaves the owner, so its reporter still cleans up.
-        assert!(!change_at(&path, false, || false));
+        assert!(!change_at(&path, &lock, false, || {}, |_| false));
         assert_eq!(owner_at(&path), Some(ProcessId::current()));
-        assert!(change_at(&path, false, || true));
+        assert!(change_at(&path, &lock, false, || {}, |_| true));
         assert!(!path.exists());
-        // A record that cannot be written does not stop the driver change.
-        let unwritable = owner_file("missing").join("folder").join(OWNER_FILE);
-        assert!(change_at(&unwritable, true, || true));
+        // A record or lock that cannot be written does not stop the driver change.
+        let missing = owner_file("missing").join("folder");
+        assert!(change_at(
+            &missing.join(OWNER_FILE),
+            &missing.join(LOCK_FILE),
+            true,
+            || panic!("waited"),
+            |_| true
+        ));
+        fs::remove_file(lock).unwrap();
     }
 
     #[test]
     fn a_hosts_own_turn_off_leaves_another_hosts_record() {
         let path = owner_file("startup");
+        let lock = owner_file("startup-lock");
         // Host A turned the display on; host B starts and turns it off.
         let host_a = ProcessId { pid: 7, start: 1 };
         record(&path, host_a).unwrap();
-        assert!(change_at(&path, false, || true));
+        assert!(change_at(&path, &lock, false, || {}, |_| true));
         assert_eq!(owner_at(&path), Some(host_a));
         fs::remove_file(path).unwrap();
+        fs::remove_file(lock).unwrap();
     }
 
     #[cfg(windows)]
@@ -440,36 +485,39 @@ mod tests {
     #[test]
     fn the_reporter_turns_off_only_its_own_hosts_display_with_no_other_host_running() {
         let path = owner_file("ended");
+        let lock = owner_file("ended-lock");
         let ended = ProcessId { pid: 7, start: 1 };
         let other = ProcessId { pid: 8, start: 1 };
         // A replacement host turned it on.
         record(&path, other).unwrap();
         assert_eq!(
-            disable_for_ended_at(&path, ended, || None, || panic!("disabled")),
+            disable_for_ended_at(&path, &lock, ended, || None, || panic!("disabled")),
             Err("left the virtual display on: host 8-1 turned it on".to_string())
         );
         // The ended host turned it on, but another host is running.
         record(&path, ended).unwrap();
         assert_eq!(
-            disable_for_ended_at(&path, ended, || Some(other), || panic!("disabled")),
+            disable_for_ended_at(&path, &lock, ended, || Some(other), || panic!("disabled")),
             Err("left the virtual display on: EternalMonitor host 8-1 is running".to_string())
         );
         assert_eq!(owner_at(&path), Some(ended));
         assert_eq!(
-            disable_for_ended_at(&path, ended, || None, || true),
+            disable_for_ended_at(&path, &lock, ended, || None, || true),
             Ok(true)
         );
         assert!(!path.exists());
         // Nobody turned it on.
         assert_eq!(
-            disable_for_ended_at(&path, ended, || None, || panic!("disabled")),
+            disable_for_ended_at(&path, &lock, ended, || None, || panic!("disabled")),
             Err(NO_OWNER.to_string())
         );
+        fs::remove_file(lock).unwrap();
     }
 
     #[test]
     fn a_host_that_starts_during_the_check_keeps_its_display() {
         let path = owner_file("starting");
+        let lock = owner_file("starting-lock");
         let ended = ProcessId { pid: 7, start: 1 };
         let replacement = ProcessId { pid: 8, start: 1 };
         record(&path, ended).unwrap();
@@ -478,6 +526,7 @@ mod tests {
         let mut scans = 0;
         let result = disable_for_ended_at(
             &path,
+            &lock,
             ended,
             || {
                 scans += 1;
@@ -494,16 +543,19 @@ mod tests {
         );
         assert_eq!(owner_at(&path), Some(replacement));
         fs::remove_file(path).unwrap();
+        fs::remove_file(lock).unwrap();
     }
 
     #[test]
     fn a_host_that_turns_the_display_on_during_the_turn_off_keeps_its_record() {
         let path = owner_file("during");
+        let lock = owner_file("during-lock");
         let ended = ProcessId { pid: 7, start: 1 };
         let replacement = ProcessId { pid: 8, start: 1 };
         record(&path, ended).unwrap();
         let result = disable_for_ended_at(
             &path,
+            &lock,
             ended,
             || None,
             || {
@@ -521,6 +573,72 @@ mod tests {
         assert_eq!(owner_at(&path), Some(replacement));
         assert_eq!(files_beside(&path), 1);
         fs::remove_file(path).unwrap();
+        fs::remove_file(lock).unwrap();
+    }
+
+    #[test]
+    fn a_host_that_turns_the_display_on_during_a_reporters_turn_off_keeps_it_on() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+        let path = owner_file("overlap");
+        let lock = owner_file("overlap-lock");
+        let ended = ProcessId { pid: 7, start: 1 };
+        record(&path, ended).unwrap();
+        let display_on = Arc::new(AtomicBool::new(true));
+        // The ended host's reporter passed both checks and is turning the
+        // display off.
+        let (paused_tx, paused) = mpsc::channel();
+        let (resume, resume_rx) = mpsc::channel::<()>();
+        let reporter = {
+            let (path, lock, display_on) = (path.clone(), lock.clone(), display_on.clone());
+            std::thread::spawn(move || {
+                disable_for_ended_at(
+                    &path,
+                    &lock,
+                    ended,
+                    || None,
+                    || {
+                        paused_tx.send(()).unwrap();
+                        resume_rx.recv().unwrap();
+                        display_on.store(false, Ordering::SeqCst);
+                        true
+                    },
+                )
+            })
+        };
+        paused.recv().unwrap();
+        // A replacement host turns it on meanwhile. Once it is done or
+        // waiting for the driver, the reporter's turn-off finishes.
+        let (event_tx, event) = mpsc::channel();
+        let host = {
+            let (path, lock, display_on) = (path.clone(), lock.clone(), display_on.clone());
+            std::thread::spawn(move || {
+                let waiting = event_tx.clone();
+                let done = change_at(
+                    &path,
+                    &lock,
+                    true,
+                    move || {
+                        let _ = waiting.send(());
+                    },
+                    |_| {
+                        display_on.store(true, Ordering::SeqCst);
+                        true
+                    },
+                );
+                let _ = event_tx.send(());
+                done
+            })
+        };
+        event.recv().unwrap();
+        resume.send(()).unwrap();
+        let reported = reporter.join().unwrap();
+        assert!(host.join().unwrap());
+        assert!(display_on.load(Ordering::SeqCst));
+        assert_eq!(reported, Ok(true));
+        assert_eq!(owner_at(&path), Some(ProcessId::current()));
+        fs::remove_file(path).unwrap();
+        fs::remove_file(lock).unwrap();
     }
 
     /// Files named like the record, the record included.
