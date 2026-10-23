@@ -142,6 +142,69 @@ final class PencilRelayTests: XCTestCase {
         view.touchesMoved([tip], with: nil)
         XCTAssertEqual(events.map(\.phase), [0, 3])
     }
+
+    /// Fill: the 200 × 100 picture covers the 100 × 100 view at 200 × 100,
+    /// so 50 pt are trimmed off each side and the view spans x 0.25...0.75.
+    func testPencilMapsThroughFillAndClampsToTheVisiblePicture() {
+        let view = RelayTouchUIView(frame: CGRect(x: 0, y: 0, width: 100, height: 100))
+        view.videoSize = CGSize(width: 200, height: 100)
+        view.pictureFit = .fill
+        view.nativePenSupported = true
+        var events: [WireInputEvent] = []
+        view.onEvents = { events += $0 }
+        let tip = TestTouch(.pencil)
+        tip.position = CGPoint(x: 0, y: 50)
+        view.touchesBegan([tip], with: nil)
+        XCTAssertEqual(events[0].xNorm, 16384)
+        XCTAssertEqual(events[0].yNorm, 32768)
+        // Past the screen edge: held on the visible picture, never the trimmed part.
+        tip.position = CGPoint(x: 150, y: 99)
+        tip.sampleTime = 2
+        view.touchesMoved([tip], with: nil)
+        view.touchesEnded([tip], with: nil)
+        XCTAssertEqual(events.last?.xNorm, 49151)
+        XCTAssertEqual(events.last?.yNorm, 64880)
+    }
+
+    func testFingerOnTheFitBarClicksTheFilledPicture() {
+        // The test finger sits at (1, 1): a letterbox bar in Fit.
+        // Fill: x = (1 + 50) / 200 = 0.255, y = 0.01.
+        let cases: [(PictureFit, (x: UInt16, y: UInt16)?)] = [(.fit, nil), (.fill, (16711, 655))]
+        for (fit, expected) in cases {
+            let view = RelayTouchUIView(frame: CGRect(x: 0, y: 0, width: 100, height: 100))
+            view.videoSize = CGSize(width: 200, height: 100)
+            view.pictureFit = fit
+            var events: [WireInputEvent] = []
+            view.onEvents = { events += $0 }
+            let finger = TestTouch(.direct)
+            view.touchesBegan([finger], with: nil)
+            view.touchesEnded([finger], with: nil)
+            if let expected {
+                XCTAssertEqual(events.map(\.phase), [0, 2])
+                XCTAssertTrue(events.allSatisfy { $0.xNorm == expected.x && $0.yNorm == expected.y })
+            } else {
+                XCTAssertTrue(events.isEmpty, "a touch on the letterbox must never click")
+            }
+        }
+    }
+
+    func testSwitchingFitOrFillCancelsAStroke() {
+        let view = RelayTouchUIView(frame: CGRect(x: 0, y: 0, width: 100, height: 100))
+        view.videoSize = CGSize(width: 200, height: 100)
+        view.nativePenSupported = true
+        var events: [WireInputEvent] = []
+        view.onEvents = { events += $0 }
+        let tip = TestTouch(.pencil)
+        view.touchesBegan([tip], with: nil)
+        view.pictureFit = .fill
+        tip.sampleTime = 2
+        view.touchesMoved([tip], with: nil)
+        XCTAssertEqual(events.map(\.phase), [0, 3])
+        // Setting the same mode again changes nothing.
+        view.touchesBegan([tip], with: nil)
+        view.pictureFit = .fill
+        XCTAssertEqual(events.map(\.phase), [0, 3, 0])
+    }
 }
 
 private final class TestTouch: UITouch {

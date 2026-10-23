@@ -40,10 +40,24 @@ struct SettingsView: View {
                     Toggle(isOn: $settings.keepScreenAwake) {
                         rowLabel("Keep screen awake", "sun.max")
                     }
+
+                    HStack {
+                        rowLabel("Picture", "aspectratio")
+                        Spacer()
+                        Picker("Picture", selection: $settings.pictureFit) {
+                            Text("Fit").tag(PictureFit.fit)
+                            Text("Fill").tag(PictureFit.fill)
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(maxWidth: 160)
+                        .accessibilityIdentifier("settings.pictureFit")
+                    }
                 } header: {
                     sectionHeader("Streaming")
                 } footer: {
-                    footnote("Frame rate applies from the next connection. Tap the picture to show or hide the controls.")
+                    footnote("Frame rate applies from the next connection. Tap the picture to show or hide the controls. "
+                        + "Fill uses the whole iPad screen and trims the edges of the PC picture that don't fit.")
                 }
                 .listRowBackground(Theme.surfaceRaised)
 

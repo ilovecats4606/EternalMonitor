@@ -23,6 +23,7 @@ struct TouchRelayView: UIViewRepresentable {
 
     func updateUIView(_ view: RelayTouchUIView, context: Context) {
         view.videoSize = connectionManager.videoSize
+        view.pictureFit = settings.pictureFit
         view.onToggleHUD = onToggleHUD
         view.commandAsControl = settings.commandAsControl
         view.keyboardSupported = connectionManager.sessionHasKeyboard
@@ -50,6 +51,10 @@ final class RelayTouchUIView: UIView {
             if oldValue != videoSize && pencil.isDown { cancelInput() }
             machine.videoPixelSize = videoSize
         }
+    }
+    /// Must match the renderer's mode so a touch lands under the finger.
+    var pictureFit: PictureFit = .fit {
+        didSet { if oldValue != pictureFit && pencil.isDown { cancelInput() } }
     }
 
     private var machine = TouchRelayMachine()
@@ -108,7 +113,7 @@ final class RelayTouchUIView: UIView {
     }
 
     private var mapper: ContentRectMapper {
-        ContentRectMapper(viewSize: bounds.size, videoSize: videoSize)
+        ContentRectMapper(viewSize: bounds.size, videoSize: videoSize, fit: pictureFit)
     }
 
     private func norm(_ touch: UITouch) -> TouchRelayMachine.Point? {
@@ -405,7 +410,7 @@ final class RelayTouchUIView: UIView {
     private func pencilReading(_ touch: UITouch, clamp: Bool = false) -> PencilReading? {
         var location = touch.preciseLocation(in: self)
         if clamp {
-            let rect = mapper.contentRect
+            let rect = mapper.visibleRect
             guard rect.width > 0, rect.height > 0 else { return nil }
             location.x = min(rect.maxX, max(rect.minX, location.x))
             location.y = min(rect.maxY, max(rect.minY, location.y))

@@ -1256,6 +1256,10 @@ final class AppSettings: ObservableObject {
     @Published var targetFPS: Int {
         didSet { UserDefaults.standard.set(targetFPS, forKey: "targetFPS") }
     }
+    /// Fit (default) shows the whole PC picture; Fill covers the iPad.
+    @Published var pictureFit: PictureFit {
+        didSet { UserDefaults.standard.set(pictureFit.rawValue, forKey: "pictureFit") }
+    }
     // last successfully-connected host+port for pre-fill on relaunch.
     @Published var lastHost: String {
         didSet { UserDefaults.standard.set(lastHost, forKey: "lastHost") }
@@ -1277,6 +1281,7 @@ final class AppSettings: ObservableObject {
         self.commandAsControl = defaults.flag(forKey: "commandAsControl")
         self.autoReconnect = defaults.flag(forKey: "autoReconnect")
         self.targetFPS = defaults.frameRatePreference()
+        self.pictureFit = PictureFit(rawValue: defaults.string(forKey: "pictureFit") ?? "") ?? .fit
         self.lastHost = defaults.object(forKey: "lastHost") as? String ?? ""
         let port = defaults.integer(forKey: "lastPort")
         self.lastPort = UInt16(clamping: port)
