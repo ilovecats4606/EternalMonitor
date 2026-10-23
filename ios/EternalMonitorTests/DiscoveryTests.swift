@@ -95,6 +95,40 @@ final class DiscoveryTests: XCTestCase {
         XCTAssertEqual(scanner.hosts.map(\.address), ["192.168.1.21"])
     }
 
+    /// Bonjour can answer a resolve after its PC left or a new scan began.
+    /// That answer can't list the PC again or start a lookup for it.
+    func testALateResolveCannotBringBackAPC() async throws {
+        let lookups = CountedLookup()
+        let scanner = NetworkScanner()
+        scanner.resolveIPv4 = { lookups.resolve($0) }
+        let service = HeldService(name: "PC", hostName: "studio.local.")
+        scanner.netServiceBrowser(NetServiceBrowser(), didFind: service, moreComing: false)
+        try await Task.sleep(for: .milliseconds(100))
+
+        // The browser reports the removal with its own NetService object.
+        scanner.netServiceBrowser(NetServiceBrowser(),
+            didRemove: NetService(domain: "local.", type: "_eternaldisplay._udp.", name: "PC"), moreComing: false)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertTrue(service.stopped, "removing a PC stops its resolve")
+        XCTAssertNil(service.delegate)
+        service.addresses = [ipv6("fe80::1")]
+        scanner.netServiceDidResolveAddress(service)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(scanner.hosts.map(\.name), [], "a PC that left must not come back")
+        XCTAssertEqual(lookups.count, 0)
+
+        // A resolve started by the previous scan doesn't count in a new one.
+        let earlier = HeldService(name: "PC", hostName: "studio.local.")
+        scanner.netServiceBrowser(NetServiceBrowser(), didFind: earlier, moreComing: false)
+        try await Task.sleep(for: .milliseconds(100))
+        scanner.startScan()
+        defer { scanner.stopScan() }
+        earlier.addresses = [ipv4("192.168.1.20")]
+        scanner.netServiceDidResolveAddress(earlier)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertFalse(scanner.hosts.contains { $0.name == "PC" })
+    }
+
     func testSavedPCsStayVisibleUnlessDiscoveryListsTheSameOne() {
         let saved = [
             RecentConnection(host: "192.168.1.20", port: 9876, lastUsed: .now, isUSB: false),
@@ -132,4 +166,39 @@ private final class HeldLookup: @unchecked Sendable {
         self.address = address
         answered.signal()
     }
+}
+
+/// A host-name lookup that finds nothing and counts how often it ran.
+private final class CountedLookup: @unchecked Sendable {
+    private let lock = NSLock()
+    private var runs = 0
+
+    var count: Int { lock.withLock { runs } }
+
+    func resolve(_ hostName: String) -> String? {
+        lock.withLock { runs += 1 }
+        return nil
+    }
+}
+
+/// A Bonjour service whose resolve answers only when the test calls the
+/// delegate method itself.
+private final class HeldService: NetService, @unchecked Sendable {
+    private let heldHostName: String
+    private var heldAddresses: [Data]?
+    private(set) var stopped = false
+
+    init(name: String, hostName: String) {
+        heldHostName = hostName
+        super.init(domain: "local.", type: "_eternaldisplay._udp.", name: name, port: 9876)
+    }
+
+    override var addresses: [Data]? {
+        get { heldAddresses }
+        set { heldAddresses = newValue }
+    }
+    override var hostName: String? { heldHostName }
+    override var port: Int { 9876 }
+    override func resolve(withTimeout timeout: TimeInterval) {}
+    override func stop() { stopped = true }
 }

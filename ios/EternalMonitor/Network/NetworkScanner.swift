@@ -143,7 +143,11 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
     ) {
         Task { @MainActor in
             let key = Self.serviceKey(service)
-            resolvingServices.removeValue(forKey: key)
+            // Stop its resolve, so it can't answer for a PC that left.
+            if let resolving = resolvingServices.removeValue(forKey: key) {
+                resolving.delegate = nil
+                resolving.stop()
+            }
             ipv4Lookups.removeValue(forKey: service.name)
             hosts.removeAll { $0.name == service.name }
 
@@ -169,7 +173,7 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
     nonisolated func netServiceDidResolveAddress(_ sender: NetService) {
         Task { @MainActor in
             let key = Self.serviceKey(sender)
-            guard sender.addresses?.isEmpty == false else { return }
+            guard isCurrent(sender), sender.addresses?.isEmpty == false else { return }
             let host = DiscoveredHost.resolved(name: sender.name, port: sender.port, addresses: sender.addresses ?? [])
             // discovery diagnostic — surface every resolved host so we
             // can tell whether mDNS is finding the right machine.
@@ -288,6 +292,7 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
 
     nonisolated func netService(_ sender: NetService, didNotResolve errorDict: [String: NSNumber]) {
         Task { @MainActor in
+            guard isCurrent(sender) else { return }
             resolvingServices.removeValue(forKey: Self.serviceKey(sender))
             resolveEnded(name: sender.name)
             if hosts.isEmpty {
@@ -298,6 +303,7 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
 
     nonisolated func netServiceDidStop(_ sender: NetService) {
         Task { @MainActor in
+            guard isCurrent(sender) else { return }
             resolvingServices.removeValue(forKey: Self.serviceKey(sender))
             resolveEnded(name: sender.name)
         }
@@ -309,6 +315,13 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
         guard ipv4Lookups[name] == nil,
               let index = hosts.firstIndex(where: { $0.name == name && $0.address == nil }) else { return }
         hosts[index].finding = false
+    }
+
+    /// Whether a callback comes from the service this scan is resolving.
+    /// Each scan starts with none, and a service that left or already gave
+    /// its IPv4 address is dropped, so their late answers are ignored.
+    private func isCurrent(_ service: NetService) -> Bool {
+        resolvingServices[Self.serviceKey(service)] === service
     }
 
     private static func serviceKey(_ service: NetService) -> String {
