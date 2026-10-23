@@ -116,33 +116,50 @@
     }
   }
 
-  /* --- GitHub stars, fetched once an hour ---------------------------------- */
+  /* --- GitHub stars -------------------------------------------------------------
+     Shields' cached JSON first: it is shared by everyone, so a campus full of
+     visitors behind one address can't exhaust GitHub's 60-an-hour limit. The
+     GitHub API is only the fallback. The count is kept for six hours, and if
+     both fail the link simply reads "GitHub". */
   var starEls = document.querySelectorAll('[data-stars]');
   if (starEls.length) {
-    var showStars = function (n) {
-      var text = n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1).replace(/\.0$/, '') + 'k' : String(n);
+    var STARS_KEY = 'gh-stars-v2';
+    var STARS_TTL = 6 * 3600000;
+    var isCount = function (text) { return typeof text === 'string' && /^\d+(\.\d+)?[kKmM]?$/.test(text); };
+    var showStars = function (text) {
       // Screen readers hear "GitHub, 180 stars", not a bare number.
       starEls.forEach(function (el) {
         el.textContent = text;
         var unit = document.createElement('span');
         unit.className = 'visually-hidden';
-        unit.textContent = n === 1 ? ' star' : ' stars';
+        unit.textContent = text === '1' ? ' star' : ' stars';
         el.appendChild(unit);
       });
     };
+    var keepStars = function (text) {
+      showStars(text);
+      try { localStorage.setItem(STARS_KEY, JSON.stringify({ text: text, at: Date.now() })); } catch (e) {}
+    };
     var cached = null;
-    try { cached = JSON.parse(sessionStorage.getItem('gh-stars') || 'null'); } catch (e) {}
-    if (cached && Date.now() - cached.at < 3600000) {
-      showStars(cached.n);
+    try { cached = JSON.parse(localStorage.getItem(STARS_KEY) || 'null'); } catch (e) {}
+    if (cached && isCount(cached.text) && Date.now() - cached.at < STARS_TTL) {
+      showStars(cached.text);
     } else {
-      fetch('https://api.github.com/repos/' + REPO, { headers: { Accept: 'application/vnd.github+json' } })
-        .then(function (r) { return r.ok ? r.json() : null; })
-        .then(function (repo) {
-          if (!repo || typeof repo.stargazers_count !== 'number') return;
-          showStars(repo.stargazers_count);
-          try { sessionStorage.setItem('gh-stars', JSON.stringify({ n: repo.stargazers_count, at: Date.now() })); } catch (e) {}
-        })
-        .catch(function () {});
+      var fromShields = function () {
+        return fetch('https://img.shields.io/github/stars/' + REPO + '.json')
+          .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+          .then(function (badge) { if (!badge || !isCount(badge.value)) throw new Error('no count'); return badge.value; });
+      };
+      var fromGitHub = function () {
+        return fetch('https://api.github.com/repos/' + REPO, { headers: { Accept: 'application/vnd.github+json' } })
+          .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+          .then(function (repo) {
+            var n = repo && repo.stargazers_count;
+            if (typeof n !== 'number') throw new Error('no count');
+            return n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1).replace(/\.0$/, '') + 'k' : String(n);
+          });
+      };
+      fromShields().catch(fromGitHub).then(keepStars).catch(function () {});
     }
   }
 
@@ -262,6 +279,7 @@
     var shaEl = document.getElementById('sha256-value');
     var tfLink = document.getElementById('testflight-link');
     var notesLink = document.getElementById('release-notes-link');
+    var htmlTag = versionEls.length ? versionEls[0].textContent.trim() : '';
 
     var formatBytes = function (n) {
       if (n < 1048576) return (n / 1024).toFixed(0) + ' KB';
@@ -291,14 +309,26 @@
           form.setAttribute('data-release', 'Windows ' + tag +
             (ipad.version ? ' · iPad v' + ipad.version + (ipad.build ? ', TestFlight build ' + ipad.build : '') : ''));
         }
+        // The HTML already shows the installer size for its own version, so
+        // GitHub is only asked when latest.json names a newer one, and the
+        // answer is kept for six hours.
+        if (tag === htmlTag || !metaEl) return;
+        var sizeKey = 'gh-setup-size-' + tag, hit = null;
+        try { hit = JSON.parse(localStorage.getItem(sizeKey) || 'null'); } catch (e) {}
+        if (hit && typeof hit.size === 'number' && Date.now() - hit.at < 6 * 3600000) {
+          metaEl.textContent = 'EternalMonitor-Setup.exe · ' + formatBytes(hit.size);
+          return;
+        }
         return fetch('https://api.github.com/repos/' + REPO + '/releases/tags/' + tag, {
           headers: { Accept: 'application/vnd.github+json' }
-        });
-      })
-      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
-      .then(function (release) {
-        var asset = (release.assets || []).filter(function (a) { return a.name === 'EternalMonitor-Setup.exe'; })[0];
-        if (asset && metaEl) metaEl.textContent = asset.name + ' · ' + formatBytes(asset.size);
+        })
+          .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+          .then(function (release) {
+            var asset = (release.assets || []).filter(function (a) { return a.name === 'EternalMonitor-Setup.exe'; })[0];
+            if (!asset) return;
+            metaEl.textContent = asset.name + ' · ' + formatBytes(asset.size);
+            try { localStorage.setItem(sizeKey, JSON.stringify({ size: asset.size, at: Date.now() })); } catch (e) {}
+          });
       })
       .catch(function () { /* The HTML already carries the current release. */ });
   }
