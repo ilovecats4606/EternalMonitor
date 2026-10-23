@@ -191,6 +191,8 @@ or in the controls while streaming.
 | What you see | What to do |
 | --- | --- |
 | **No PCs found** on the iPad | Check that both are on the same Wi-Fi and not on a guest network. Type the **Address** from the PC window instead. |
+| **Couldn't search for PCs** on the iPad | Tap **Search again**, or scan the QR code or type the **Address** from the PC window. If it keeps failing, turn on **Local Network** for EternalMonitor in the iPad's Settings. |
+| **EternalMonitor can't look for PCs** | Tap **Open Settings** and turn on **Local Network**. |
 | **Your PC didn't answer** | Check that EternalMonitor is open on the PC and says **Ready for your iPad**, that the PC is awake, and that both are on the same Wi-Fi, not a guest network. If all of that is right, Windows Firewall or security software is probably blocking EternalMonitor: run EternalMonitor-Setup.exe again, or use a USB cable. Then tap **Try again**. |
 | **Your PC answered, but no picture arrived** | Look at EternalMonitor on the PC and follow any message it shows, click **Restart**, then tap **Try again** on the iPad. |
 | **Lost the connection to your PC** or **Couldn't reconnect to your PC** | The PC may have gone to sleep or closed EternalMonitor. Wake it, check EternalMonitor is open, then tap **Try again**. |

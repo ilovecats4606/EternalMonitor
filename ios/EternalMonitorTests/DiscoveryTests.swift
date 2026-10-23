@@ -152,6 +152,39 @@ final class DiscoveryTests: XCTestCase {
         XCTAssertEqual(scanner.hosts.map(\.address), ["192.168.1.21"], "a tap must reach the current address")
     }
 
+    /// Only a Local Network denial sends the user to Settings. Any other
+    /// Bonjour failure keeps Search again.
+    func testOnlyALocalNetworkDenialSendsYouToSettings() async throws {
+        func problem(_ code: Int) -> NetworkScanner.SearchProblem {
+            NetworkScanner.SearchProblem(errorDict: [NetService.errorCode: NSNumber(value: code), NetService.errorDomain: 10])
+        }
+        // kDNSServiceErr_PolicyDenied and kDNSServiceErr_NoAuth.
+        XCTAssertEqual(problem(-65570), .localNetworkOff)
+        XCTAssertEqual(problem(-65555), .localNetworkOff)
+        // Unknown, busy, bad argument, missing Info.plist entries, no daemon, no router.
+        for code in [-72000, -72003, -72004, -72008, -65563, -65566] {
+            XCTAssertEqual(problem(code), .couldNotSearch, "\(code)")
+        }
+        XCTAssertEqual(NetworkScanner.SearchProblem(errorDict: [:]), .couldNotSearch)
+
+        let scanner = NetworkScanner()
+        scanner.netServiceBrowser(NetServiceBrowser(), didNotSearch: [NetService.errorCode: -72000, NetService.errorDomain: 10])
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(scanner.searchProblem, .couldNotSearch)
+        scanner.netServiceBrowser(NetServiceBrowser(), didNotSearch: [NetService.errorCode: -65570, NetService.errorDomain: 10])
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(scanner.searchProblem, .localNetworkOff)
+
+        let failed = ConnectView.scanEmptyAdvice(.couldNotSearch)
+        XCTAssertEqual(failed.title, "Couldn't search for PCs")
+        XCTAssertTrue(failed.detail.hasPrefix("Search again, or scan the QR code or type the Address"), failed.detail)
+        let blocked = ConnectView.scanEmptyAdvice(.localNetworkOff)
+        XCTAssertEqual(blocked.title, "EternalMonitor can't look for PCs")
+        XCTAssertEqual(blocked.detail, "Turn on Local Network for EternalMonitor in Settings.")
+        XCTAssertNil(ConnectView.scanEmptyAdvice(nil).title)
+        XCTAssertTrue(ConnectView.scanEmptyAdvice(nil).detail.hasPrefix("No PCs found."))
+    }
+
     func testSavedPCsStayVisibleUnlessDiscoveryListsTheSameOne() {
         let saved = [
             RecentConnection(host: "192.168.1.20", port: 9876, lastUsed: .now, isUSB: false),

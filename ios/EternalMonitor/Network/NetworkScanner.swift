@@ -34,8 +34,24 @@ final class NetworkScanner: NSObject, ObservableObject {
     @Published var hosts: [DiscoveredHost] = []
     @Published var isScanning = false
     @Published var statusMessage: String = ""
-    /// Bonjour refused to search, usually because Local Network access is off.
-    @Published var searchBlocked = false
+    /// Why Bonjour couldn't search, or nil while it can.
+    @Published var searchProblem: SearchProblem?
+
+    enum SearchProblem: Equatable {
+        /// Local Network access is off for EternalMonitor.
+        case localNetworkOff
+        /// Any other Bonjour failure. Searching again may work.
+        case couldNotSearch
+
+        /// Only a policy denial means Local Network access is off.
+        init(errorDict: [String: NSNumber]) {
+            switch errorDict[NetService.errorCode]?.intValue {
+            // kDNSServiceErr_PolicyDenied, kDNSServiceErr_NoAuth
+            case -65570, -65555: self = .localNetworkOff
+            default: self = .couldNotSearch
+            }
+        }
+    }
 
     private let browser = NetServiceBrowser()
     private var resolvingServices: [String: NetService] = [:]
@@ -64,12 +80,18 @@ final class NetworkScanner: NSObject, ObservableObject {
 
     private func beginScan() {
         isScanning = true
-        searchBlocked = false
+        searchProblem = nil
         hosts = []
         resolvingServices.removeAll()
         ipv4Lookups.removeAll()
         statusMessage = "Looking for PCs…"
 
+        #if DEBUG
+        if let code = UIPreview.searchErrorCode {
+            netServiceBrowser(browser, didNotSearch: [NetService.errorCode: NSNumber(value: code)])
+            return
+        }
+        #endif
         browser.searchForServices(ofType: "_eternaldisplay._udp.", inDomain: "local.")
 
         scanTask = Task { @MainActor in
@@ -164,10 +186,11 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
         _ browser: NetServiceBrowser,
         didNotSearch errorDict: [String: NSNumber]
     ) {
+        let problem = SearchProblem(errorDict: errorDict)
+        print("[mDNS] Search failed: \(errorDict)")
         Task { @MainActor in
-            statusMessage = "Can't search: Local Network access is off."
             stopScan()
-            searchBlocked = true
+            searchProblem = problem
         }
     }
 

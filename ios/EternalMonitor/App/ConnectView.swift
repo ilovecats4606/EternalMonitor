@@ -525,19 +525,26 @@ struct ConnectView: View {
     // MARK: - Scan results
 
     private var scanEmptyState: some View {
-        HStack(alignment: .top, spacing: 12) {
+        let advice = Self.scanEmptyAdvice(scanner.searchProblem)
+        return HStack(alignment: .top, spacing: 12) {
             Image(systemName: "wifi.exclamationmark")
                 .foregroundStyle(Theme.textMuted)
                 .font(.system(size: 16))
             VStack(alignment: .leading, spacing: 10) {
-                Text(scanner.searchBlocked
-                    ? "EternalMonitor can't look for PCs. Turn on Local Network for EternalMonitor in Settings."
-                    : "No PCs found. Check that EternalMonitor is open on the PC and both are on the same Wi-Fi, not a guest network. Or type the Address shown on the PC.")
-                    .font(.app(14, relativeTo: .callout))
-                    .foregroundStyle(Theme.textMuted)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("connect.scanEmpty")
-                if scanner.searchBlocked {
+                VStack(alignment: .leading, spacing: 6) {
+                    if let title = advice.title {
+                        Text(title)
+                            .font(.app(16, .semibold, relativeTo: .headline))
+                            .foregroundStyle(Theme.text)
+                            .accessibilityIdentifier("connect.scanProblemTitle")
+                    }
+                    Text(advice.detail)
+                        .font(.app(14, relativeTo: .callout))
+                        .foregroundStyle(Theme.textMuted)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("connect.scanEmpty")
+                }
+                if scanner.searchProblem == .localNetworkOff {
                     Button("Open Settings") { openAppSettings() }
                         .buttonStyle(PillButtonStyle(foreground: Theme.onAccent, fill: Theme.accent))
                 } else {
@@ -549,6 +556,23 @@ struct ConnectView: View {
         }
         .card(padding: 16)
         .transition(.opacity)
+    }
+
+    /// What an empty search says: what went wrong if the search itself
+    /// failed, and what to do.
+    static func scanEmptyAdvice(_ problem: NetworkScanner.SearchProblem?) -> (title: String?, detail: String) {
+        switch problem {
+        case .localNetworkOff:
+            return ("EternalMonitor can't look for PCs", "Turn on Local Network for EternalMonitor in Settings.")
+        case .couldNotSearch:
+            // NetServiceBrowser can report Local Network being off this way
+            // too, so the Settings advice stays as the last resort.
+            return ("Couldn't search for PCs",
+                "Search again, or scan the QR code or type the Address shown on the PC. "
+                    + "If it keeps failing, turn on Local Network for EternalMonitor in Settings.")
+        case nil:
+            return (nil, "No PCs found. Check that EternalMonitor is open on the PC and both are on the same Wi-Fi, not a guest network. Or type the Address shown on the PC.")
+        }
     }
 
     private var discoveredSection: some View {
