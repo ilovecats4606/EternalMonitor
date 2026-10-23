@@ -42,8 +42,34 @@ final class FeedbackTests: XCTestCase {
     func testAProblemCardNamesItsProblem() {
         let body = Feedback.body(.problem(ConnectionProblem.noReply(usb: false).title), context)
         XCTAssertTrue(body.contains("--\nProblem: Your PC didn't answer\nApp:"), body)
-        XCTAssertTrue(ConnectionProblem.noPicture.canReport)
-        XCTAssertFalse(ConnectionProblem.reconnecting(attempt: 1, of: 3).canReport)
+    }
+
+    func testReportThisProblemOnlyShowsForFailures() {
+        let informational: [ConnectionProblem] = [
+            .reconnecting(attempt: 1, of: 3), .pcUpdating(.reconnecting), .pcUpdating(.manual),
+            .lost(.cableUnplugged), .lost(.usbTurnedOff), .pcBusy, .pairingCodeAsAddress,
+        ]
+        for problem in informational {
+            XCTAssertFalse(problem.canReport, problem.title)
+        }
+        let failures: [ConnectionProblem] = [
+            .noReply(usb: false), .noReply(usb: true), .noPicture, .receiverNotReady, .badAddress("pc"),
+            .routerAddress, .noNetwork, .localNetworkBlocked, .couldNotConnect, .usbFailed,
+            .lost(.pcStoppedResponding), .reconnectFailed, .pcEndedSession, .pcUpdating(.notBack),
+        ]
+        for problem in failures {
+            XCTAssertTrue(problem.canReport, problem.title)
+        }
+    }
+
+    func testMailSaysTheDiagnosticsAreAttachedAndHowToRemoveThem() {
+        let attached = Feedback.body(.problem("Your PC didn't answer"), context, attachesDiagnostics: true)
+        XCTAssertTrue(attached.hasPrefix(Feedback.attachmentNotice + "\n\n\n\n--\n"), attached)
+        XCTAssertTrue(Feedback.attachmentNotice.contains("PC's and iPad's names and local network addresses"))
+        XCTAssertTrue(Feedback.attachmentNotice.contains("Remove it before sending"))
+        // Without an attachment (the copy sheet) it says nothing about one.
+        XCTAssertFalse(Feedback.body(.general, context).contains("diagnostics"))
+        XCTAssertFalse(Feedback.fullText(.general, context).contains("diagnostics"))
     }
 
     @MainActor
@@ -79,6 +105,13 @@ final class FeedbackTests: XCTestCase {
         XCTAssertEqual(mail.route, .mail)
         let report = String(decoding: mail.attachment ?? Data(), as: UTF8.self)
         XCTAssertTrue(report.hasPrefix("EternalMonitor iPad support report"), report)
+        // Report this problem and the one-time card both open Mail with the
+        // report attached, and both say so at the top of the email.
+        XCTAssertTrue(mail.mailBody.hasPrefix(Feedback.attachmentNotice), mail.mailBody)
+        XCTAssertTrue(mail.mailBody.contains("Problem: Lost the connection to your PC"))
+        let ask = await FeedbackRequest.make(.general, context: context, canSendMail: true)
+        XCTAssertTrue(ask.mailBody.hasPrefix(Feedback.attachmentNotice), ask.mailBody)
+        XCTAssertFalse(copy.mailBody.contains("diagnostics"), copy.mailBody)
     }
 
     func testTheAskComesAfterThreeSessionsOfFiveMinutes() {

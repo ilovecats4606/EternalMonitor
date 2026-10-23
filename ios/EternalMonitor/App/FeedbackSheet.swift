@@ -10,6 +10,11 @@ struct FeedbackRequest: Identifiable {
     /// The Diagnostics report, attached in Mail. The user can remove it there.
     let attachment: Data?
 
+    /// What Mail opens with. It says so whenever the report is attached.
+    var mailBody: String {
+        Feedback.body(kind, context, attachesDiagnostics: attachment != nil)
+    }
+
     /// Mail with the Diagnostics report attached when Mail is set up, or the
     /// sheet to copy from when it isn't.
     @MainActor
@@ -48,7 +53,7 @@ private struct MailComposer: UIViewControllerRepresentable {
         mail.mailComposeDelegate = context.coordinator
         mail.setToRecipients([Feedback.email])
         mail.setSubject(Feedback.subject(request.kind, request.context))
-        mail.setMessageBody(Feedback.body(request.kind, request.context), isHTML: false)
+        mail.setMessageBody(request.mailBody, isHTML: false)
         if let attachment = request.attachment {
             mail.addAttachmentData(attachment, mimeType: "text/plain", fileName: Feedback.attachmentName)
         }

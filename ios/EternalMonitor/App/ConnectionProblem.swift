@@ -131,11 +131,18 @@ enum ConnectionProblem: Equatable {
         }
     }
 
-    /// Whether the card offers Report this problem. Not while a reconnect
-    /// is still running: that card is a status, not a failure yet.
+    /// Whether the card offers Report this problem. Not on cards that only
+    /// say what is happening or what the user did: a reconnect or an update
+    /// still under way, the cable pulled out, USB turned off, the PC busy
+    /// with another device, or the pairing code typed as the address.
     var canReport: Bool {
-        if case .reconnecting = self { return false }
-        return true
+        switch self {
+        case .reconnecting, .pcUpdating(.reconnecting), .pcUpdating(.manual),
+             .lost(.cableUnplugged), .lost(.usbTurnedOff), .pcBusy, .pairingCodeAsAddress:
+            return false
+        default:
+            return true
+        }
     }
 
     var actions: [Action] {

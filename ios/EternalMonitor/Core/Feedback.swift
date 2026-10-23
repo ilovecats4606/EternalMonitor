@@ -63,8 +63,15 @@ enum Feedback {
         "EternalMonitor \(context.appVersion) (\(context.build)) for iPad: \(kind.label)"
     }
 
-    /// Room to write at the top, then the details in short lines.
-    static func body(_ kind: Kind, _ context: Context) -> String {
+    /// Said first in Mail whenever the Diagnostics report is attached, since
+    /// the report can name the PC and iPad.
+    static let attachmentNotice = "We attached a diagnostics report to help us look into it. "
+        + "It can include your PC's and iPad's names and local network addresses. "
+        + "Remove it before sending if you'd rather not share it."
+
+    /// Room to write, then the details in short lines. With the Diagnostics
+    /// report attached, the email says so first.
+    static func body(_ kind: Kind, _ context: Context, attachesDiagnostics: Bool = false) -> String {
         var lines: [String] = []
         if case .problem(let title) = kind {
             lines.append("Problem: \(title)")
@@ -74,7 +81,8 @@ enum Feedback {
         lines.append("iPad: \(context.model)")
         lines.append("PC app: \(context.pcVersion.map { "EternalMonitor \($0)" } ?? "unknown")")
         lines.append("Connection: \(context.connection ?? "not connected")")
-        return "\n\n\n--\n" + lines.joined(separator: "\n")
+        let notice = attachesDiagnostics ? attachmentNotice + "\n" : ""
+        return notice + "\n\n\n--\n" + lines.joined(separator: "\n")
     }
 
     /// The whole message for Copy message, with where it goes.
