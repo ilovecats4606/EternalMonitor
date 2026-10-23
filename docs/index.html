@@ -110,45 +110,75 @@
 
     <section class="section" id="features" aria-labelledby="features-title">
       <div class="container">
-        <div class="section-head reveal">
-          <h2 id="features-title">The iPad becomes part of your PC.</h2>
-        </div>
+        <h2 id="features-title" class="visually-hidden">Features</h2>
 
-        <article class="feature reveal">
-          <div class="feature-text">
-            <h3>Mirror my screen, or a real second screen.</h3>
+        <article class="show reveal" aria-labelledby="f-screen">
+          <div class="show-head">
+            <h3 id="f-screen">Mirror my screen, or a real second screen.</h3>
           </div>
-          <div class="feature-media">
-            <div class="pc-window">
-              <div class="pc-titlebar" aria-hidden="true">
-                <span class="t"><img src="assets/icon.png" alt="" width="14" height="14">EternalMonitor</span>
-                <span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span>
+          <div class="switch-demo">
+            <input type="radio" name="mode" id="mode-mirror" class="sw-input">
+            <input type="radio" name="mode" id="mode-second" class="sw-input" checked>
+            <div class="sw" role="group" aria-label="Use the iPad as">
+              <label for="mode-mirror">Mirror my screen</label>
+              <label for="mode-second">Second screen</label>
+            </div>
+            <div class="modes">
+              <div class="pc-window modes-pc">
+                <div class="pc-titlebar" aria-hidden="true">
+                  <span class="t"><img src="assets/icon.png" alt="" width="14" height="14">EternalMonitor</span>
+                  <span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span>
+                </div>
+                <div class="swap">
+                  <img class="swap-a" src="assets/mode-mirror.webp" srcset="assets/mode-mirror.webp 1040w, assets/mode-mirror@2x.webp 2080w" sizes="(max-width: 860px) 92vw, 640px" width="2080" height="500" loading="lazy" decoding="async" alt="The Windows app with Use the iPad as set to Mirror my screen: the iPad shows the same picture as your main screen.">
+                  <img class="swap-b" src="assets/mode-second.webp" srcset="assets/mode-second.webp 1040w, assets/mode-second@2x.webp 2080w" sizes="(max-width: 860px) 92vw, 640px" width="2080" height="500" loading="lazy" decoding="async" alt="The Windows app with Use the iPad as set to Second screen: the iPad becomes an extra screen next to your main one.">
+                </div>
               </div>
-              <img src="assets/host-second-screen.webp" srcset="assets/host-second-screen.webp 1040w, assets/host-second-screen@2x.webp 2080w" sizes="(max-width: 860px) 100vw, 540px" width="2080" height="1000" loading="lazy" decoding="async" alt="The Windows app's Stream page with Second screen selected under Use the iPad as. It says the iPad becomes an extra screen next to your main one as soon as it connects, and shows the PC's address and a six-digit pairing code.">
+              <div class="displays" aria-hidden="true">
+                <div class="d-monitor"><span class="d-stand"></span></div>
+                <div class="d-ipad"></div>
+              </div>
             </div>
           </div>
         </article>
 
-        <article class="feature flip reveal">
-          <div class="feature-text">
-            <h3>Apple Pencil, like a real pen.</h3>
+        <article class="show reveal" aria-labelledby="f-fill">
+          <div class="show-head">
+            <h3 id="f-fill">Fit the picture, or fill the iPad.</h3>
+          </div>
+          <div class="switch-demo">
+            <input type="radio" name="picture" id="pic-fit" class="sw-input">
+            <input type="radio" name="picture" id="pic-fill" class="sw-input" checked>
+            <div class="sw" role="group" aria-label="Picture">
+              <label for="pic-fit">Fit</label>
+              <label for="pic-fill">Fill</label>
+            </div>
+            <div class="tablet fill-tablet">
+              <div class="screen swap">
+                <img class="swap-a" src="assets/ipad-fit.webp" srcset="assets/ipad-fit.webp 1180w, assets/ipad-fit@2x.webp 2360w" sizes="(max-width: 860px) 92vw, 760px" width="2360" height="1520" loading="lazy" decoding="async" alt="The iPad app with Picture set to Fit: the whole PC picture, with black bars where the shapes differ.">
+                <img class="swap-b" src="assets/ipad-fill.webp" srcset="assets/ipad-fill.webp 1180w, assets/ipad-fill@2x.webp 2360w" sizes="(max-width: 860px) 92vw, 760px" width="2360" height="1520" loading="lazy" decoding="async" alt="The iPad app with Picture set to Fill: the PC picture covers the whole iPad screen.">
+              </div>
+            </div>
+          </div>
+        </article>
+
+        <article class="show show-split reveal" aria-labelledby="f-pencil">
+          <div class="show-head">
+            <h3 id="f-pencil">Apple Pencil, like a real pen.</h3>
             <p>Pressure and tilt, tuned with care, because we care about drawing.</p>
           </div>
-          <div class="feature-media">
-            <div class="tablet">
-              <div class="screen">
-                <img src="assets/ipad-settings.webp" srcset="assets/ipad-settings.webp 1210w, assets/ipad-settings@2x.webp 2420w" sizes="(max-width: 860px) 100vw, 540px" width="2420" height="1668" loading="lazy" decoding="async" alt="The iPad app's settings: how touch controls the PC (tap to click, drag to move, two fingers to scroll, hold to right-click), what the Command key acts as, and the Apple Pencil Drawing mode switch with its explanation.">
-              </div>
+          <div class="tablet">
+            <div class="screen">
+              <img src="assets/ipad-settings.webp" srcset="assets/ipad-settings.webp 1210w, assets/ipad-settings@2x.webp 2420w" sizes="(max-width: 860px) 100vw, 540px" width="2420" height="1668" loading="lazy" decoding="async" alt="The iPad app's settings: how touch controls the PC (tap to click, drag to move, two fingers to scroll, hold to right-click), what the Command key acts as, and the Apple Pencil Drawing mode switch with its explanation.">
             </div>
           </div>
         </article>
 
-        <article class="feature reveal">
-          <div class="feature-text">
-            <h3>USB or Wi-Fi. Pair once.</h3>
+        <article class="show show-split flip reveal" aria-labelledby="f-link">
+          <div class="show-head">
+            <h3 id="f-link">USB or Wi-Fi. Pair once.</h3>
             <p>Or scan the QR code and skip the code.</p>
           </div>
-          <div class="feature-media">
             <div class="pair">
               <div class="dialog-shot">
                 <img src="assets/host-qr.webp" srcset="assets/host-qr.webp 374w, assets/host-qr@2x.webp 748w" sizes="(max-width: 860px) 50vw, 280px" width="748" height="1050" loading="lazy" decoding="async" alt="The Windows app's Scan to connect dialog, with a QR code and the PC's address under it.">
@@ -159,46 +189,39 @@
                 </div>
               </div>
             </div>
-          </div>
         </article>
 
-        <article class="feature flip reveal">
-          <div class="feature-text">
+        <div class="tiles reveal">
+          <article class="tile">
             <h3>Your graphics card does the work.</h3>
             <p>NVIDIA, AMD or Intel, in H.264 or HEVC.</p>
-          </div>
-          <div class="feature-media">
             <div class="pc-window">
               <div class="pc-titlebar" aria-hidden="true">
-                <span class="t"><img src="assets/icon.png" alt="" width="14" height="14">EternalMonitor</span>
-                <span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span>
-              </div>
+                  <span class="t"><img src="assets/icon.png" alt="" width="14" height="14">EternalMonitor</span>
+                  <span class="wc"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></span>
+                </div>
               <img src="assets/host-performance.webp" srcset="assets/host-performance.webp 1040w, assets/host-performance@2x.webp 2080w" sizes="(max-width: 860px) 100vw, 540px" width="2080" height="1095" loading="lazy" decoding="async" alt="The Windows app's Performance page: capture, encode and send rates, bandwidth, and a chart of encode time per frame.">
             </div>
-          </div>
-        </article>
+          </article>
+          <article class="tile">
+            <h3>Send feedback. Update in one click.</h3>
+            <p>From either app.</p>
+            <div class="tile-shot">
+              <img src="assets/ipad-feedback.webp" srcset="assets/ipad-feedback.webp 580w, assets/ipad-feedback@2x.webp 1160w" sizes="(max-width: 860px) 92vw, 520px" width="1160" height="1114" loading="lazy" decoding="async" alt="The iPad app's settings: Send feedback, Check for updates automatically, and About with the version, source code, Star EternalMonitor on GitHub and Contact.">
+            </div>
+          </article>
+        </div>
       </div>
     </section>
 
-    <section class="section" aria-label="In numbers">
+    <section class="section numbers" aria-label="In numbers">
       <div class="container">
-        <div class="facts reveal">
-          <div class="fact">
-            <div class="n">4–50<small>Mbps</small></div>
-            <div class="l">Adaptive bitrate</div>
-            <div class="d">When a packet goes missing on Wi-Fi, the iPad asks for it again right away, so one dropped packet rarely costs a frame.</div>
-          </div>
-          <div class="fact">
-            <div class="n">30–120<small>fps</small></div>
-            <div class="l">Frame rate</div>
-            <div class="d">The PC offers 30, 60, 90 or 120 fps and the iPad asks for 30, 60 or 120. The lower of the two wins.</div>
-          </div>
-          <div class="fact">
-            <div class="n">MIT</div>
-            <div class="l">Open source</div>
-            <div class="d">Free, with no account. Rust on the PC, Swift on the iPad.</div>
-          </div>
-        </div>
+        <dl class="facts reveal">
+          <div class="fact"><dt>Up to</dt><dd class="n">120<small>fps*</small></dd></div>
+          <div class="fact"><dt>Adaptive bitrate</dt><dd class="n">4–50<small>Mbps</small></dd></div>
+          <div class="fact"><dt>Open source</dt><dd class="n">Free<small>MIT</small></dd></div>
+        </dl>
+        <p class="footnote">*On iPads with ProMotion. The lower of the PC's and the iPad's frame rate wins.</p>
       </div>
     </section>
 
