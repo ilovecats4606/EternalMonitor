@@ -208,6 +208,17 @@ impl Drop for Uploader {
         let Ok(receiver) = self.receiver.lock() else {
             return;
         };
+        if !enabled() {
+            // Sharing was turned off during the stalled request. Clear what
+            // is pending, as the thread does.
+            if let Ok(paths) = files(&self.directory) {
+                for path in paths {
+                    let _ = fs::remove_file(path);
+                }
+            }
+            while receiver.try_recv().is_ok() {}
+            return;
+        }
         let events: Vec<Event> = receiver
             .try_iter()
             .filter(|line| line != WAKE)
@@ -584,7 +595,17 @@ mod tests {
         directory
     }
 
+    /// The sharing setting is process-wide. Tests that need it on hold this;
+    /// a test that turns it off holds it exclusively.
+    static SHARING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+    fn sharing_on() -> std::sync::RwLockReadGuard<'static, ()> {
+        SHARING
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn quit_waits(delay: Duration) -> (Duration, PathBuf) {
+        let _sharing = sharing_on();
         let directory = outbox_with_batches(8);
         let config = Config {
             endpoint: slow_server(delay),
@@ -647,6 +668,7 @@ mod tests {
 
     #[test]
     fn quitting_near_the_deadline_keeps_every_drained_event() {
+        let _sharing = sharing_on();
         let directory = outbox_with_batches(1);
         let config = Config {
             endpoint: slow_server(Duration::from_millis(1700)),
@@ -674,6 +696,37 @@ mod tests {
             .count();
         assert_eq!(kept, 10, "{messages:?}");
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn quitting_with_sharing_off_during_a_stalled_upload_keeps_nothing() {
+        let _sharing = SHARING
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let directory = outbox_with_batches(1);
+        let (sender, receiver) = mpsc::sync_channel(256);
+        sender
+            .send("2026-10-21T17:11:31Z  INFO last line".into())
+            .unwrap();
+        // The request in flight never finishes, so the quit wait runs out.
+        let (_request, done) = mpsc::channel();
+        let uploader = Uploader {
+            stop: std::sync::Arc::new(AtomicBool::new(false)),
+            wake: sender,
+            receiver: std::sync::Arc::new(Mutex::new(receiver)),
+            directory: directory.clone(),
+            done,
+            thread: None,
+        };
+        ENABLED.store(false, Ordering::Relaxed);
+        drop(uploader);
+        ENABLED.store(true, Ordering::Relaxed);
+        assert!(
+            files(&directory).unwrap().is_empty(),
+            "{:?}",
+            outbox_messages(&directory)
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
