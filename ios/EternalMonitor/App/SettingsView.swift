@@ -244,7 +244,7 @@ struct SettingsView: View {
                     } header: {
                         sectionHeader("About")
                     } footer: {
-                        footnote("Built by Sideband Studio. Set in Geist.")
+                        footnote("Built by Sideband Studio.")
                     }
                     .listRowBackground(Theme.surfaceRaised)
                     .id("about")
