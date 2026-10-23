@@ -171,6 +171,36 @@ final class GoodbyeTests: XCTestCase {
         XCTAssertTrue(manager.isIdleOnConnect)
     }
 
+    /// A PC too old for this app turns it down. Its error says to update the
+    /// PC, so a pending update popup (which points to TestFlight) waits until
+    /// the error is dismissed.
+    func testAVersionMismatchErrorKeepsTheUpdatePopupAway() async throws {
+        let suite = "GoodbyeTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let manifest = Data(#"{"schema":1,"ipad":{"version":"9.9.9","build":999}}"#.utf8)
+        let updates = UpdateChecker(defaults: defaults, source: .injected(manifest),
+                                    installed: InstalledApp(version: "0.3.1", build: 166))
+        updates.checkIfDue()
+        XCTAssertNotNil(updates.popup, "an update is pending")
+
+        let host = FakeUDPHost()
+        let manager = ConnectionManager()
+        defer { manager.cancel() }
+        manager.connect(host: "127.0.0.1", port: host.port)
+        let answered = await Task.detached { host.acceptSession(status: .versionUnsupported, acceptedVersion: 1) }.value
+        XCTAssertTrue(answered, "the iPad never sent HELLO2")
+        try await until("turned down") { manager.state == .disconnected && manager.connectionError != nil }
+        XCTAssertEqual(manager.versionMismatch, .pcOlder)
+        XCTAssertTrue(manager.connectionError?.contains("click Update now on the PC") == true, manager.connectionError ?? "")
+        XCTAssertNil(manager.problem)
+        XCTAssertFalse(manager.isIdleOnConnect && updates.popup != nil, "the popup must not cover the error")
+
+        // The user dismisses the error (ConnectView's close button).
+        manager.connectionError = nil
+        XCTAssertTrue(manager.isIdleOnConnect && updates.popup != nil, "then the popup shows")
+    }
+
     /// Disconnected from the PC's side: the iPad stays away.
     func testAPCDisconnectingTheIPadStaysDisconnected() async throws {
         let host = FakeUDPHost()
