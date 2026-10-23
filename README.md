@@ -271,7 +271,7 @@ described in [SECURITY.md](SECURITY.md).
 
 ## License
 
-EternalMonitor is released under the [MIT License](LICENSE), © 2026 Ali Younes.
+EternalMonitor is released under the [MIT License](LICENSE), © 2026 Sideband Studio.
 The Windows installer also ships third-party components under their own licenses,
 including the [Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)
 and FFmpeg.
