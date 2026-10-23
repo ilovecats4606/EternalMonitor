@@ -37,9 +37,16 @@ pub trait PenApi {
     /// Send mouse input for the fallback. Returns how many of the events,
     /// from the first, Windows inserted.
     fn send_mouse(&mut self, inputs: &[Injection]) -> usize;
+    /// Keep a release the fallback still owes as its device goes, at the
+    /// desktop pixel the pointer was last sent to: Windows holds the left
+    /// button across a pipeline restart, so the next device must send it.
+    fn owe_release(&mut self, at: (i32, i32));
+    /// A release an earlier device left owed, for a new device to send.
+    fn take_owed_release(&mut self) -> Option<(i32, i32)>;
 }
 
 /// One device per relay, retained across samples and destroyed at shutdown.
+/// A mouse release it still owes then passes to the next device.
 #[derive(Debug)]
 pub struct PenDevice<A: PenApi> {
     slot: Slot<A>,
@@ -203,6 +210,7 @@ impl<A: PenApi> PenTarget for Target<'_, A> {
 
 impl<A: PenApi> PenDevice<A> {
     pub fn new(api: A) -> Self {
+        let now = Instant::now();
         let mut slot = Slot {
             api,
             handle: None,
@@ -211,13 +219,20 @@ impl<A: PenApi> PenDevice<A> {
             #[cfg(test)]
             reported: Vec::new(),
         };
-        slot.create(Instant::now());
-        Self {
+        slot.create(now);
+        let mut device = Self {
             slot,
             contact: PenContact::default(),
             mouse: Mouse::default(),
             hovering: false,
+        };
+        // Windows still holds the button if the last device went with its
+        // release refused: it is released before any new input.
+        if let Some(at) = device.slot.api.take_owed_release() {
+            (device.mouse.pressed, device.mouse.at) = (true, at);
+            device.drop_mouse_input("reset", now);
         }
+        device
     }
 
     pub fn available(&self) -> bool {
@@ -522,6 +537,9 @@ impl<A: PenApi> PenDevice<A> {
 impl<A: PenApi> Drop for PenDevice<A> {
     fn drop(&mut self) {
         self.slot.destroy();
+        if self.mouse.pressed {
+            self.slot.api.owe_release(self.mouse.at);
+        }
     }
 }
 
@@ -555,6 +573,9 @@ mod tests {
         button: bool,
         /// The virtual screen, which can change while input waits.
         screen: VirtualScreen,
+        /// A release a dropped device left owed, where Windows keeps it for
+        /// the next device's Windows.
+        owed: std::rc::Rc<std::cell::Cell<Option<(i32, i32)>>>,
     }
 
     impl FakeApi {
@@ -570,6 +591,7 @@ mod tests {
                 mouse: Vec::new(),
                 button: false,
                 screen: SCREEN,
+                owed: Default::default(),
             }
         }
     }
@@ -639,6 +661,14 @@ mod tests {
 
         fn send_mouse(&mut self, inputs: &[Injection]) -> usize {
             self.record_mouse(inputs)
+        }
+
+        fn owe_release(&mut self, at: (i32, i32)) {
+            self.owed.set(Some(at));
+        }
+
+        fn take_owed_release(&mut self) -> Option<(i32, i32)> {
+            self.owed.take()
         }
     }
 
@@ -1311,6 +1341,52 @@ mod tests {
         assert!(!device.slot.api.button);
     }
 
+    #[test]
+    fn a_release_refused_as_the_pipeline_stops_is_sent_by_the_next_device() {
+        // Sol's case: a stroke on the mouse holds the button, SendInput
+        // refuses everything, and the pipeline restarts before a retry
+        // succeeds: the relay resets and drops its device. Windows still
+        // holds the button, so the next pipeline's device must release it
+        // before any new input, on a refresh tick or ahead of a sample.
+        let (x10, y10) = abs(10, 1);
+        let (x20, y20) = abs(20, 2);
+        for ticked in [true, false] {
+            let mut device = PenDevice::new(FakeApi::new(&[false]));
+            let start = Instant::now();
+            deliver_one(&mut device, pen_xy(PenPhase::Down, 10, 1), start);
+            device.slot.api.mouse_limit = 0;
+            reset_one(&mut device, start);
+            // Windows outlives the device.
+            let (held, owed) = (
+                device.slot.api.button,
+                std::rc::Rc::clone(&device.slot.api.owed),
+            );
+            assert!(held);
+            drop(device);
+            let mut windows = FakeApi::new(&[false]);
+            (windows.button, windows.owed) = (held, owed);
+            let mut device = PenDevice::new(windows);
+            // With no device, the transport ticks for the release alone.
+            assert!(!device.available() && device.mouse_waiting());
+            let later = start + Duration::from_millis(50);
+            let mut mouse = Vec::new();
+            if ticked {
+                mouse.extend(tick_at(&mut device, later));
+            }
+            deliver_one(&mut device, pen_xy(PenPhase::Down, 20, 2), later);
+            mouse.extend(std::mem::take(&mut device.slot.api.mouse));
+            assert_eq!(
+                mouse,
+                [
+                    Injection::LeftUp { x: x10, y: y10 },
+                    Injection::MoveAbs { x: x20, y: y20 },
+                    Injection::LeftDown { x: x20, y: y20 },
+                ],
+                "ticked: {ticked}"
+            );
+        }
+    }
+
     /// What reached Windows, in order, for the random streams.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Seen {
@@ -1439,6 +1515,13 @@ mod tests {
 
         fn send_mouse(&mut self, inputs: &[Injection]) -> usize {
             self.record_mouse(inputs)
+        }
+
+        // Each stream's Windows goes with its device.
+        fn owe_release(&mut self, _: (i32, i32)) {}
+
+        fn take_owed_release(&mut self) -> Option<(i32, i32)> {
+            None
         }
     }
 
