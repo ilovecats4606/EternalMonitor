@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use eternal_updater::quote_arg;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
@@ -522,6 +523,8 @@ fn start_install(setup: &Path, release: &Release) -> Result<(), UpdateError> {
         installer: setup.to_path_buf(),
         sha256: release.sha256.clone(),
         app,
+        // The listen port, if one was given, survives the restart.
+        app_args: std::env::args_os().skip(1).collect(),
         host_pid: std::process::id(),
         log: dir.join("update.log"),
     };
@@ -588,33 +591,6 @@ pub fn helper_command_line(helper: &Path, args: &eternal_updater::HelperArgs) ->
         line.push_str(&quote_arg(&arg.to_string_lossy()));
     }
     line
-}
-
-/// Quotes one argument for the Windows CRT's command-line parser.
-fn quote_arg(arg: &str) -> String {
-    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
-        return arg.to_string();
-    }
-    let mut out = String::from("\"");
-    let mut backslashes = 0;
-    for c in arg.chars() {
-        match c {
-            '\\' => backslashes += 1,
-            '"' => {
-                out.push_str(&"\\".repeat(backslashes * 2 + 1));
-                out.push('"');
-                backslashes = 0;
-            }
-            _ => {
-                out.push_str(&"\\".repeat(backslashes));
-                out.push(c);
-                backslashes = 0;
-            }
-        }
-    }
-    out.push_str(&"\\".repeat(backslashes * 2));
-    out.push('"');
-    out
 }
 
 // ── State ───────────────────────────────────────────────────────────────────

@@ -307,11 +307,11 @@ pub fn image_id(process: &OwnedHandle) -> io::Result<FileId> {
     file_id(&image)
 }
 
-/// Starts `exe` from its own folder, inheriting no handles. Unlike
-/// `std::process::Command`, which passes on every inheritable handle.
-pub fn start(exe: &Path) -> io::Result<()> {
-    let command_line = format!("\"{}\"", exe.display());
-    start_suspended(exe, &command_line, 0, None)?
+/// Starts `exe` from its own folder with `command_line` (program name first),
+/// inheriting no handles. Unlike `std::process::Command`, which passes on
+/// every inheritable handle.
+pub fn start(exe: &Path, command_line: &str) -> io::Result<()> {
+    start_suspended(exe, command_line, 0, None)?
         .resume()
         .map(drop)
 }

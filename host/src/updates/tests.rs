@@ -761,6 +761,7 @@ fn helper_arguments_survive_windows_quoting() {
         ),
         sha256: "0".repeat(64),
         app: PathBuf::from(r"C:\Program Files\EternalMonitor\EternalMonitor-host.exe"),
+        app_args: Vec::new(),
         host_pid: 42,
         log: PathBuf::from(r"C:\Users\A B\x\"),
     };
