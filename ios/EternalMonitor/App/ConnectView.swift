@@ -16,6 +16,9 @@ struct ConnectView: View {
     @State private var showQRScanner = false
     @State private var showDetails = false
     @State private var feedbackRequest: FeedbackRequest?
+    /// Send feedback was tapped and its sheet is on the way (Mail first
+    /// collects diagnostics). Nothing else may open meanwhile.
+    @State private var preparingFeedback = false
     @AppStorage("didSeeOnboarding") private var didSeeOnboarding = false
     @FocusState private var focusedField: Field?
     @Environment(\.horizontalSizeClass) private var sizeClass
@@ -132,7 +135,7 @@ struct ConnectView: View {
                 // copy sheet) or next to the feedback ask.
                 UpdatePopup(allowed: connectionManager.state == .disconnected && focusedField == nil
                     && !showSettings && !showQRScanner && connectionManager.pairingPrompt == nil
-                    && feedbackRequest == nil && !showsFeedbackAsk)
+                    && feedbackRequest == nil && !preparingFeedback && !showsFeedbackAsk)
             }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -355,7 +358,15 @@ struct ConnectView: View {
     /// Mail with the details and diagnostics, or the copy sheet.
     private func startFeedback(_ kind: Feedback.Kind) {
         let context = connectionManager.feedbackContext
-        Task { feedbackRequest = await FeedbackRequest.make(kind, context: context) }
+        preparingFeedback = true
+        Task {
+            // Cleared in the same turn the sheet is set, or if this ends early.
+            defer { preparingFeedback = false }
+            #if DEBUG
+            await UIPreview.feedbackPreparation()
+            #endif
+            feedbackRequest = await FeedbackRequest.make(kind, context: context)
+        }
     }
 
     private func openAppSettings() {

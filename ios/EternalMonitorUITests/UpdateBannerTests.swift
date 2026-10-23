@@ -81,6 +81,29 @@ final class UpdateBannerTests: XCTestCase {
         later.tap()
     }
 
+    /// Between Send feedback and its sheet (Mail collects diagnostics first)
+    /// the ask is gone and the sheet isn't up yet: the popup still waits.
+    func testFeedbackPreparationKeepsThePopupAway() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-checkForUpdates", "YES",
+                               "-updateDismissedBuild", "0", "-updatePopupClosedBuild", "0",
+                               "-feedbackLongSessions", "3", "-feedbackAskDone", "NO"]
+        app.launchEnvironment["EM_UPDATE_MANIFEST"] = manifest
+        app.launchEnvironment["EM_FEEDBACK_PREPARE_MS"] = "4000"
+        app.launch()
+        let send = app.buttons["feedback.askSend"]
+        XCTAssertTrue(send.waitForExistence(timeout: 10))
+        send.tap()
+        let later = app.buttons["updatePopup.later"]
+        let done = app.buttons["feedback.done"]
+        XCTAssertFalse(later.waitForExistence(timeout: 3), "not while the feedback sheet is on its way")
+        XCTAssertTrue(done.waitForExistence(timeout: 15))
+        XCTAssertFalse(later.exists, "not over the feedback sheet")
+        done.tap()
+        XCTAssertTrue(later.waitForExistence(timeout: 10), "shows once the sheet closes")
+        later.tap()
+    }
+
     /// The feedback sheet (Mail, or the copy sheet without Mail) on its own.
     func testFeedbackSheetComesBeforeThePopup() {
         let app = XCUIApplication()

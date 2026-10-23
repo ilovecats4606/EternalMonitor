@@ -16,6 +16,13 @@ enum UIPreview {
     static var scrollsToAbout: Bool { mode == "settings-about" }
     /// Taps Send feedback. Simulators have no Mail, so this shows the copy sheet.
     static var opensFeedback: Bool { mode == "feedback" }
+    /// `EM_FEEDBACK_PREPARE_MS` stretches the wait before the feedback sheet,
+    /// as collecting diagnostics for Mail can on a real iPad.
+    static func feedbackPreparation() async {
+        if let ms = Int(ProcessInfo.processInfo.environment["EM_FEEDBACK_PREPARE_MS"] ?? "") {
+            try? await Task.sleep(for: .milliseconds(ms))
+        }
+    }
     /// The Bonjour error every search fails with.
     static var searchErrorCode: Int? {
         switch mode {
