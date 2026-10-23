@@ -15,6 +15,8 @@ pub fn join_parent_console() {
         };
         let redirected = GetStdHandle(STD_OUTPUT_HANDLE)
             .is_ok_and(|output| [FILE_TYPE_DISK, FILE_TYPE_PIPE].contains(&GetFileType(output)));
+        // Redirected runs don't attach: on the test runner's console, Stop-Host's
+        // Ctrl+C would reach the runner too. A headless one gets its own console.
         if !redirected {
             keeping_std_handles(|| AttachConsole(ATTACH_PARENT_PROCESS));
         }

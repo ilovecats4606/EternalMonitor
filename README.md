@@ -160,7 +160,10 @@ cargo build --release -p eternal-host
 
 The host is a Windows GUI program, so it opens no console window. Started
 from a terminal it prints its log there, but the prompt returns at once;
-`cargo run -p eternal-host` waits for it.
+`cargo run -p eternal-host` waits for it. With `ETERNAL_HEADLESS=1` and output
+redirected (`> host.log`) it gets its own console, so Ctrl+C in the terminal
+can't reach it: press Ctrl+C in that console's window, or use Task Manager.
+`scripts\win\Stop-Host.ps1` stops only hosts that `remote.sh run-host` started.
 
 `scripts\build-installer.ps1` builds the full Setup.exe with Inno Setup and the
 same `FFMPEG_DIR`. `scripts\package.ps1` builds a bare zip.
