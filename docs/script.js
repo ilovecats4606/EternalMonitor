@@ -69,6 +69,9 @@
     var full = { mp4: film.getAttribute('data-full-mp4'), webm: film.getAttribute('data-full-webm') };
     var wantsPlay = !reducedMotion;
     var inView = false;
+    // Without JS the film keeps its native controls; with JS the buttons
+    // below take over until the full version brings them back.
+    film.removeAttribute('controls');
 
     var setSources = function (src) {
       while (film.firstChild) film.removeChild(film.firstChild);
@@ -117,7 +120,8 @@
       });
     }
     if (fullBtn && full.mp4) {
-      fullBtn.addEventListener('click', function () {
+      fullBtn.addEventListener('click', function (event) {
+        event.preventDefault();
         film.pause();
         film.loop = false;
         film.setAttribute('controls', '');

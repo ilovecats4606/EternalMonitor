@@ -372,6 +372,9 @@ small { font-size: 0.875rem; }
 .film-controls .btn:hover { background: rgba(26, 26, 29, 0.9); }
 .film-controls .btn svg { width: 14px; height: 14px; }
 .film-stage.has-controls .film-controls { display: none; }
+/* Without JS the video's own controls play it; only the full-version link stays. */
+.no-js #film-play { display: none; }
+.no-js .film-controls { position: static; justify-content: flex-end; margin-top: 10px; }
 @media (max-width: 720px) {
   .film-controls { position: static; justify-content: flex-end; margin-top: 10px; }
   .film-controls .btn { background: var(--raised); -webkit-backdrop-filter: none; backdrop-filter: none; }

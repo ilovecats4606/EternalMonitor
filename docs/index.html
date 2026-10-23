@@ -86,7 +86,7 @@
         <figure class="film">
           <div class="film-stage">
           <div class="film-frame">
-            <video id="film" muted playsinline loop preload="none"
+            <video id="film" controls muted playsinline loop preload="none"
                    poster="assets/film-poster.jpg"
                    width="1920" height="1080"
                    aria-label="EternalMonitor in use: the Windows app shows its address, pairing code and QR code; in a real session recorded in the iPad Simulator, the iPad app connects, takes the six-digit code and shows the live stream with its own connection measurements; the Windows app switches between Mirror my screen and Second screen"
@@ -94,6 +94,7 @@
                    data-full-mp4="assets/film-full.mp4" data-full-webm="assets/film-full.webm">
               <source src="assets/film-loop.mp4" type="video/mp4">
               <source src="assets/film-loop.webm" type="video/webm">
+              <a href="assets/film-full.mp4">Download the video (MP4)</a>
             </video>
           </div>
             <div class="film-controls">
@@ -102,7 +103,7 @@
                 <svg class="ico-pause" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" hidden><path d="M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z"/></svg>
                 <span class="label">Play</span>
               </button>
-              <button type="button" class="btn btn-secondary" id="film-full">Watch the full version</button>
+              <a href="assets/film-full.mp4" class="btn btn-secondary" id="film-full">Watch the full version</a>
             </div>
           </div>
           <figcaption class="film-caption caption">
