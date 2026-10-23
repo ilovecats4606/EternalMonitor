@@ -51,8 +51,7 @@ impl AnalyzerApp {
     /// Update, restart and fault notices, most urgent first.
     fn notices(&mut self, ui: &mut Ui, snap: &StatsSnapshot) {
         let capture_block = *self.control.shared.capture_block.lock();
-        if let Some(block) = capture_block {
-            let (title, body) = capture_block_notice(block);
+        if let Some((title, body)) = capture_block_notice(capture_block, snap.pipeline_running) {
             widgets::banner(ui, WARNING, Icon::Warning, title, body, 0.0, |_| {});
             ui.add_space(GAP - 10.0);
         }
@@ -701,9 +700,16 @@ pub(super) fn usb_cable_notice(
 }
 
 /// The Stream page notice while Windows withholds the screen: what is going
-/// on and what to do. Capture keeps retrying meanwhile.
-pub(super) fn capture_block_notice(block: CaptureBlock) -> (&'static str, &'static str) {
-    match block {
+/// on and what to do. Capture keeps retrying meanwhile. A stopped stream
+/// retries nothing, so it shows none.
+pub(super) fn capture_block_notice(
+    block: Option<CaptureBlock>,
+    running: bool,
+) -> Option<(&'static str, &'static str)> {
+    if !running {
+        return None;
+    }
+    Some(match block? {
         CaptureBlock::SecureDesktop => (
             "Windows is showing the lock screen or a permission prompt",
             "Windows hides the screen from other apps while it does. Unlock the PC or answer the prompt, and the picture comes back by itself.",
@@ -724,7 +730,7 @@ pub(super) fn capture_block_notice(block: CaptureBlock) -> (&'static str, &'stat
             "This Windows session is disconnected",
             "Windows stops screen capture while the session is disconnected, for example during Remote Desktop or after switching users. Sign in to this account at the PC itself, and the picture comes back by itself.",
         ),
-    }
+    })
 }
 
 /// What the USB row says. The Apple Devices hint appears only when Apple's
