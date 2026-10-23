@@ -237,8 +237,9 @@ final class RelayTouchUIView: UIView {
     private func pictureMoved() {
         holdTimer?.cancel()
         holdTimer = nil
+        // Keep tracking a cancelled tip until it lifts: its samples send
+        // nothing more, and palms that land meanwhile are still rejected.
         onEvents?(pointer.ended(at: nil) + pencil.cancel())
-        pencilTouch = nil
         run(machine.threeFingerTap(timeUs: ControlChannel.clientNowUs()).filter {
             if case .toggleHUD = $0 { return false }; return true
         })
@@ -325,7 +326,7 @@ final class RelayTouchUIView: UIView {
         }
         for touch in touches {
             if touch.type == .pencil && (nativePenSupported || drawingMode) { continue }
-            if touch.type != .indirectPointer && (drawingMode || pencil.isDown || ignoredTouches.contains(touch)) {
+            if touch.type != .indirectPointer && (drawingMode || pencilTouch != nil || ignoredTouches.contains(touch)) {
                 ignoredTouches.insert(touch)
                 continue
             }

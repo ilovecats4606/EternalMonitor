@@ -314,6 +314,46 @@ final class PencilRelayTests: XCTestCase {
         }
     }
 
+    /// A switch cancels the stroke, but the tip is still on the glass: a palm
+    /// that lands before it lifts must still be ignored, not click the PC.
+    func testPalmsStayIgnoredUntilACancelledTipLifts() {
+        for change in ["fill", "rotation", "resolution"] {
+            let view = iPadAirRelay()
+            view.nativePenSupported = true
+            var events: [WireInputEvent] = []
+            view.onEvents = { events += $0 }
+            let tip = TestTouch(.pencil)
+            tip.position = CGPoint(x: 10, y: 410)
+            view.touchesBegan([tip], with: nil)
+            switch change {
+            case "fill": view.pictureFit = .fill
+            case "rotation":
+                view.frame.size = CGSize(width: 820, height: 1180)
+                view.layoutIfNeeded()
+            default: view.videoSize = CGSize(width: 2560, height: 1080)
+            }
+            XCTAssertEqual(events.map(\.phase), [0, 3], change)
+            let palm = TestTouch(.direct)
+            palm.point = CGPoint(x: 400, y: 600)
+            view.touchesBegan([palm], with: nil)
+            palm.point = CGPoint(x: 500, y: 600)
+            view.touchesMoved([palm], with: nil)
+            view.touchesEnded([palm], with: nil)
+            tip.sampleTime = 2
+            view.touchesMoved([tip], with: nil)
+            view.touchesEnded([tip], with: nil)
+            XCTAssertEqual(events.map(\.phase), [0, 3], "\(change): \(events.dropFirst(2))")
+            // Once the tip is up, a finger is a finger again. (400, 600) is on
+            // the picture in both orientations.
+            let finger = TestTouch(.direct)
+            finger.point = CGPoint(x: 400, y: 600)
+            view.touchesBegan([finger], with: nil)
+            view.touchesEnded([finger], with: nil)
+            XCTAssertEqual(events.dropFirst(2).map(\.phase), [0, 2], change)
+            XCTAssertEqual(events.dropFirst(2).map(\.kind), [0, 0], change)
+        }
+    }
+
     func testATwoFingerScrollAcrossASwitchStops() {
         let view = iPadAirRelay()
         var events: [WireInputEvent] = []
