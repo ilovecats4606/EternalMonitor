@@ -801,7 +801,8 @@ small { font-size: 0.875rem; }
   transition: border-color 0.15s ease-out, box-shadow 0.15s ease-out;
 }
 .field textarea { resize: vertical; min-height: 110px; }
-.field input::placeholder, .field textarea::placeholder { color: #6f6f78; }
+/* 6.2:1 on the field; still dimmer than typed text. */
+.field input::placeholder, .field textarea::placeholder { color: var(--faint); opacity: 1; }
 .field input:focus-visible, .field textarea:focus-visible, .field select:focus-visible {
   outline: none;
   border-color: var(--accent);
