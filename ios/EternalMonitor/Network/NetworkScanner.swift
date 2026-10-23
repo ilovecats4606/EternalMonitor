@@ -40,8 +40,9 @@ final class NetworkScanner: NSObject, ObservableObject {
     private let browser = NetServiceBrowser()
     private var resolvingServices: [String: NetService] = [:]
     /// Services whose IPv4 address is being looked up by host name, each
-    /// with the lookup whose answer still counts. A removed service or a new
-    /// scan drops its entry, so a late answer can't list that PC again.
+    /// with the lookup whose answer still counts. A removed service, a new
+    /// scan or a newer address drops its entry, so a late answer can't list
+    /// that PC again or replace the address it has now.
     private var ipv4Lookups: [String: UUID] = [:]
     /// Looks up a host name's IPv4 address off the main actor. Tests replace
     /// it to answer late.
@@ -194,6 +195,8 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
     /// that already has an address.
     func merge(_ host: DiscoveredHost) {
         if host.address == nil, hosts.contains(where: { $0.name == host.name && $0.address != nil }) { return }
+        // A lookup still running would answer with an older address.
+        if host.address != nil { ipv4Lookups.removeValue(forKey: host.name) }
         hosts.removeAll { $0.name == host.name || (host.address != nil && $0.address == host.address) }
         hosts.append(host)
         // Resolve the local subnet ONCE per sort — the old comparator called

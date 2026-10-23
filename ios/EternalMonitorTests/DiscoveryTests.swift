@@ -129,6 +129,29 @@ final class DiscoveryTests: XCTestCase {
         XCTAssertFalse(scanner.hosts.contains { $0.name == "PC" })
     }
 
+    /// Sol's sequence: a lookup starts, Bonjour then answers with IPv4
+    /// directly, and the lookup's older answer arrives last.
+    func testADirectIPv4AnswerBeatsAnOlderLookup() async throws {
+        let lookup = HeldLookup()
+        let scanner = NetworkScanner()
+        scanner.resolveIPv4 = { lookup.resolve($0) }
+        let service = HeldService(name: "PC", hostName: "studio.local.")
+        scanner.netServiceBrowser(NetServiceBrowser(), didFind: service, moreComing: false)
+        try await Task.sleep(for: .milliseconds(100))
+        service.addresses = [ipv6("fe80::1")]
+        scanner.netServiceDidResolveAddress(service)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(scanner.hosts.map(\.address), [nil])
+
+        service.addresses = [ipv6("fe80::1"), ipv4("192.168.1.21")]
+        scanner.netServiceDidResolveAddress(service)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(scanner.hosts.map(\.address), ["192.168.1.21"])
+        lookup.answer("192.168.1.20")
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(scanner.hosts.map(\.address), ["192.168.1.21"], "a tap must reach the current address")
+    }
+
     func testSavedPCsStayVisibleUnlessDiscoveryListsTheSameOne() {
         let saved = [
             RecentConnection(host: "192.168.1.20", port: 9876, lastUsed: .now, isUSB: false),
