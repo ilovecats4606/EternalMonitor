@@ -43,18 +43,16 @@ struct SettingsView: View {
                             rowLabel("Keep screen awake", "sun.max")
                         }
 
-                        HStack {
+                        // A menu, like Frame rate: a segmented control in a
+                        // scrolling list takes a flick that starts on it as a tap.
+                        Picker(selection: $settings.pictureFit) {
+                            Text("Fit").tag(PictureFit.fit)
+                            Text("Fill").tag(PictureFit.fill)
+                        } label: {
                             rowLabel("Picture", "aspectratio")
-                            Spacer()
-                            Picker("Picture", selection: $settings.pictureFit) {
-                                Text("Fit").tag(PictureFit.fit)
-                                Text("Fill").tag(PictureFit.fill)
-                            }
-                            .pickerStyle(.segmented)
-                            .labelsHidden()
-                            .frame(maxWidth: 160)
-                            .accessibilityIdentifier("settings.pictureFit")
                         }
+                        .accessibilityIdentifier("settings.pictureFit")
+                        .accessibilityValue(settings.pictureFit == .fit ? "Fit" : "Fill")
                     } header: {
                         sectionHeader("Streaming")
                     } footer: {

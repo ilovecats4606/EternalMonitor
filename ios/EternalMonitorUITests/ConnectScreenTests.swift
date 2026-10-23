@@ -62,6 +62,50 @@ final class ConnectScreenTests: XCTestCase {
         waitForExpectations(timeout: 5)
     }
 
+    /// A flick or drag that starts on the Picture row scrolls Settings and
+    /// leaves the choice alone; only choosing from its menu changes it.
+    func testScrollingFromThePictureRowKeepsTheChoice() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-pictureFit", "fit"]
+        app.launch()
+        let settings = app.buttons["settings.button"]
+        XCTAssertTrue(settings.waitForExistence(timeout: 10))
+        let picture = app.buttons["settings.pictureFit"]
+        for gesture in ["drag", "swipe"] {
+            settings.tap()
+            XCTAssertTrue(picture.waitForExistence(timeout: 5), gesture)
+            XCTAssertEqual(picture.value as? String, "Fit", gesture)
+            let top = picture.frame.minY
+            // Start over the value, where the old segmented control's Fill sat.
+            let start = picture.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5))
+            if gesture == "drag" {
+                start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -300)),
+                            withVelocity: .slow, thenHoldForDuration: 0.3)
+            } else {
+                start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -300)),
+                            withVelocity: .fast, thenHoldForDuration: 0)
+            }
+            XCTAssertTrue(!picture.exists || picture.frame.minY < top - 100, "the \(gesture) did not scroll Settings")
+            XCTAssertFalse(app.buttons["Fill"].exists, "the \(gesture) opened the Picture menu")
+            app.buttons["settings.done"].tap()
+            XCTAssertTrue(settings.waitForExistence(timeout: 5))
+            settings.tap()
+            XCTAssertTrue(picture.waitForExistence(timeout: 5), gesture)
+            XCTAssertEqual(picture.value as? String, "Fit", "a \(gesture) that started on the Picture row changed it")
+            app.buttons["settings.done"].tap()
+        }
+        // The menu itself still works.
+        settings.tap()
+        XCTAssertTrue(picture.waitForExistence(timeout: 5))
+        picture.tap()
+        app.buttons["Fill"].tap()
+        XCTAssertEqual(picture.value as? String, "Fill")
+        picture.tap()
+        app.buttons["Fit"].tap()
+        XCTAssertEqual(picture.value as? String, "Fit")
+        app.buttons["settings.done"].tap()
+    }
+
     /// The pairing code typed into Address is caught at once, instead of
     /// being read as a numeric address that never answers.
     func testPairingCodeAsAddressIsExplainedAtOnce() {
