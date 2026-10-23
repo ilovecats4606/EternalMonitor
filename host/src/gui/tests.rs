@@ -477,3 +477,44 @@ fn feedback_details_leave_out_names_and_addresses() {
     );
     assert!(body(Kind::Idea, "", Some(&idle)).contains("Setup: Mirror, no iPad connected"));
 }
+
+/// A session counts as nearby, and so does one that ended less than the
+/// quiet period ago, so a reconnecting iPad never flashes the popup.
+#[test]
+fn the_update_popup_waits_until_no_ipad_has_been_connected_for_a_while() {
+    use super::update_banner::{ipad_nearby, POPUP_QUIET};
+    assert!(POPUP_QUIET >= Duration::from_secs(15) && POPUP_QUIET <= Duration::from_secs(30));
+    let quiet = Duration::from_secs(20);
+    let start = Instant::now();
+    let mut last = None;
+    assert!(
+        !ipad_nearby(false, &mut last, start, quiet),
+        "never connected"
+    );
+    assert!(ipad_nearby(true, &mut last, start, quiet));
+    // Three drops and reconnects, a few seconds apart.
+    for cycle in 1..=3u64 {
+        let lost = start + Duration::from_secs(5 * cycle);
+        assert!(ipad_nearby(true, &mut last, lost, quiet));
+        assert!(ipad_nearby(
+            false,
+            &mut last,
+            lost + Duration::from_millis(1),
+            quiet
+        ));
+        assert!(ipad_nearby(
+            false,
+            &mut last,
+            lost + Duration::from_secs(3),
+            quiet
+        ));
+    }
+    let gone = start + Duration::from_secs(15);
+    assert!(ipad_nearby(
+        false,
+        &mut last,
+        gone + quiet - Duration::from_millis(1),
+        quiet
+    ));
+    assert!(!ipad_nearby(false, &mut last, gone + quiet, quiet));
+}

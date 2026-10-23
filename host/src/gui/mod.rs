@@ -285,6 +285,9 @@ pub struct AnalyzerApp {
     updates: crate::updates::Updater,
     /// The update popup is on screen; it stays until a button is chosen.
     update_popup_open: bool,
+    /// When an iPad last had a session, for the popup's quiet period.
+    ipad_last_seen: Option<Instant>,
+    popup_quiet: Duration,
     /// "Your iPad app is out of date" was dismissed for this run.
     ipad_notice_dismissed: bool,
     settings_packet_size: u32,
@@ -424,6 +427,8 @@ impl AnalyzerApp {
             settings_check_updates: persisted.check_for_updates,
             updates,
             update_popup_open: false,
+            ipad_last_seen: None,
+            popup_quiet: popup_quiet(),
             ipad_notice_dismissed: false,
             settings_packet_size: control.shared.max_dgram.load(Ordering::SeqCst),
             control,
@@ -768,9 +773,23 @@ impl eframe::App for AnalyzerApp {
         if self.show_qr_modal {
             self.draw_qr_modal(&ctx, &snap);
         }
-        self.update_popup(&ctx, &snap, &client);
+        self.update_popup(&ctx, &client);
         self.draw_feedback_panel(&ctx, &client);
     }
+}
+
+/// [`update_banner::POPUP_QUIET`]. Debug builds only:
+/// `ETERNAL_UPDATE_POPUP_QUIET_MS` shortens it for the GUI tests.
+fn popup_quiet() -> Duration {
+    if cfg!(debug_assertions) {
+        if let Some(ms) = std::env::var("ETERNAL_UPDATE_POPUP_QUIET_MS")
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+        {
+            return Duration::from_millis(ms);
+        }
+    }
+    update_banner::POPUP_QUIET
 }
 
 // ── Sidebar ─────────────────────────────────────────────────────────────────

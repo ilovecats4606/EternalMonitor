@@ -2,6 +2,8 @@
 //! Settings, and the notices shown when an iPad cannot connect because of a
 //! version difference or runs an older app.
 
+use std::time::{Duration, Instant};
+
 use eframe::egui::{self, vec2, Color32, Frame, Margin, Rect, Sense, Stroke, Ui};
 
 use super::icons::{self, Icon};
@@ -19,6 +21,27 @@ pub(super) fn popup_hint(installs_in_place: bool) -> &'static str {
     }
 }
 
+/// How long no iPad must have been connected before the popup may open. A
+/// dropped iPad reconnects by itself: its first try comes 1 s later, its
+/// second about 15 s later (1 s backoff, a 12 s connect window, 2 s backoff).
+/// 20 s outlasts both, so a reconnect loop never flashes the popup.
+pub(super) const POPUP_QUIET: Duration = Duration::from_secs(20);
+
+/// Whether an iPad is connected, or was less than `quiet` ago. `last` is when
+/// one was last seen; updated here every frame.
+pub(super) fn ipad_nearby(
+    connected: bool,
+    last: &mut Option<Instant>,
+    now: Instant,
+    quiet: Duration,
+) -> bool {
+    if connected {
+        *last = Some(now);
+        return true;
+    }
+    last.is_some_and(|at| now.saturating_duration_since(at) < quiet)
+}
+
 /// What the update popup does this frame, given what else is going on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PopupGate {
@@ -30,8 +53,8 @@ pub(super) enum PopupGate {
 }
 
 impl PopupGate {
-    /// `connected`: an iPad is streaming, so this window may be in its
-    /// picture. `other`: another dialog or ask is up. Either hides an open
+    /// `connected`: an iPad is connected or just was, so this window may be
+    /// in its picture. `other`: another dialog or ask is up. Either hides an open
     /// popup; at most one dialog shows at a time.
     pub(super) fn of(
         open: bool,
@@ -179,25 +202,25 @@ impl AnalyzerApp {
     }
 
     /// A small card over the window, once per version and then at most every
-    /// three days (see `updates::State::popup`). It waits while an iPad is
-    /// connected, since this window may be on the screen the iPad shows, and
+    /// three days (see `updates::State::popup`). It waits while an iPad has a
+    /// session, even while the stream restarts, and for [`POPUP_QUIET`] after,
+    /// since this window may be on the screen the iPad shows. It also waits
     /// while the QR code, Send feedback, the feedback ask or a menu is open.
     /// It opens only on the Stream page, between clicks and while nobody
     /// types. The banner offers the update meanwhile.
-    pub(super) fn update_popup(
-        &mut self,
-        ctx: &egui::Context,
-        snap: &StatsSnapshot,
-        client: &ClientSnapshot,
-    ) {
+    pub(super) fn update_popup(&mut self, ctx: &egui::Context, client: &ClientSnapshot) {
+        // A session outlives capture and encoder restarts, a display change
+        // and the second screen attaching, while the pipeline is briefly off.
+        let connected = ipad_nearby(
+            client.info.is_some(),
+            &mut self.ipad_last_seen,
+            Instant::now(),
+            self.popup_quiet,
+        );
         let Some(popup) = self.updates.popup() else {
             self.update_popup_open = false;
             return;
         };
-        let connected = matches!(
-            StreamState::of(snap, client),
-            StreamState::Streaming | StreamState::Paused
-        );
         let other = self.show_qr_modal
             || self.feedback.is_some()
             || self.feedback_ask.due(client.info.is_some())

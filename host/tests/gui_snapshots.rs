@@ -35,6 +35,38 @@ impl ConfigSource for Fixture {
     }
 }
 
+const POPUP_QUIET_MS: u64 = 3000;
+
+fn popup_shown(harness: &Harness<'_, AnalyzerApp>) -> bool {
+    harness
+        .query_by_role_and_label(Role::Dialog, "Update ready")
+        .is_some()
+}
+
+/// The popup opens once no iPad has been connected for the quiet period.
+fn wait_for_popup(harness: &mut Harness<'_, AnalyzerApp>) {
+    let deadline = Instant::now() + std::time::Duration::from_millis(POPUP_QUIET_MS + 7000);
+    while !popup_shown(harness) {
+        assert!(Instant::now() < deadline, "the popup never opened");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        harness.run_steps(1);
+    }
+    harness.run_steps(4);
+}
+
+/// Draws frames for `millis` and checks the popup stays closed in each.
+fn no_popup_for(harness: &mut Harness<'_, AnalyzerApp>, millis: u64, why: &str) {
+    let end = Instant::now() + std::time::Duration::from_millis(millis);
+    loop {
+        harness.run_steps(1);
+        assert!(!popup_shown(harness), "{why}");
+        if Instant::now() >= end {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 fn snapshot(harness: &mut Harness<'_, AnalyzerApp>, shared: &SharedControl, name: &str) {
     harness.run_steps(4);
     mask_pairing_code(harness, shared);
@@ -62,6 +94,8 @@ fn fixture() -> (std::path::PathBuf, SharedControl) {
     std::fs::create_dir_all(dir.join("EternalMonitor")).unwrap();
     // This integration test never touches the user's real settings.
     std::env::set_var("APPDATA", &dir);
+    // The popup's quiet period after an iPad leaves, shortened from 20 s.
+    std::env::set_var("ETERNAL_UPDATE_POPUP_QUIET_MS", POPUP_QUIET_MS.to_string());
     SettingsFile {
         check_for_updates: false,
         ..Default::default()
@@ -377,7 +411,7 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
         .query_by_role_and_label(Role::Dialog, "Update ready")
         .is_none());
     harness.get_by_label("Close").click();
-    harness.run_steps(4);
+    wait_for_popup(&mut harness);
     {
         let popup = harness.get_by_role_and_label(Role::Dialog, "Update ready");
         popup.get_by_label("EternalMonitor 99.0.0 is ready");
@@ -394,7 +428,7 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
         .is_none());
     harness.get_by_label("EternalMonitor 99.0.0 is available");
     disconnect_ipad(&shared);
-    harness.run_steps(4);
+    wait_for_popup(&mut harness);
     harness
         .get_by_role_and_label(Role::Dialog, "Update ready")
         .get_by_label("Later")
@@ -503,10 +537,80 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     assert!(harness
         .query_by_label("Your iPad app is out of date")
         .is_none());
+    popup_waits_while_the_ipad_has_a_session(&shared, &dir, &mut results);
     disconnect_ipad(&shared);
     update_arrives_while_feedback_is_open(&shared, &dir, &mut results);
     std::fs::remove_dir_all(dir).unwrap();
     results.unwrap();
+}
+
+/// The session, not the pipeline, says whether an iPad is there: a capture
+/// or encoder restart, a display change or the second screen attaching stops
+/// the pipeline briefly while the iPad stays connected. A USB link that drops
+/// and comes back, again and again, never flashes the popup either.
+fn popup_waits_while_the_ipad_has_a_session(
+    shared: &SharedControl,
+    dir: &std::path::Path,
+    results: &mut SnapshotResults,
+) {
+    let checked_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    std::fs::write(
+        dir.join("EternalMonitor/update-state.json"),
+        serde_json::json!({
+            "checked_at": checked_at,
+            "latest": {
+                "version": "99.0.0",
+                "installer": "https://github.com/sidebandstudio/EternalMonitor/releases/download/v99.0.0/EternalMonitor-Setup.exe",
+                "sha256": "0".repeat(64),
+            },
+            "notified": "99.0.0",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    SettingsFile {
+        check_for_updates: true,
+        feedback_ask_done: true,
+        star_clicked: true,
+        ..Default::default()
+    }
+    .save();
+    connect_ipad(shared);
+    let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
+    window.get_by_label("EternalMonitor 99.0.0 is available");
+    no_popup_for(&mut window, 200, "the iPad is streaming");
+
+    // The pipeline restarts; the session stays. Longer than the quiet period.
+    PIPELINE_STATS.lock().pipeline_running = false;
+    no_popup_for(
+        &mut window,
+        POPUP_QUIET_MS + 1000,
+        "the iPad is still connected while the stream restarts",
+    );
+    PIPELINE_STATS.lock().pipeline_running = true;
+    no_popup_for(&mut window, 200, "the stream is back");
+
+    // Three USB drops, each followed by the iPad reconnecting.
+    for _ in 0..3 {
+        shared.session.lock().link_lost(PeerId::usb(7).link);
+        no_popup_for(&mut window, 300, "the iPad is reconnecting");
+        connect_ipad(shared);
+        no_popup_for(&mut window, 100, "the iPad reconnected");
+    }
+    // It stays away this time: the popup opens after the quiet period.
+    shared.session.lock().link_lost(PeerId::usb(7).link);
+    no_popup_for(&mut window, 500, "too soon after the iPad left");
+    wait_for_popup(&mut window);
+    window
+        .get_by_role_and_label(Role::Dialog, "Update ready")
+        .get_by_label("Later")
+        .click();
+    window.run_steps(4);
+    connect_ipad(shared);
+    results.extend_harness(&mut window);
 }
 
 /// A check that finds an update while Send feedback is open on Stream, with
