@@ -74,6 +74,9 @@ struct TaskGate {
     health: VddTaskHealth,
     /// When a task last timed out, and whether it was the Enable task.
     stuck: Option<(Instant, bool)>,
+    /// An Enable timed out and may still be running. It can add the monitor
+    /// after a Disable that did not wait for it to end.
+    enable_pending: bool,
 }
 
 #[cfg_attr(not(windows), allow(dead_code))] // Driver tasks exist only on Windows.
@@ -83,6 +86,7 @@ impl TaskGate {
             known_enabled: None,
             health: VddTaskHealth::Ok,
             stuck: None,
+            enable_pending: false,
         }
     }
 
@@ -110,13 +114,16 @@ impl TaskGate {
         self.known_enabled = None;
         match outcome {
             TaskOutcome::Done => {
+                // A Disable waits for a pending Enable to end before it runs.
                 self.known_enabled = Some(enabled);
                 self.health = VddTaskHealth::Ok;
                 self.stuck = None;
+                self.enable_pending = false;
             }
             TaskOutcome::TimedOut => {
                 self.health = VddTaskHealth::NotResponding;
                 self.stuck = Some((now, enabled));
+                self.enable_pending |= enabled;
             }
             TaskOutcome::Missing => self.health = VddTaskHealth::TasksMissing,
             TaskOutcome::Failed => {}
@@ -155,7 +162,7 @@ impl DriverTasks {
         &self,
         enabled: bool,
         mut progress: impl FnMut(),
-        run: impl FnOnce(bool, &mut dyn FnMut()) -> TaskOutcome,
+        run: impl FnOnce(bool, bool, &mut dyn FnMut()) -> TaskOutcome,
     ) -> bool {
         let _serial = loop {
             if let Some(guard) = self.serial.try_lock_for(Duration::from_millis(50)) {
@@ -166,7 +173,13 @@ impl DriverTasks {
         // The gate guard ends with this statement. Logging below reads the
         // health through the same mutex, which deadlocked when the guard
         // lived through the whole match.
-        let decision = self.gate.lock().before(enabled, Instant::now());
+        let (decision, after_enable) = {
+            let gate = self.gate.lock();
+            (
+                gate.before(enabled, Instant::now()),
+                !enabled && gate.enable_pending,
+            )
+        };
         match decision {
             Gate::AlreadyDone => return true,
             Gate::Refuse => {
@@ -175,7 +188,7 @@ impl DriverTasks {
             }
             Gate::Run => {}
         }
-        let outcome = run(enabled, &mut progress);
+        let outcome = run(enabled, after_enable, &mut progress);
         self.gate.lock().after(enabled, outcome, Instant::now());
         outcome == TaskOutcome::Done
     }
@@ -187,12 +200,18 @@ pub const TASK_DISABLE: &str = "EternalMonitor VDD Disable";
 
 /// Trigger a pre-registered scheduled task by name. Returns true on success. Missing tasks
 /// (e.g. a build installed without the VDD feature) just log a warning and return false —
-/// the caller falls back to the primary display.
+/// the caller falls back to the primary display. With `after`, the run first
+/// waits for a running instance of that task to end.
 #[cfg(windows)]
-fn run_task(task: &str, progress: &mut dyn FnMut()) -> TaskOutcome {
+fn run_task(task: &str, after: Option<&str>, progress: &mut dyn FnMut()) -> TaskOutcome {
     use std::os::windows::process::CommandExt;
     let started = Instant::now();
-    let script = format!("& {{ {} }} -Task '{}'", include_str!("vdd_task.ps1"), task);
+    let script = format!(
+        "& {{ {} }} -Task '{}' -After '{}'",
+        include_str!("vdd_task.ps1"),
+        task,
+        after.unwrap_or_default()
+    );
     let mut command = Command::new("powershell.exe");
     command
         .args([
@@ -263,8 +282,12 @@ fn run_task(task: &str, progress: &mut dyn FnMut()) -> TaskOutcome {
 pub(crate) fn set_enabled(enabled: bool, progress: impl FnMut()) -> bool {
     #[cfg(windows)]
     {
-        TASKS.set_enabled(enabled, progress, |enabled, progress| {
-            run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress)
+        TASKS.set_enabled(enabled, progress, |enabled, after_enable, progress| {
+            run_task(
+                if enabled { TASK_ENABLE } else { TASK_DISABLE },
+                after_enable.then_some(TASK_ENABLE),
+                progress,
+            )
         })
     }
     #[cfg(not(windows))]
@@ -335,7 +358,7 @@ mod tests {
         assert!(!tasks.set_enabled(
             true,
             || {},
-            |_, _| {
+            |_, _, _| {
                 display_on.set(true);
                 TaskOutcome::TimedOut
             }
@@ -344,13 +367,54 @@ mod tests {
         let disabled = tasks.set_enabled(
             false,
             || {},
-            |enabled, _| {
+            |enabled, _, _| {
                 display_on.set(enabled);
                 TaskOutcome::Done
             },
         );
         assert!(disabled, "the Disable task was refused");
         assert!(!display_on.get(), "the monitor stayed after exit");
+    }
+
+    #[test]
+    fn an_enable_the_host_gave_up_on_cannot_undo_the_disable_at_quit() {
+        use std::cell::Cell;
+        let tasks = DriverTasks::new();
+        let display_on = Cell::new(false);
+        // The Enable task keeps running after the host stops waiting, and
+        // adds the monitor when it ends.
+        let enable_running = Cell::new(false);
+        let enable_ends = || {
+            if enable_running.replace(false) {
+                display_on.set(true);
+            }
+        };
+        assert!(!tasks.set_enabled(
+            true,
+            || {},
+            |_, _, _| {
+                enable_running.set(true);
+                TaskOutcome::TimedOut
+            }
+        ));
+        assert!(tasks.set_enabled(
+            false,
+            || {},
+            |enabled, after_enable, _| {
+                // vdd_task.ps1 -After waits for the Enable task to end.
+                if after_enable {
+                    enable_ends();
+                }
+                display_on.set(enabled);
+                TaskOutcome::Done
+            }
+        ));
+        // The host has quit by the time anything still running ends.
+        enable_ends();
+        assert!(
+            !display_on.get(),
+            "a late Enable added the monitor after quit"
+        );
     }
 
     #[test]
@@ -379,7 +443,7 @@ mod tests {
                 .with_writer(std::io::sink)
                 .finish();
             let ran = tracing::subscriber::with_default(subscriber, || {
-                tasks.set_enabled(true, || {}, |_, _| panic!("a refused task must not run"))
+                tasks.set_enabled(true, || {}, |_, _, _| panic!("a refused task must not run"))
             });
             let _ = done_tx.send(ran);
         });
@@ -400,7 +464,7 @@ mod tests {
         assert!(tasks.set_enabled(
             false,
             || {},
-            |e, _| {
+            |e, _, _| {
                 record(&runs, e);
                 TaskOutcome::Done
             }
@@ -414,7 +478,7 @@ mod tests {
                 tasks.set_enabled(
                     true,
                     || {},
-                    |e, _| {
+                    |e, _, _| {
                         record(&runs, e);
                         started_tx.send(()).unwrap();
                         release_rx.recv().unwrap();
@@ -435,7 +499,7 @@ mod tests {
                     || {
                         let _ = waiting_tx.send(());
                     },
-                    |e, _| {
+                    |e, _, _| {
                         record(&runs, e);
                         TaskOutcome::Done
                     },

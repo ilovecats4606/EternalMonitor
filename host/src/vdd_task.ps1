@@ -1,4 +1,4 @@
-param([string]$Task)
+param([string]$Task, [string]$After)
 $ErrorActionPreference = 'Stop'
 try {
     $service = New-Object -ComObject Schedule.Service
@@ -12,6 +12,16 @@ try {
         if ((Get-Date) -gt $deadline) { throw "Previous VDD task timed out: $Task" }
         Start-Sleep -Milliseconds 50
         $registered = $service.GetFolder('\').GetTask($Task)
+    }
+    # The host stopped waiting for an earlier run of $After, which can still
+    # finish. A Disable that ran first would be undone when the Enable ends.
+    if ($After) {
+        $earlier = $service.GetFolder('\').GetTask($After)
+        while ($earlier.State -in @(2,4)) {
+            if ((Get-Date) -gt $deadline) { throw "Previous VDD task timed out: $After" }
+            Start-Sleep -Milliseconds 50
+            $earlier = $service.GetFolder('\').GetTask($After)
+        }
     }
     if (!$registered.Enabled -or !$registered.Definition.Settings.AllowDemandStart) {
         throw "VDD task cannot be started: $Task"
