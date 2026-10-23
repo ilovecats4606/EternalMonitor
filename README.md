@@ -121,21 +121,10 @@ to do about each one.
 
 ## How it works
 
-```mermaid
-flowchart RL
-  subgraph pc [Windows PC]
-    direction TB
-    capture[Desktop capture] --> encode[GPU encoder]
-    inject[Input injection]
-  end
-  subgraph ipad [iPad]
-    direction TB
-    repair[Reassembly and repair] --> decode[VideoToolbox decode] --> show[Metal display]
-    touch[Touch, keyboard, Pencil]
-  end
-  pc -- "video and audio over Wi-Fi or USB" --> ipad
-  ipad -- "input and repair requests" --> pc
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/how-it-works-dark.svg">
+  <img src="docs/assets/readme/how-it-works-light.svg" width="1280" alt="The Windows PC captures the desktop, encodes it on the GPU and sends video and audio over Wi-Fi or USB. The iPad reassembles and repairs the stream, decodes it with VideoToolbox and shows it with Metal. Touch, keyboard and Pencil input and repair requests travel back to the PC, which injects the input.">
+</picture>
 
 The Windows host is written in Rust. It captures the desktop with DXGI, encodes on
 the GPU through FFmpeg, and sends each frame as numbered UDP fragments. Over USB
