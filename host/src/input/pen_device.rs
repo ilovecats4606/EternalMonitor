@@ -416,7 +416,8 @@ impl<A: PenApi> PenDevice<A> {
         for waiting in self.mouse.waiting.drain(..inserted) {
             match waiting.event {
                 MouseEvent::Move => self.mouse.at = at(&waiting),
-                MouseEvent::Press => self.mouse.pressed = true,
+                // A press carries its position, so it moves the pointer too.
+                MouseEvent::Press => (self.mouse.at, self.mouse.pressed) = (at(&waiting), true),
                 MouseEvent::Release => self.mouse.pressed = false,
             }
         }
@@ -1144,6 +1145,51 @@ mod tests {
             ]
         );
         assert!(!device.slot.api.button);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_press_retried_apart_from_its_move_lands_where_the_pencil_touched() {
+        // Sol's case: SendInput inserts only the move of a tap's down, and
+        // the physical mouse moves the cursor before the press is retried.
+        use windows::Win32::UI::Input::KeyboardAndMouse::{MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_MOVE};
+        let mut device = PenDevice::new(FakeApi::new(&[false]));
+        let now = Instant::now();
+        device.slot.api.mouse_limit = 1;
+        deliver_one(&mut device, pen_xy(PenPhase::Down, 10, 1), now);
+        let first = std::mem::take(&mut device.slot.api.mouse);
+        device.slot.api.mouse_limit = usize::MAX;
+        let retried = tick_at(&mut device, now);
+        let (x, y) = abs(10, 1);
+        assert_eq!(first, [Injection::MoveAbs { x, y }]);
+        // SendInput as Windows applies it: a mouse event's coordinates move
+        // the cursor only with MOUSEEVENTF_MOVE, and a press lands where the
+        // cursor is.
+        let apply = |batch: &[Injection], cursor: &mut (i32, i32)| {
+            let mut inputs = Vec::new();
+            for &injection in batch {
+                super::super::windows_inject::push_input(&mut inputs, injection);
+            }
+            let mut pressed = None;
+            for input in &inputs {
+                let mouse = unsafe { input.Anonymous.mi };
+                if mouse.dwFlags.0 & MOUSEEVENTF_MOVE.0 != 0 {
+                    *cursor = (mouse.dx, mouse.dy);
+                }
+                if mouse.dwFlags.0 & MOUSEEVENTF_LEFTDOWN.0 != 0 {
+                    pressed = Some(*cursor);
+                }
+            }
+            pressed
+        };
+        let mut cursor = (0, 0);
+        assert_eq!(apply(&first, &mut cursor), None);
+        // The physical mouse moves the cursor before the retry.
+        cursor = (40_000, 40_000);
+        assert_eq!(
+            apply(&retried, &mut cursor),
+            Some((i32::from(x), i32::from(y)))
+        );
     }
 
     #[test]

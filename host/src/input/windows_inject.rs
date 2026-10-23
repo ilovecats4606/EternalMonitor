@@ -330,7 +330,7 @@ pub(crate) fn inject(
     }
 }
 
-fn push_input(inputs: &mut Vec<INPUT>, injection: Injection) {
+pub(super) fn push_input(inputs: &mut Vec<INPUT>, injection: Injection) {
     let input = match injection {
         Injection::Pen(_) => unreachable!("pen samples go through PenDevice::deliver"),
         Injection::KeyDown { scan, extended } | Injection::KeyUp { scan, extended } => {
@@ -353,8 +353,14 @@ fn push_input(inputs: &mut Vec<INPUT>, injection: Injection) {
             i32::from(y),
             0,
         ),
+        // Without MOUSEEVENTF_MOVE Windows ignores the position and presses
+        // wherever the cursor is: a fallback press retried after SendInput
+        // inserted only its move would follow the physical mouse.
         Injection::LeftDown { x, y } => mouse_input(
-            MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            MOUSEEVENTF_MOVE
+                | MOUSEEVENTF_LEFTDOWN
+                | MOUSEEVENTF_ABSOLUTE
+                | MOUSEEVENTF_VIRTUALDESK,
             i32::from(x),
             i32::from(y),
             0,
