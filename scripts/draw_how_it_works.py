@@ -73,13 +73,13 @@ THEMES = {
         "faint": "#63636B",
         "video": "#5C6B00",
         "video_rail": "rgba(92,107,0,0.40)",
-        "audio": "#5C6B00",
+        "audio": "#7C8F00",
         "input": "#71717A",
         "video_pill": "#E8FF47",
         "video_pill_stroke": "rgba(0,0,0,0.12)",
         "video_pill_text": "#0C0D04",
         "audio_pill": "#FFFFFF",
-        "audio_pill_stroke": "#5C6B00",
+        "audio_pill_stroke": "#7C8F00",
         "audio_pill_text": "#3F4A00",
         "chip": "#FFFFFF",
         "chip_stroke": "rgba(0,0,0,0.14)",
@@ -151,18 +151,18 @@ PC_ROWS = [
     ("video", "Encode", "On the GPU, through FFmpeg", VIDEO_ROWS[1]),
     ("video", "Send", "Numbered fragments", VIDEO_ROWS[2]),
     ("audio", "Capture audio", "WASAPI loopback, encoded as Opus", AUDIO_ROW),
-    ("input", "Inject input", "Touch, keys and Pencil on Windows", INPUT_ROW),
+    ("input", "Inject input", "Mouse, keys and pen input on Windows", INPUT_ROW),
 ]
 IPAD_ROWS = [
     ("video", "Reassemble and repair", "Rebuilds frames from fragments", VIDEO_ROWS[0]),
     ("video", "Decode", "In hardware with VideoToolbox", VIDEO_ROWS[1]),
     ("video", "Display", "Drawn with Metal", VIDEO_ROWS[2]),
     ("audio", "Play audio", "Opus decoded to AVAudioEngine", AUDIO_ROW),
-    ("input", "Input", "Touch, keyboard and Apple Pencil", INPUT_ROW),
+    ("input", "Input", "Touch, Pencil, keyboard, trackpad", INPUT_ROW),
 ]
 
 SCREEN_Y, SCREEN_H = 108, 408
-PC = {"x": 40, "y": 96, "w": 410, "h": 448, "screen": (52, SCREEN_Y, 386, SCREEN_H)}
+PC = {"x": 40, "y": 94, "w": 410, "h": 450, "screen": (52, SCREEN_Y, 386, SCREEN_H)}
 IPAD = {"x": 670, "y": 94, "w": 410, "h": 436, "screen": (684, SCREEN_Y, 382, SCREEN_H)}
 LEFT, RIGHT = PC["x"] + PC["w"], IPAD["x"]
 MID = (LEFT + RIGHT) / 2
@@ -303,8 +303,8 @@ ALT = (
     "The Windows PC captures the desktop, encodes the video on the GPU and sends it "
     "over Wi-Fi or USB. The iPad reassembles the video, asking for missing fragments "
     "on Wi-Fi, decodes it with VideoToolbox and shows it with Metal. PC audio is "
-    "captured with WASAPI, encoded as Opus and played on the iPad. Touch, keyboard "
-    "and Pencil input travels back to the PC, which injects it."
+    "captured with WASAPI, encoded as Opus and played on the iPad. Touch, Pencil, "
+    "keyboard and trackpad input travels back to the PC, which injects it."
 )
 
 

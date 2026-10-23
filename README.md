@@ -123,16 +123,18 @@ to do about each one.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/how-it-works-dark.svg">
-  <img src="docs/assets/readme/how-it-works-light.svg" width="1120" alt="The Windows PC captures the desktop, encodes the video on the GPU and sends it over Wi-Fi or USB. The iPad reassembles the video, asking for missing fragments on Wi-Fi, decodes it with VideoToolbox and shows it with Metal. PC audio is captured with WASAPI, encoded as Opus and played on the iPad. Touch, keyboard and Pencil input travels back to the PC, which injects it.">
+  <img src="docs/assets/readme/how-it-works-light.svg" width="1120" alt="The Windows PC captures the desktop, encodes the video on the GPU and sends it over Wi-Fi or USB. The iPad reassembles the video, asking for missing fragments on Wi-Fi, decodes it with VideoToolbox and shows it with Metal. PC audio is captured with WASAPI, encoded as Opus and played on the iPad. Touch, Pencil, keyboard and trackpad input travels back to the PC, which injects it.">
 </picture>
 
 The Windows host is written in Rust. It captures the desktop with DXGI, encodes on
 the GPU through FFmpeg, and sends each frame as numbered UDP fragments. Over USB
 the same messages travel through a framed tunnel that Apple's device service
-provides. The iPad app is native Swift. It reassembles fragments, requests any
-that are missing, decodes with VideoToolbox and renders with Metal. Input and
-receiver reports go back on the same session, and the host uses those reports
-to adapt the bitrate.
+provides. The iPad app is native Swift. It reassembles fragments, decodes with
+VideoToolbox and renders with Metal. On Wi-Fi it also requests any fragments
+that are missing. PC audio is captured with WASAPI and sent as Opus, and the
+iPad conceals lost audio instead of requesting it again. Input and receiver
+reports go back on the same session, and the host uses those reports to adapt
+the bitrate.
 
 [ARCHITECTURE.md](ARCHITECTURE.md) describes the pipeline and protocol v2, and
 [docs/decisions.md](docs/decisions.md) explains why each part works the way it
