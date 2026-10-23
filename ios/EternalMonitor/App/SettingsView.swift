@@ -224,7 +224,7 @@ struct SettingsView: View {
                             }
                         }
                         .padding(.vertical, 4)
-                        creditLink("Developer", "github.com/whoisaldo", symbol: "person", url: "https://github.com/whoisaldo")
+                        creditLink("Developer", "Sideband Studio", symbol: "building.2", url: "https://sideband.studio")
                         creditLink("Source code", "EternalMonitor", symbol: "chevron.left.forwardslash.chevron.right", url: "https://github.com/sidebandstudio/EternalMonitor")
                         creditLink("Star EternalMonitor on GitHub", "GitHub", symbol: "star", url: Feedback.repoURL)
                             .accessibilityIdentifier("settings.star")
@@ -232,7 +232,7 @@ struct SettingsView: View {
                     } header: {
                         sectionHeader("About")
                     } footer: {
-                        footnote("Built by Ali Younes (@whoisaldo). Set in Geist.")
+                        footnote("Built by Sideband Studio. Set in Geist.")
                     }
                     .listRowBackground(Theme.surfaceRaised)
                     .id("about")
