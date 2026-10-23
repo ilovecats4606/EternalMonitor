@@ -104,9 +104,10 @@ final class ConnectionManager: ObservableObject {
     @Published private(set) var reconnectAttempt = 0
 
     /// Settled on the Connect screen: no attempt under way, no reconnect
-    /// cycle waiting between attempts, and no problem card.
+    /// cycle waiting between attempts, and no problem card or error. An
+    /// error such as a version mismatch says what to do, so it stays in view.
     var isIdleOnConnect: Bool {
-        state == .disconnected && problem == nil && reconnectAttempt == 0
+        state == .disconnected && problem == nil && connectionError == nil && reconnectAttempt == 0
     }
     /// Decoded video dimensions in pixels — the touch relay maps gestures
     /// through the same aspect-fit rect the renderer draws.
