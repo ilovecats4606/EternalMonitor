@@ -58,6 +58,43 @@ final class DiscoveryTests: XCTestCase {
         XCTAssertTrue(ConnectView.discoveredSubtitle(gaveUp).contains("Type the Address"))
     }
 
+    /// A slow IPv4 lookup can't bring back a PC that left the network, or
+    /// replace the address a newer scan found.
+    func testALateIPv4LookupCannotBringBackOrOverwriteAPC() async throws {
+        let lookup = HeldLookup()
+        let scanner = NetworkScanner()
+        scanner.resolveIPv4 = { lookup.resolve($0) }
+        // A lookup still wanted gives its PC the address.
+        let other = DiscoveredHost.resolved(name: "Other", port: 9876, addresses: [ipv6("fe80::2")])
+        scanner.merge(other)
+        scanner.lookUpIPv4(hostName: "other.local.", service: other)
+        lookup.answer("192.168.1.30")
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(scanner.hosts.map(\.address), ["192.168.1.30"])
+
+        // The PC leaves the network while its lookup runs.
+        let found = DiscoveredHost.resolved(name: "PC", port: 9876, addresses: [ipv6("fe80::1")])
+        scanner.merge(found)
+        scanner.lookUpIPv4(hostName: "studio.local.", service: found)
+        scanner.netServiceBrowser(NetServiceBrowser(),
+            didRemove: NetService(domain: "local.", type: "_eternaldisplay._udp.", name: "PC"), moreComing: false)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(scanner.hosts.map(\.name), ["Other"])
+        lookup.answer("192.168.1.20")
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(scanner.hosts.map(\.name), ["Other"], "a PC that left must not come back")
+
+        // A new scan finds the PC at a newer address before an older lookup answers.
+        scanner.merge(found)
+        scanner.lookUpIPv4(hostName: "studio.local.", service: found)
+        scanner.startScan()
+        defer { scanner.stopScan() }
+        scanner.merge(DiscoveredHost(name: "PC", address: "192.168.1.21", port: 9876))
+        lookup.answer("192.168.1.20")
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(scanner.hosts.map(\.address), ["192.168.1.21"])
+    }
+
     func testSavedPCsStayVisibleUnlessDiscoveryListsTheSameOne() {
         let saved = [
             RecentConnection(host: "192.168.1.20", port: 9876, lastUsed: .now, isUSB: false),
@@ -77,5 +114,22 @@ final class DiscoveryTests: XCTestCase {
         // A PC still being found matches nothing.
         let finding = [DiscoveredHost(name: "PC", address: nil, port: 9876, finding: true)]
         XCTAssertEqual(RecentConnection.unlisted(saved, discovered: finding).count, 3)
+    }
+}
+
+/// A host-name lookup that answers when the test says so, as a slow
+/// multicast DNS reply would. One lookup runs at a time.
+private final class HeldLookup: @unchecked Sendable {
+    private let answered = DispatchSemaphore(value: 0)
+    private var address: String?
+
+    func resolve(_ hostName: String) -> String? {
+        answered.wait()
+        return address
+    }
+
+    func answer(_ address: String) {
+        self.address = address
+        answered.signal()
     }
 }

@@ -39,8 +39,13 @@ final class NetworkScanner: NSObject, ObservableObject {
 
     private let browser = NetServiceBrowser()
     private var resolvingServices: [String: NetService] = [:]
-    /// Services whose IPv4 address is being looked up by host name.
-    private var ipv4Lookups: Set<String> = []
+    /// Services whose IPv4 address is being looked up by host name, each
+    /// with the lookup whose answer still counts. A removed service or a new
+    /// scan drops its entry, so a late answer can't list that PC again.
+    private var ipv4Lookups: [String: UUID] = [:]
+    /// Looks up a host name's IPv4 address off the main actor. Tests replace
+    /// it to answer late.
+    var resolveIPv4: @Sendable (String) -> String? = { NetworkScanner.ipv4Address(hostName: $0) }
     private var scanTask: Task<Void, Never>?
     // track auto-retry state so we don't bounce forever when discovery is broken.
     private var didAutoRetry = false
@@ -61,6 +66,7 @@ final class NetworkScanner: NSObject, ObservableObject {
         searchBlocked = false
         hosts = []
         resolvingServices.removeAll()
+        ipv4Lookups.removeAll()
         statusMessage = "Looking for PCs…"
 
         browser.searchForServices(ofType: "_eternaldisplay._udp.", inDomain: "local.")
@@ -85,7 +91,7 @@ final class NetworkScanner: NSObject, ObservableObject {
         scanTask?.cancel()
         scanTask = nil
         isScanning = false
-        for index in hosts.indices where hosts[index].address == nil && !ipv4Lookups.contains(hosts[index].name) {
+        for index in hosts.indices where hosts[index].address == nil && ipv4Lookups[hosts[index].name] == nil {
             hosts[index].finding = false
         }
 
@@ -138,6 +144,7 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
         Task { @MainActor in
             let key = Self.serviceKey(service)
             resolvingServices.removeValue(forKey: key)
+            ipv4Lookups.removeValue(forKey: service.name)
             hosts.removeAll { $0.name == service.name }
 
             if !moreComing {
@@ -192,12 +199,16 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
         statusMessage = "Found \(hosts.count) PC\(hosts.count == 1 ? "" : "s")"
     }
 
-    private func lookUpIPv4(hostName: String, service: DiscoveredHost) {
-        guard ipv4Lookups.insert(service.name).inserted else { return }
+    func lookUpIPv4(hostName: String, service: DiscoveredHost) {
+        guard ipv4Lookups[service.name] == nil else { return }
+        let lookup = UUID()
+        ipv4Lookups[service.name] = lookup
+        let resolve = resolveIPv4
         Task.detached {
-            let address = Self.ipv4Address(hostName: hostName)
+            let address = resolve(hostName)
             await MainActor.run {
-                self.ipv4Lookups.remove(service.name)
+                guard self.ipv4Lookups[service.name] == lookup else { return }
+                self.ipv4Lookups.removeValue(forKey: service.name)
                 if let address {
                     self.merge(DiscoveredHost(name: service.name, address: address, port: service.port))
                 } else if !self.isScanning, let index = self.hosts.firstIndex(where: { $0.name == service.name && $0.address == nil }) {
@@ -295,7 +306,7 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
     /// The resolve timed out or stopped. A PC that never gave an IPv4
     /// address, with no lookup left running, stops showing as being found.
     private func resolveEnded(name: String) {
-        guard !ipv4Lookups.contains(name),
+        guard ipv4Lookups[name] == nil,
               let index = hosts.firstIndex(where: { $0.name == name && $0.address == nil }) else { return }
         hosts[index].finding = false
     }
