@@ -190,6 +190,43 @@ fn github_release_must_publish_the_same_sha256_and_installer() {
     }
 }
 
+/// The release workflow publishes `.github/release-body.md` with the hash in
+/// it. People arriving from 0.3.0 and 0.3.1's "View release" read it, and
+/// this updater must still find the hash.
+#[test]
+fn the_published_release_body_carries_the_installer_hash() {
+    let template = include_str!("../../../.github/release-body.md");
+    assert_eq!(template.matches("{{SHA256}}").count(), 1);
+    // Get-FileHash prints uppercase hex, and a Windows checkout may use CRLF.
+    let body = template.replace("{{SHA256}}", &SHA.to_uppercase());
+    let release = release("0.3.2");
+    for body in [body.clone(), body.replace('\n', "\r\n")] {
+        assert_eq!(published_sha256(&body).as_deref(), Some(SHA));
+        let data = github(
+            "v0.3.2",
+            &body,
+            &release.installer,
+            9,
+            serde_json::json!({}),
+        );
+        assert_eq!(check_github_release(&data, &release), Ok(9));
+    }
+    // The label comes before any other 64-digit hex the page might show.
+    assert_eq!(template.matches("SHA-256").count(), 1);
+    assert!(template.contains("**EternalMonitor-Setup.exe SHA-256:**\n```\n{{SHA256}}\n```"));
+    for words in [
+        "**Recommended update.** Updating is highly recommended for everyone.",
+        "download **EternalMonitor-Setup.exe** below and run it",
+        "It installs over your current version and keeps your settings.",
+        "open TestFlight and tap **Update**",
+        "(https://eternalmonitor.dev/download.html)",
+        "RELEASE_NOTES.md",
+    ] {
+        assert!(template.contains(words), "{words}");
+    }
+    assert!(!template.contains("Protocol v2"), "stale v0.1.x note");
+}
+
 #[test]
 fn only_https_on_allowed_hosts_is_downloaded() {
     let endpoints = Endpoints::production();
