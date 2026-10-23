@@ -325,7 +325,7 @@ fn request(enabled: bool, purpose: Purpose, progress: impl FnMut()) -> bool {
     {
         TASKS.set_enabled(enabled, purpose, progress, |enabled, progress| {
             let mut outcome = TaskOutcome::Failed;
-            crate::startup::display::change(enabled, || {
+            crate::startup::display::change(enabled, progress, |progress| {
                 outcome = run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress);
                 outcome == TaskOutcome::Done
             });
