@@ -23,6 +23,7 @@ an iPad on 0.3.1 still works with the Windows changes.
   the host can't start or stops unexpectedly, it names the error and log file,
   and a helper process reports the crash and turns the second screen off.
   Opening EternalMonitor again brings the running window to the front.
+- EternalMonitor no longer opens a black console window next to the app.
 - A USB connection stays up when the stream restarts. Capture blocked by the
   lock screen or a display change retries by itself. A hung or missing display
   task no longer stalls the stream or leaves the second screen behind at quit.

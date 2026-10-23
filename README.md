@@ -158,6 +158,10 @@ cargo build --release -p eternal-host
 .\target\release\eternal-host.exe          # optional port argument, default 9876
 ```
 
+The host is a Windows GUI program, so it opens no console window. Started
+from a terminal it prints its log there, but the prompt returns at once;
+`cargo run -p eternal-host` waits for it.
+
 `scripts\build-installer.ps1` builds the full Setup.exe with Inno Setup and the
 same `FFMPEG_DIR`. `scripts\package.ps1` builds a bare zip.
 
