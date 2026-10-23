@@ -40,9 +40,11 @@ the MIT license, and needs no account.
 - **Touch, keyboard and pointer.** Tap to click, drag, scroll with two fingers and
   hold to right-click. Hardware keyboards, trackpads and mice work too, with
   sticky modifiers and middle-click.
-- **Apple Pencil as a real pen.** Windows receives Windows Ink pressure and tilt.
-  Drawing mode ignores your palm on the canvas, and Clip Studio Paint works with
-  its Tablet PC setting.
+- **Apple Pencil as a real pen.** Windows receives Windows Ink pressure and tilt,
+  and the pen lands under the tip on any monitor layout. Drawing mode ignores your
+  palm on the canvas, and Clip Studio Paint works with its Tablet PC setting.
+- **Fit or fill.** Fit shows the whole PC picture, with bars where the shapes
+  differ. Fill uses the iPad's entire screen and trims the edges that don't fit.
 - **PC audio.** Sound plays on the iPad as Opus, with a jitter buffer and loss
   concealment. You can mute it without stopping the video.
 - **Loss repair for real Wi-Fi.** When a packet goes missing, the iPad asks for
@@ -52,6 +54,14 @@ the MIT license, and needs no account.
   H.264 by default, or HEVC if you prefer it, at 30, 60, 90 or 120 fps.
 - **Pairing.** The first Wi-Fi connection asks for a six-digit code or a QR scan.
   After that the iPad remembers the PC. USB needs no code.
+- **Recovers and explains.** The picture comes back by itself after the lock
+  screen, a display change or a stream restart. When something does go wrong,
+  both apps say what happened and what to do, and **Send feedback** writes an
+  email to the studio with your setup filled in.
+- **Updates in one click.** A popup tells you when a new version is out. On
+  Windows, **Update now** checks the download and installs it with one Windows
+  prompt; the iPad app opens TestFlight. The Windows app runs without a console
+  window.
 
 <br clear="right">
 
