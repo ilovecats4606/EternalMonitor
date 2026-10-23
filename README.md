@@ -123,7 +123,7 @@ to do about each one.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/how-it-works-dark.svg">
-  <img src="docs/assets/readme/how-it-works-light.svg" width="1280" alt="The Windows PC captures the desktop, encodes it on the GPU and sends video and audio over Wi-Fi or USB. The iPad reassembles and repairs the stream, decodes it with VideoToolbox and shows it with Metal. Touch, keyboard and Pencil input and repair requests travel back to the PC, which injects the input.">
+  <img src="docs/assets/readme/how-it-works-light.svg" width="1120" alt="The Windows PC captures the desktop, encodes the video on the GPU and sends it over Wi-Fi or USB. The iPad reassembles the video, asking for missing fragments on Wi-Fi, decodes it with VideoToolbox and shows it with Metal. PC audio is captured with WASAPI, encoded as Opus and played on the iPad. Touch, keyboard and Pencil input travels back to the PC, which injects it.">
 </picture>
 
 The Windows host is written in Rust. It captures the desktop with DXGI, encodes on
