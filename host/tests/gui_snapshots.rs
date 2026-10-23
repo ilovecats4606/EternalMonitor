@@ -5,7 +5,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use eframe::egui::accesskit::Role;
-use egui_kittest::{kittest::Queryable, Harness};
+use egui_kittest::{kittest::Queryable, Harness, SnapshotResults};
 use eternal_host::capture::recovery::CaptureBlock;
 use eternal_host::control::{GuiControl, SharedControl, VddStatus};
 use eternal_host::gui::AnalyzerApp;
@@ -392,7 +392,266 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     report(&shared, 1_008_000, 2_010);
     harness.run_steps(4);
     harness.get_by_label("Poor");
+
+    // One set of snapshot results for every window this test opened.
+    let mut results = SnapshotResults::new();
+    results.extend_harness(&mut harness);
+    feedback_and_star(&shared, &dir, &mut results);
+    long_feedback_keeps_its_buttons_on_screen(&shared, &mut results);
     std::fs::remove_dir_all(dir).unwrap();
+    results.unwrap();
+}
+
+/// The text the last frame copied, if any.
+fn copied_text(harness: &Harness<'_, AnalyzerApp>) -> Option<String> {
+    harness
+        .output()
+        .platform_output
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        })
+}
+
+/// The link the last frame opened, if any.
+fn opened_url(harness: &Harness<'_, AnalyzerApp>) -> Option<String> {
+    harness
+        .output()
+        .platform_output
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            egui::OutputCommand::OpenUrl(open) => Some(open.url.clone()),
+            _ => None,
+        })
+}
+
+fn settings_file(dir: &std::path::Path) -> SettingsFile {
+    let text = std::fs::read_to_string(dir.join("EternalMonitor/settings.json")).unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
+/// A long message never pushes the dialog's buttons out of the window, at
+/// the smallest window size or the default one.
+fn long_feedback_keeps_its_buttons_on_screen(
+    shared: &SharedControl,
+    results: &mut SnapshotResults,
+) {
+    let message = (1..=35)
+        .map(|n| format!("Line {n}: the picture stutters when I drag a window."))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for (name, size) in [
+        ("feedback-panel-long-minimum", egui::vec2(820.0, 560.0)),
+        ("feedback-panel-long", egui::vec2(1040.0, 720.0)),
+    ] {
+        let mut window = harness(shared, size, 1.0);
+        nav(&mut window, "Settings");
+        window
+            .get_all_by_role_and_label(Role::Button, "Send feedback")
+            .next()
+            .expect("the sidebar button")
+            .click();
+        window.run_steps(4);
+        window.get_by_role(Role::MultilineTextInput).click();
+        window.run_steps(2);
+        window
+            .get_by_role(Role::MultilineTextInput)
+            .type_text(&message);
+        window.run_steps(6);
+        // The box keeps the caret in view as typing goes on.
+        window.get_by_role(Role::MultilineTextInput).type_text("!");
+        window.run_steps(6);
+        let typed = window
+            .get_by_role(Role::MultilineTextInput)
+            .value()
+            .unwrap_or_default();
+        assert_eq!(typed.lines().count(), 35, "{typed}");
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        for label in [
+            "Open in my email app",
+            "Copy message",
+            "Copy with logs",
+            "Close",
+        ] {
+            let rect = window.get_by_role_and_label(Role::Button, label).rect();
+            assert!(
+                screen.contains_rect(rect),
+                "{name}: {label} at {rect:?} is outside {screen:?}"
+            );
+        }
+        window.get_by_label("Tell us how it's going");
+        window.get_by_label("No email app? Write to").hover();
+        window.run_steps(4);
+        snapshot(&mut window, shared, name);
+        results.extend_harness(&mut window);
+    }
+}
+
+/// Send feedback, the one-time ask after three long sessions, and the GitHub
+/// star card in the sidebar.
+fn feedback_and_star(shared: &SharedControl, dir: &std::path::Path, results: &mut SnapshotResults) {
+    let size = egui::vec2(1040.0, 720.0);
+    let mut window = harness(shared, size, 1.0);
+    let star = window.get_by_role_and_label(Role::Button, "Enjoying EternalMonitor?");
+    // In the sidebar footer, above Send feedback.
+    let feedback = window.get_by_role_and_label(Role::Button, "Send feedback");
+    assert!(star.rect().right() <= 224.0 && star.rect().bottom() <= feedback.rect().top());
+    snapshot(&mut window, shared, "sidebar-star");
+    window
+        .get_by_role_and_label(Role::Button, "Enjoying EternalMonitor?")
+        .hover();
+    window.run_steps(20);
+    snapshot(&mut window, shared, "sidebar-star-hover");
+
+    // Settings has Send feedback next to Source code. The panel opens over
+    // Settings, where no random pairing code shows through.
+    nav(&mut window, "Settings");
+    let links: Vec<_> = window
+        .get_all_by_role_and_label(Role::Button, "Send feedback")
+        .collect();
+    assert_eq!(links.len(), 2);
+    window.get_by_label("Source code").scroll_to_me();
+    window.run_steps(4);
+    snapshot(&mut window, shared, "settings-about");
+
+    // The panel: kind, message, details and the ways to send.
+    window
+        .get_all_by_role_and_label(Role::Button, "Send feedback")
+        .find(|node| node.rect().left() > 224.0)
+        .expect("the Settings link")
+        .click();
+    window.run_steps(4);
+    window.get_by_label("Tell us how it's going");
+    window.get_by_label("SEND FEEDBACK");
+    window.get_by_label("Problem");
+    window.get_by_label("Idea");
+    window.get_by_label("No email app? Write to");
+    window.get_by_label_contains("To include logs, click Copy with logs");
+    window.get_by_label_contains("We're a small studio");
+    // The details say what is sent: the setup, never the iPad's name.
+    window.get_by_label_contains("Second screen, USB, iPad 2420 × 1668 at 120 Hz");
+    window.get_by_label("Something I like").click();
+    window.run_steps(4);
+    window.get_by_label("Thank you! Hearing what works keeps a small studio going.");
+    let text = window.get_by_role(Role::MultilineTextInput);
+    text.click();
+    window.run_steps(2);
+    window
+        .get_by_role(Role::MultilineTextInput)
+        .type_text("Drawing on the iPad in Krita feels great.");
+    window.get_by_label("No email app? Write to").hover();
+    window.run_steps(4);
+    snapshot(&mut window, shared, "feedback-panel");
+
+    window.get_by_label("Copy message").click();
+    window.step();
+    let copied = copied_text(&window).expect("Copy message copies");
+    assert!(copied.starts_with("To: hello@sideband.studio\nSubject: EternalMonitor 0.3.2 for Windows: Something I like"), "{copied}");
+    assert!(copied.contains("Drawing on the iPad in Krita feels great."));
+    assert!(copied.contains("Setup: Second screen, USB, iPad 2420 × 1668 at 120 Hz"));
+    assert!(!copied.contains("Test iPad Pro") && !copied.contains("192.0.2.10"));
+    window.run_steps(4);
+    window.get_by_label("Copied. Paste it into an email to hello@sideband.studio");
+    // Sending feedback any way means the one-time ask never shows.
+    assert!(settings_file(dir).feedback_ask_done);
+
+    window.get_by_label("Open in my email app").click();
+    window.step();
+    let url = opened_url(&window).expect("Open in my email app opens a mailto link");
+    assert!(
+        url.starts_with(
+            "mailto:hello@sideband.studio?subject=EternalMonitor%200.3.2%20for%20Windows"
+        ),
+        "{url}"
+    );
+    assert!(url.contains("Krita") && url.len() <= eternal_host::feedback::MAILTO_LIMIT);
+
+    // Without details, nothing about the PC or iPad goes in.
+    window
+        .get_by_role_and_label(Role::CheckBox, "Include app and PC details")
+        .click();
+    window.run_steps(4);
+    assert!(window.query_by_label_contains("iPad 2420").is_none());
+    window.get_by_label("Copy message").click();
+    window.step();
+    let copied = copied_text(&window).unwrap();
+    // The subject keeps the kind and version, for sorting mail.
+    assert!(
+        copied.contains("Subject: EternalMonitor 0.3.2 for Windows: Something I like"),
+        "{copied}"
+    );
+    assert!(
+        !copied.contains("iPad 2420") && !copied.contains("Setup:") && !copied.contains("App:"),
+        "{copied}"
+    );
+    // Copy with logs adds the session log after the message.
+    window.get_by_label("Copy with logs").click();
+    window.step();
+    let copied = copied_text(&window).unwrap();
+    assert!(copied.contains("Drawing on the iPad in Krita feels great."));
+    window.run_steps(4);
+    window.get_by_label_contains("Paste it into an email to hello@sideband.studio");
+    window.run_steps(4);
+    window.get_by_label("Close").click();
+    window.run_steps(4);
+    assert!(window.query_by_label("Tell us how it's going").is_none());
+
+    nav(&mut window, "Stream");
+
+    // One click opens the repository and thanks you, for good.
+    window
+        .get_by_role_and_label(Role::Button, "Enjoying EternalMonitor?")
+        .click();
+    window.step();
+    assert_eq!(
+        opened_url(&window).as_deref(),
+        Some("https://github.com/sidebandstudio/EternalMonitor")
+    );
+    window.run_steps(4);
+    window.get_by_role_and_label(Role::Button, "Thank you!");
+    assert!(settings_file(dir).star_clicked);
+    // Move the pointer away so the image shows the card at rest.
+    window.get_by_label("Connected iPad").hover();
+    window.run_steps(20);
+    snapshot(&mut window, shared, "sidebar-star-thanks");
+    results.extend_harness(&mut window);
+    let reopened = harness(shared, size, 1.0);
+    reopened.get_by_role_and_label(Role::Button, "Thank you!");
+    assert!(reopened
+        .query_by_role_and_label(Role::Button, "Enjoying EternalMonitor?")
+        .is_none());
+
+    // The one-time ask: after three sessions of five minutes, on Stream, only
+    // while no iPad is connected.
+    SettingsFile {
+        check_for_updates: false,
+        feedback_sessions: 3,
+        ..Default::default()
+    }
+    .save();
+    let streaming = harness(shared, size, 1.0);
+    assert!(streaming
+        .query_by_label("How's EternalMonitor working for you? :)")
+        .is_none());
+    let idle = SharedControl::new(9876, 15_000_000);
+    idle.pairing.lock().configure(true, [0x11; 16]);
+    let mut ask = harness(&idle, size, 1.0);
+    ask.get_by_label("How's EternalMonitor working for you? :)");
+    snapshot(&mut ask, &idle, "feedback-ask");
+    results.extend_harness(&mut ask);
+    ask.get_by_label("Not now").click();
+    ask.run_steps(4);
+    assert!(ask
+        .query_by_label("How's EternalMonitor working for you? :)")
+        .is_none());
+    assert!(settings_file(dir).feedback_ask_done);
+    let again = harness(&idle, size, 1.0);
+    assert!(again
+        .query_by_label("How's EternalMonitor working for you? :)")
+        .is_none());
 }
 
 /// Renders every screen at the real window size for design review.

@@ -292,18 +292,23 @@ impl AnalyzerApp {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     ui.label(heading("EternalMonitor"));
                     ui.label(muted(format!(
-                        "Version {} · Built by Ali Younes (@whoisaldo)",
+                        "Version {} · Built by Sideband Studio",
                         env!("CARGO_PKG_VERSION")
                     )));
                 });
             });
             ui.add_space(10.0);
+            let mut feedback = false;
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 18.0;
-                widgets::link(ui, "github.com/whoisaldo", "https://github.com/whoisaldo");
+                widgets::link(ui, "sideband.studio", "https://sideband.studio");
                 widgets::link(ui, "Source code", "https://github.com/sidebandstudio/EternalMonitor");
+                feedback = widgets::link_button(ui, "Send feedback", super::icons::Icon::Mail).clicked();
                 widgets::link(ui, "hello@sideband.studio", "mailto:hello@sideband.studio");
             });
+            if feedback {
+                self.open_feedback();
+            }
             ui.add_space(6.0);
             ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
                 ui.add(

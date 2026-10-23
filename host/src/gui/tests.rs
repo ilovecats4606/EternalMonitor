@@ -385,3 +385,64 @@ fn the_second_screen_notice_says_which_driver_problem_applies() {
         .starts_with("Windows didn't add the second screen in time"));
     assert!(slow.retry && !slow.installer);
 }
+
+#[test]
+fn feedback_details_leave_out_names_and_addresses() {
+    use crate::feedback::{body, mailto, Kind};
+    let client = ClientSnapshot {
+        info: Some(ClientInfo {
+            device_name: "Jane Doe's iPad".into(),
+            device_id: 0x5EC2E7,
+            screen_px: (2420, 1668),
+            refresh_hz: 120,
+            preferred_fps: 60,
+            decoder_caps: 1,
+            feature_caps: 0,
+            connected_at: Instant::now(),
+        }),
+        peer: Some(PeerId::usb(7)),
+        session_id: Some(3),
+        report: None,
+        capture_block: None,
+    };
+    let details = super::feedback_panel::details(true, &client);
+    let text = body(Kind::Problem, "It froze", Some(&details));
+    assert!(
+        text.contains("Setup: Second screen, USB, iPad 2420 × 1668 at 120 Hz"),
+        "{text}"
+    );
+    let (url, _) = mailto(Kind::Problem, "It froze", Some(&details));
+    let mut private = vec![
+        "Jane".to_string(),
+        "iPad Pro".to_string(),
+        "5EC2E7".to_string(),
+        "192.".to_string(),
+        "10.0.".to_string(),
+        "USB device 7".to_string(),
+        detect_local_ip(9876),
+    ];
+    // Whatever this machine's user and computer are called.
+    for var in ["USER", "USERNAME", "COMPUTERNAME", "HOSTNAME", "LOGNAME"] {
+        if let Ok(value) = std::env::var(var) {
+            if value.len() > 2 {
+                private.push(value);
+            }
+        }
+    }
+    for secret in &private {
+        assert!(!text.contains(secret.as_str()), "{secret} in {text}");
+        assert!(!url.contains(secret.as_str()), "{secret} in {url}");
+    }
+    // Disconnected: no iPad line at all.
+    let idle = super::feedback_panel::details(
+        false,
+        &ClientSnapshot {
+            info: None,
+            peer: None,
+            session_id: None,
+            report: None,
+            capture_block: None,
+        },
+    );
+    assert!(body(Kind::Idea, "", Some(&idle)).contains("Setup: Mirror, no iPad connected"));
+}

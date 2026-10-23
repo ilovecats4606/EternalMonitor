@@ -276,5 +276,5 @@ The Windows installer also ships third-party components under their own licenses
 including the [Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)
 and FFmpeg.
 
-Built by Ali Younes ([@whoisaldo](https://github.com/whoisaldo)). Questions go to
+Built by [Sideband Studio](https://sideband.studio). Questions go to
 [hello@sideband.studio](mailto:hello@sideband.studio).

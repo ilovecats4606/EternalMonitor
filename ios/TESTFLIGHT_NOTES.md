@@ -36,6 +36,12 @@ an iPad on 0.3.1 still works with the Windows changes.
   stream controls stay until you hide them.
 - Logs collapse repeated lines and keep their last lines at quit. A Known
   issues page and the setup guide's tables list every message and what to do.
+- **Send feedback** in both apps writes an email to the studio with the app
+  versions and setup filled in; nothing is sent until you press Send. The iPad
+  attaches its Diagnostics report, which you can remove, and problem cards
+  offer **Report this problem**. Without an email app, **Copy message** works
+  instead. After a few long sessions each app asks once how it's going, and
+  the PC sidebar has a small card for starring EternalMonitor on GitHub.
 
 ### What to test
 
@@ -52,3 +58,6 @@ prompt, and check that the new version opens, once while streaming with
 With a second monitor left of the main display, touch each corner of the iPad
 picture with Apple Pencil; the pointer should be under the tip. Repeat with the
 extended iPad display and with 125% scaling.
+
+Tap **Send feedback** in Settings on the iPad and click it in the PC's sidebar:
+check the email it writes, and tell us what you think while you're there.

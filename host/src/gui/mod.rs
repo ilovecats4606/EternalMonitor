@@ -9,7 +9,10 @@
 //!   (or "Waiting for an iPad" when nobody is connected);
 //! - on Settings, the "Encoder input" row;
 //! - at the top of Stream, the "Mirror my screen" and "Second screen" choice.
+//! - in the sidebar, "Send feedback" and the GitHub star card (see
+//!   `feedback_panel.rs`).
 
+mod feedback_panel;
 mod icons;
 mod page_performance;
 mod page_settings;
@@ -269,6 +272,7 @@ impl History {
 enum Copied {
     Address,
     Logs,
+    Email,
 }
 
 pub struct AnalyzerApp {
@@ -299,6 +303,10 @@ pub struct AnalyzerApp {
     show_qr_modal: bool,
     qr_cache: Option<(String, QrCode)>,
     copied: Option<(Copied, Instant)>,
+    /// The Send feedback dialog, while open.
+    feedback: Option<feedback_panel::Draft>,
+    feedback_ask: crate::feedback::Ask,
+    star_clicked: bool,
     history: History,
     quality: QualityMeter,
     logo: Option<(f32, egui::TextureHandle)>,
@@ -428,6 +436,12 @@ impl AnalyzerApp {
             show_qr_modal: false,
             qr_cache: None,
             copied: None,
+            feedback: None,
+            feedback_ask: crate::feedback::Ask::new(
+                persisted.feedback_sessions,
+                persisted.feedback_ask_done,
+            ),
+            star_clicked: persisted.star_clicked,
             history: History::new(),
             quality: QualityMeter::default(),
             logo: None,
@@ -467,6 +481,9 @@ impl AnalyzerApp {
             start_on_boot: self.settings_start_on_boot,
             require_pairing: pairing.required,
             auth_token_hex: crate::pairing::token_hex(&pairing.token()),
+            feedback_sessions: self.feedback_ask.long_sessions,
+            feedback_ask_done: self.feedback_ask.done,
+            star_clicked: self.star_clicked,
         };
         file.save();
     }
@@ -702,6 +719,7 @@ impl eframe::App for AnalyzerApp {
         let snap = StatsSnapshot::take();
         let client = ClientSnapshot::take(&self.control);
         self.history.sample(&snap, Instant::now());
+        self.observe_session(&client);
         if !snap.pipeline_running {
             // A stopped pipeline starts with the new settings anyway.
             self.restart_pending = false;
@@ -744,6 +762,7 @@ impl eframe::App for AnalyzerApp {
         if self.show_qr_modal {
             self.draw_qr_modal(&ctx, &snap);
         }
+        self.draw_feedback_panel(&ctx, &client);
     }
 }
 
@@ -790,6 +809,12 @@ impl AnalyzerApp {
                     ui.label(faint(format!("Version {}", env!("CARGO_PKG_VERSION"))));
                     ui.add_space(6.0);
                     sidebar_status(ui, snap, client);
+                    ui.add_space(6.0);
+                    if feedback_panel::sidebar_action(ui, Icon::Mail, "Send feedback").clicked() {
+                        self.open_feedback();
+                    }
+                    ui.add_space(2.0);
+                    self.star_card(ui);
                 });
             });
     }
