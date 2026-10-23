@@ -129,13 +129,16 @@ impl AnalyzerApp {
         }
         ui.add_space(GAP - 10.0);
         if let Some(action) = action {
-            self.update_action(action);
+            self.update_action(ui.ctx(), action);
         }
     }
 
-    fn update_action(&mut self, action: Action) {
+    fn update_action(&mut self, ctx: &egui::Context, action: Action) {
         update_toast::hide();
         match action {
+            Action::UpdateNow if !self.updates.installs_in_place() => {
+                ctx.open_url(egui::OpenUrl::new_tab(WEBSITE_DOWNLOAD));
+            }
             Action::UpdateNow => self.updates.update_now(),
             Action::Force => self.updates.force_now(),
             Action::Cancel => self.updates.cancel(),
@@ -170,7 +173,7 @@ impl AnalyzerApp {
             }
         }
         match action {
-            Some(true) => self.update_action(Action::UpdateNow),
+            Some(true) => self.update_action(ui.ctx(), Action::UpdateNow),
             Some(false) => self.updates.check_now(),
             None => {}
         }
@@ -229,7 +232,7 @@ impl AnalyzerApp {
         );
         if clicked {
             if available.is_some() {
-                self.update_action(Action::UpdateNow);
+                self.update_action(ui.ctx(), Action::UpdateNow);
             } else {
                 self.updates.check_now();
             }

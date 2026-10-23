@@ -456,6 +456,56 @@ fn installed_helper(app: &Path) -> Option<PathBuf> {
     .find(|path| path.is_file())
 }
 
+/// Setup installs into the folder it installed into before (Program Files
+/// the first time), and the helper starts the exe that asked for the update
+/// again. So only the installed copy updates itself. A portable or self-built
+/// copy would come back as the old version, and Setup would point the
+/// firewall rules away from it; Update now opens the website for those.
+fn installs_in_place(exe: &Path, install_dir: Option<&Path>) -> bool {
+    let (Some(dir), Some(install_dir)) = (exe.parent(), install_dir) else {
+        return false;
+    };
+    let plain = |path: &Path| {
+        path.to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .to_lowercase()
+    };
+    plain(dir) == plain(install_dir)
+}
+
+/// The folder Setup reads from its uninstall entry to install an update into.
+/// `None` when EternalMonitor was never installed.
+#[cfg(windows)]
+fn install_dir() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::core::w;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+    let mut value = [0u16; 1024];
+    let mut bytes = std::mem::size_of_val(&value) as u32;
+    // AppId in installer/EternalMonitor.iss; a per-machine 64-bit install.
+    let result = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            w!("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{B7E6F2C4-3A91-4E0D-9C2A-ETERNALMONITOR}_is1"),
+            w!("Inno Setup: App Path"),
+            RRF_RT_REG_SZ,
+            None,
+            Some(value.as_mut_ptr().cast()),
+            Some(&mut bytes),
+        )
+    };
+    if result.is_err() {
+        return None;
+    }
+    let length = value.iter().position(|&c| c == 0).unwrap_or(value.len());
+    Some(std::ffi::OsString::from_wide(&value[..length]).into())
+}
+
+#[cfg(not(windows))]
+fn install_dir() -> Option<PathBuf> {
+    None
+}
+
 /// Copies the helper out of the install folder, which Setup replaces, and
 /// returns the copy held open so it cannot change before it starts. The copy
 /// must hash the same as the installed helper.
@@ -1113,6 +1163,7 @@ pub struct Updater {
     state: Arc<Mutex<State>>,
     path: Option<PathBuf>,
     tx: mpsc::Sender<Command>,
+    in_place: bool,
 }
 
 impl Updater {
@@ -1142,7 +1193,20 @@ impl Updater {
         {
             tracing::warn!(%error, "Could not start the update worker");
         }
-        Self { state, path, tx }
+        let in_place = std::env::current_exe()
+            .is_ok_and(|exe| installs_in_place(&exe, install_dir().as_deref()));
+        Self {
+            state,
+            path,
+            tx,
+            in_place,
+        }
+    }
+
+    /// `false` for a copy Setup would not replace: Update now opens the
+    /// website instead.
+    pub fn installs_in_place(&self) -> bool {
+        self.in_place
     }
 
     fn with<T>(&self, change: impl FnOnce(&mut State) -> T) -> T {

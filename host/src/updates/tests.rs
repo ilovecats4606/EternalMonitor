@@ -753,6 +753,44 @@ fn the_app_closes_only_after_the_helper_takes_over() {
     );
 }
 
+/// Setup installs into its own folder and the helper starts the exe that
+/// asked, so a copy anywhere else would come back as the old version.
+#[test]
+fn only_the_installed_copy_installs_updates_in_place() {
+    let installed = Path::new("C:\\")
+        .join("Program Files")
+        .join("EternalMonitor");
+    let exe = installed.join("EternalMonitor-host.exe");
+    assert!(installs_in_place(&exe, Some(&installed)));
+    let trailing = PathBuf::from(format!(
+        "{}{}",
+        installed.display(),
+        std::path::MAIN_SEPARATOR
+    ));
+    assert!(installs_in_place(&exe, Some(&trailing)));
+    let other_case = PathBuf::from(installed.to_string_lossy().to_uppercase());
+    assert!(installs_in_place(&exe, Some(&other_case)));
+
+    // The zip from the release page, unpacked in Downloads.
+    let portable = Path::new("C:\\")
+        .join("Users")
+        .join("A B")
+        .join("Downloads")
+        .join("EternalMonitor")
+        .join("EternalMonitor-host.exe");
+    assert!(!installs_in_place(&portable, Some(&installed)));
+    // A build from source.
+    let built = Path::new("C:\\")
+        .join("src")
+        .join("target")
+        .join("release")
+        .join("eternal-host.exe");
+    assert!(!installs_in_place(&built, Some(&installed)));
+    // Never installed: Setup would install into Program Files.
+    assert!(!installs_in_place(&portable, None));
+    assert!(!installs_in_place(&exe, None));
+}
+
 #[test]
 fn helper_arguments_survive_windows_quoting() {
     let args = eternal_updater::HelperArgs {
