@@ -17,8 +17,8 @@ const BATCH_SIZE: usize = 4;
 const WAKE: &str = "";
 /// Longest a normal quit waits for uploads. Unsent batches stay in the outbox.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
-/// After that, how long a quit lets the upload thread finish writing the
-/// queue it holds. A few small files take milliseconds.
+/// After that, how long a quit waits for the last queued lines to reach the
+/// outbox. A few small files take milliseconds.
 const FINAL_WRITE_WAIT: Duration = Duration::from_millis(250);
 static SENDER: OnceLock<mpsc::SyncSender<String>> = OnceLock::new();
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -159,8 +159,8 @@ pub struct UploadGuard {
 }
 
 /// The upload thread. Dropping it waits at most [`SHUTDOWN_WAIT`] and
-/// [`FINAL_WRITE_WAIT`]; if a request is still in flight, the queued lines are
-/// written to the outbox from here.
+/// [`FINAL_WRITE_WAIT`]; if a request is still in flight, another thread
+/// writes the queued lines to the outbox.
 struct Uploader {
     stop: std::sync::Arc<AtomicBool>,
     /// Wakes a thread waiting for lines, so an idle quit does not wait out
@@ -207,38 +207,45 @@ impl Drop for Uploader {
             }
             return;
         }
-        // The thread is inside a request and holds no lock; keep what it has
-        // not written yet and let the process exit without it. A thread that
-        // holds the lock is writing the queue itself. Waiting for the lock
-        // made the quit last as long as that write.
-        let receiver = match self.receiver.try_lock() {
-            Ok(receiver) => receiver,
-            Err(std::sync::TryLockError::WouldBlock) => {
-                let _ = self.done.recv_timeout(FINAL_WRITE_WAIT);
-                return;
+        // The thread is stuck in a request or a write. Keep what it has not
+        // written yet, but from another thread: the disk can stall as well,
+        // and writing here made the quit last as long as the stall.
+        let (receiver, directory, sharing) =
+            (self.receiver.clone(), self.directory.clone(), enabled());
+        let (written_tx, written) = mpsc::channel();
+        let _ = std::thread::Builder::new().spawn(move || {
+            keep_queued(&receiver, &directory, sharing);
+            let _ = written_tx.send(());
+        });
+        let _ = written.recv_timeout(FINAL_WRITE_WAIT);
+    }
+}
+/// The quit's fallback: writes the lines still queued, or clears everything
+/// pending when sharing is off. If the upload thread is writing the queue
+/// itself, this waits for it and finds nothing left.
+fn keep_queued(receiver: &Mutex<mpsc::Receiver<String>>, directory: &Path, sharing: bool) {
+    let Ok(receiver) = receiver.lock() else {
+        return;
+    };
+    if !sharing {
+        // Sharing was turned off during the stalled request. Clear what is
+        // pending, as the thread does.
+        if let Ok(paths) = files(directory) {
+            for path in paths {
+                let _ = fs::remove_file(path);
             }
-            Err(std::sync::TryLockError::Poisoned(_)) => return,
-        };
-        if !enabled() {
-            // Sharing was turned off during the stalled request. Clear what
-            // is pending, as the thread does.
-            if let Ok(paths) = files(&self.directory) {
-                for path in paths {
-                    let _ = fs::remove_file(path);
-                }
-            }
-            while receiver.try_recv().is_ok() {}
-            return;
         }
-        let events: Vec<Event> = receiver
-            .try_iter()
-            .filter(|line| line != WAKE)
-            .map(|line| event(&line, level(&line)))
-            .collect();
-        for chunk in events.chunks(BATCH_SIZE) {
-            if let Ok(batch) = batch(chunk.to_vec()) {
-                let _ = persist(&self.directory, &batch);
-            }
+        while receiver.try_recv().is_ok() {}
+        return;
+    }
+    let events: Vec<Event> = receiver
+        .try_iter()
+        .filter(|line| line != WAKE)
+        .map(|line| event(&line, level(&line)))
+        .collect();
+    for chunk in events.chunks(BATCH_SIZE) {
+        if let Ok(batch) = batch(chunk.to_vec()) {
+            let _ = persist(directory, &batch);
         }
     }
 }
@@ -362,6 +369,8 @@ fn persist(directory: &Path, batch: &Batch) -> std::io::Result<()> {
     let _guard = PERSIST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    #[cfg(test)]
+    tests::stall_while_held(directory);
     let bytes = serde_json::to_vec(batch)?;
     let path = directory.join(format!("{}-{}.json", batch.events[0].at_ms, batch.batch_id));
     let temp = path.with_extension("tmp");
@@ -503,8 +512,8 @@ fn run(
     Ok(())
 }
 /// Writes the events this thread holds and those still queued, all under the
-/// receiver lock. A shutdown fallback that finds the lock taken leaves the
-/// queue to this write instead of draining it.
+/// receiver lock. The quit's fallback takes the same lock, so each queued
+/// line is written once.
 fn finish(
     directory: &Path,
     receiver: &Mutex<mpsc::Receiver<String>>,
@@ -675,6 +684,68 @@ mod tests {
                 std::thread::sleep(pause);
             }
         }
+    }
+
+    /// Outbox whose writes block, holding the write lock, while a test
+    /// keeps it here: a stalled disk.
+    static STALLED_OUTBOX: Mutex<Option<PathBuf>> = Mutex::new(None);
+    pub(super) fn stall_while_held(directory: &Path) {
+        while STALLED_OUTBOX.lock().unwrap().as_deref() == Some(directory) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn quitting_while_an_outbox_write_stalls_is_bounded() {
+        let _sharing = sharing_on();
+        let directory = std::env::temp_dir().join(id().unwrap());
+        fs::create_dir_all(&directory).unwrap();
+        let config = Config {
+            endpoint: "http://127.0.0.1:9/v1/events".into(),
+            ingest_key: "write-only".into(),
+            enabled: true,
+            allow_http: true,
+        };
+        // The worker's first write stalls while it holds the outbox lock.
+        *STALLED_OUTBOX.lock().unwrap() = Some(directory.clone());
+        let (sender, uploader) = Uploader::spawn(config, directory.clone());
+        sender
+            .send("2026-10-21T17:11:31Z  INFO first line".into())
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        sender
+            .send("2026-10-21T17:11:31Z  INFO last line".into())
+            .unwrap();
+        // The disk recovers long after the quit should have returned.
+        let release = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(5));
+            *STALLED_OUTBOX.lock().unwrap() = None;
+        });
+        let started = std::time::Instant::now();
+        drop(uploader);
+        let waited = started.elapsed();
+        assert!(
+            STALLED_OUTBOX.lock().unwrap().is_some(),
+            "quit waited for the stalled write: {waited:?}"
+        );
+        assert!(
+            waited < SHUTDOWN_WAIT + Duration::from_millis(600),
+            "quit waited {waited:?}"
+        );
+        release.join().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let messages = loop {
+            let messages = outbox_messages(&directory);
+            let kept = ["first line", "last line"]
+                .iter()
+                .all(|line| messages.iter().any(|m| m.ends_with(line)));
+            if kept || std::time::Instant::now() >= deadline {
+                break messages;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
