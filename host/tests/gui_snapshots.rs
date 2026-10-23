@@ -320,7 +320,34 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     // The banner sits above every page, Settings included.
     harness.get_by_label("EternalMonitor 99.0.0 is available");
     harness.get_by_label("Version 99.0.0 is ready to install.");
+    // The popup waits for the Stream page, then shows over it while the
+    // iPad streams.
+    assert!(harness
+        .query_by_role_and_label(Role::Dialog, "Update ready")
+        .is_none());
     nav(&mut harness, "Stream");
+    {
+        let popup = harness.get_by_role_and_label(Role::Dialog, "Update ready");
+        popup.get_by_label("EternalMonitor 99.0.0 is ready");
+        popup.get_by_label("Updating is highly recommended.");
+        popup.get_by_label("Update now opens the download page.");
+        popup.get_by_role_and_label(Role::Button, "Update now");
+    }
+    snapshot(&mut harness, &shared, "update-popup");
+    harness
+        .get_by_role_and_label(Role::Dialog, "Update ready")
+        .get_by_label("Later")
+        .click();
+    harness.run_steps(4);
+    assert!(harness
+        .query_by_role_and_label(Role::Dialog, "Update ready")
+        .is_none());
+    // Later hides the popup for three days, not the banner.
+    nav(&mut harness, "Settings");
+    nav(&mut harness, "Stream");
+    assert!(harness
+        .query_by_role_and_label(Role::Dialog, "Update ready")
+        .is_none());
     harness.get_by_label("EternalMonitor 99.0.0 is available");
     // Setup did not install this test binary, so Update now only opens the
     // download page.
@@ -392,6 +419,7 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     report(&shared, 1_008_000, 2_010);
     harness.run_steps(4);
     harness.get_by_label("Poor");
+
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -515,6 +543,21 @@ fn review_screens() {
     save(&mut tall, "settings-full");
     let mut small = harness(&shared, egui::vec2(820.0, 560.0), 1.5);
     save(&mut small, "minimum-size");
+
+    // The update popup with a note from latest.json.
+    let state = dir.join("EternalMonitor/update-state.json");
+    let mut cached: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    cached["latest"]["note"] = "Fixes the second screen on laptops with two graphics cards.".into();
+    cached["popup"] = serde_json::Value::Null;
+    std::fs::write(&state, cached.to_string()).unwrap();
+    SettingsFile {
+        check_for_updates: true,
+        ..Default::default()
+    }
+    .save();
+    let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
+    save(&mut h, "update-popup-note");
     std::fs::remove_dir_all(dir).unwrap();
 
     // Website product shot: realistic names and a healthy link, default window size.

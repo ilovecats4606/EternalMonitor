@@ -110,6 +110,9 @@ struct ConnectView: View {
                     }
                     .scrollDismissesKeyboard(.interactively)
                 }
+
+                UpdatePopup(allowed: connectionManager.state == .disconnected && focusedField == nil
+                    && !showSettings && !showQRScanner && connectionManager.pairingPrompt == nil)
             }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

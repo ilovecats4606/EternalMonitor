@@ -20,6 +20,87 @@ final class UpdateCheckerTests: XCTestCase {
         XCTAssertNil(UpdateManifest.parse(Data("<html>".utf8)))
     }
 
+    private func ipadManifest(_ extra: String) -> Data {
+        Data("""
+        {"schema":1,"windows":{"version":"0.3.2","installer":"x","sha256":"y","note":"PC only"},
+         "ipad":{"version":"0.3.2","build":170,"channel":"beta"\(extra)},"future":{"a":1}}
+        """.utf8)
+    }
+
+    func testManifestReadsTheOptionalRecommendedFlagAndNote() throws {
+        // Missing: recommended, no note. Unknown keys are ignored.
+        let plain = try XCTUnwrap(UpdateManifest.parse(ipadManifest("")))
+        XCTAssertEqual(plain, UpdateManifest.IPad(version: "0.3.2", build: 170, testflight: nil))
+        XCTAssertTrue(plain.isRecommended)
+        XCTAssertNil(plain.note)
+
+        let soft = try XCTUnwrap(UpdateManifest.parse(ipadManifest(#","recommended":false,"note":"  Fixes Pencil pressure.  ""#)))
+        XCTAssertFalse(soft.isRecommended)
+        XCTAssertEqual(soft.note, "Fixes Pencil pressure.")
+
+        // A note that isn't one short line, or a field of the wrong type, is
+        // dropped instead of hiding the update.
+        let long = String(repeating: "x", count: 201)
+        for extra in [#","note":"""#, #","note":"   ""#, #","note":"Two\nlines""#, #","note":"\#(long)""#,
+                      #","note":7,"recommended":"yes""#, #","note":null,"recommended":null"#] {
+            let parsed = try XCTUnwrap(UpdateManifest.parse(ipadManifest(extra)), extra)
+            XCTAssertNil(parsed.note, extra)
+            XCTAssertTrue(parsed.isRecommended, extra)
+        }
+        let longest = String(repeating: "x", count: 200)
+        XCTAssertEqual(UpdateManifest.parse(ipadManifest(#","note":"\#(longest)""#))?.note?.count, 200)
+    }
+
+    func testPopupShowsOncePerBuildThenAtMostEveryThreeDays() {
+        let installed = InstalledApp(version: "0.3.1", build: 166)
+        let available = UpdateManifest.IPad(version: "0.3.2", build: 170, testflight: nil)
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        let day: TimeInterval = 86_400
+        let make = { (available: UpdateManifest.IPad?, closed: (build: Int, at: Date)?, at: Date) in
+            UpdatePopupModel.make(available: available, installed: installed, automatic: true, closed: closed, now: at)
+        }
+        let popup = make(available, nil, now)
+        XCTAssertEqual(popup, UpdatePopupModel(version: "0.3.2", build: 170, recommended: true, note: nil))
+        XCTAssertEqual(popup?.title, "A new version of EternalMonitor is ready")
+        XCTAssertEqual(popup?.message, "Updating is highly recommended.")
+
+        let closed = (build: 170, at: now)
+        XCTAssertNil(make(available, closed, now.addingTimeInterval(3 * day - 1)))
+        XCTAssertNotNil(make(available, closed, now.addingTimeInterval(3 * day)))
+        XCTAssertNotNil(make(available, closed, now.addingTimeInterval(-60)), "a clock set back doesn't hide it for good")
+        let next = UpdateManifest.IPad(version: "0.3.2", build: 171, testflight: nil)
+        XCTAssertNotNil(make(next, closed, now), "a newer build shows at once")
+        XCTAssertNil(make(nil, nil, now))
+        XCTAssertNil(make(UpdateManifest.IPad(version: "0.3.1", build: 166, testflight: nil), nil, now))
+        XCTAssertNil(UpdatePopupModel.make(available: available, installed: installed, automatic: false, closed: nil, now: now))
+
+        let soft = UpdateManifest.IPad(version: "0.3.2", build: 170, testflight: nil, recommended: false, note: "Fixes Pencil pressure.")
+        XCTAssertEqual(make(soft, nil, now)?.message, "An update is available.")
+        XCTAssertEqual(make(soft, nil, now)?.note, "Fixes Pencil pressure.")
+    }
+
+    @MainActor
+    func testCheckerRemembersThePopupAndTheNote() throws {
+        let suite = "UpdateCheckerTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let installed = InstalledApp(version: "0.3.1", build: 166)
+        let data = Data(#"{"schema":1,"ipad":{"version":"0.3.2","build":170,"recommended":false,"note":"Fixes Pencil pressure."}}"#.utf8)
+        let checker = UpdateChecker(defaults: defaults, source: .injected(data), installed: installed)
+        checker.checkIfDue()
+        let now = Date()
+        XCTAssertEqual(checker.popup(now: now)?.note, "Fixes Pencil pressure.")
+        checker.closePopup(now: now)
+        XCTAssertNil(checker.popup(now: now))
+        XCTAssertNotNil(checker.banner, "Later on the popup leaves the banner")
+
+        let relaunched = UpdateChecker(defaults: defaults, source: .disabled, installed: installed)
+        XCTAssertNil(relaunched.popup(now: now.addingTimeInterval(60)))
+        let later = relaunched.popup(now: now.addingTimeInterval(UpdatePopupModel.closeInterval))
+        XCTAssertEqual(later?.message, "An update is available.")
+        XCTAssertEqual(later?.note, "Fixes Pencil pressure.")
+    }
+
     func testVersionCompare() {
         XCTAssertLessThan(AppVersion("0.3.9")!, AppVersion("0.3.10")!)
         XCTAssertLessThan(AppVersion("0.9.0")!, AppVersion("1.0.0")!)

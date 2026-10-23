@@ -18,7 +18,7 @@ an iPad on 0.3.1 still works with the Windows changes.
   installs it and reopens EternalMonitor, waiting for streaming to stop or for
   **Stop and update**. The iPad says when the PC is updating and when a new
   TestFlight build is ready. Both apps say which one to update when versions
-  differ.
+  differ. A short popup recommends each new version.
 - The PC window opens on graphics drivers that crashed 0.3.1 at startup. If
   the host can't start or stops unexpectedly, it names the error and log file,
   and a helper process reports the crash and turns the second screen off.

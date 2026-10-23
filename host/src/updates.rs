@@ -24,6 +24,8 @@ const CHECK_INTERVAL: u64 = 24 * 60 * 60;
 /// loop or repeated restarts cannot hammer the website.
 const STARTUP_INTERVAL: u64 = 60 * 60;
 const LATER_INTERVAL: u64 = 24 * 60 * 60;
+/// A closed update popup stays away this long for the same version.
+const POPUP_INTERVAL: u64 = 3 * 24 * 60 * 60;
 /// The stream must stay off this long before a waiting update starts, so a
 /// quick reconnect does not close the app under the user.
 const STREAM_IDLE: Duration = Duration::from_secs(3);
@@ -112,8 +114,19 @@ pub struct Release {
     pub version: String,
     pub installer: String,
     pub sha256: String,
+    /// `false` softens the popup's wording. Missing means recommended.
+    #[serde(default = "recommended")]
+    pub recommended: bool,
+    /// One short sentence the popup shows under its message.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
+fn recommended() -> bool {
+    true
+}
+
+/// Unknown fields are ignored, so a newer manifest still parses here.
 #[derive(Deserialize)]
 struct Manifest {
     schema: u32,
@@ -125,6 +138,23 @@ struct ManifestWindows {
     version: String,
     installer: String,
     sha256: String,
+    /// Optional, and read leniently: a wrong type must not stop the update.
+    #[serde(default)]
+    recommended: serde_json::Value,
+    #[serde(default)]
+    note: serde_json::Value,
+}
+
+const MAX_NOTE_CHARS: usize = 200;
+
+/// A note the popup can show: one trimmed line, not empty and not too long.
+/// Anything else is dropped rather than failing the check.
+fn short_note(note: Option<&str>) -> Option<String> {
+    let note = note?.trim();
+    let fits = !note.is_empty()
+        && note.chars().count() <= MAX_NOTE_CHARS
+        && !note.chars().any(char::is_control);
+    fits.then(|| note.to_string())
 }
 
 pub fn parse_manifest(data: &[u8], endpoints: &Endpoints) -> Result<Release, UpdateError> {
@@ -151,6 +181,8 @@ pub fn parse_manifest(data: &[u8], endpoints: &Endpoints) -> Result<Release, Upd
         version: version.to_string(),
         installer: expected,
         sha256,
+        recommended: windows.recommended.as_bool().unwrap_or(true),
+        note: short_note(windows.note.as_str()),
     })
 }
 
@@ -667,6 +699,8 @@ struct Saved {
     later: Option<(String, u64)>,
     /// The last version announced by a Windows notification.
     notified: Option<String>,
+    /// The update popup was closed for one version, at this time.
+    popup: Option<(String, u64)>,
     /// Written just before Setup starts: `(from, to)`.
     pending: Option<(String, String)>,
 }
@@ -704,6 +738,28 @@ pub enum Notice {
     Installing(String),
     Failed(String),
     Updated(String),
+}
+
+/// The popup shown over the window when an automatic check finds an update.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Popup {
+    pub version: String,
+    pub recommended: bool,
+    pub note: Option<String>,
+}
+
+impl Popup {
+    pub fn title(&self) -> String {
+        format!("EternalMonitor {} is ready", self.version)
+    }
+
+    pub fn message(&self) -> &'static str {
+        if self.recommended {
+            "Updating is highly recommended."
+        } else {
+            "An update is available."
+        }
+    }
 }
 
 pub enum Command {
@@ -855,6 +911,29 @@ impl State {
         let release = self.available()?;
         ((self.auto || self.manual_check) && !self.snoozed(now))
             .then(|| Notice::Available(release.version.clone()))
+    }
+
+    /// Once per version while the banner offers it, then at most every
+    /// three days after it is closed. Never when automatic checks are off.
+    fn popup(&self, now: u64) -> Option<Popup> {
+        if !self.auto || !matches!(self.notice(now), Some(Notice::Available(_))) {
+            return None;
+        }
+        let release = self.available()?;
+        let closed = self.saved.popup.as_ref().is_some_and(|(version, at)| {
+            *version == release.version && *at <= now && now - at < POPUP_INTERVAL
+        });
+        (!closed).then(|| Popup {
+            version: release.version.clone(),
+            recommended: release.recommended,
+            note: release.note.clone(),
+        })
+    }
+
+    fn popup_closed(&mut self, now: u64) {
+        if let Some(version) = self.available().map(|r| r.version.clone()) {
+            self.saved.popup = Some((version, now));
+        }
     }
 
     fn later(&mut self, now: u64) {
@@ -1234,6 +1313,15 @@ impl Updater {
 
     pub fn notice(&self) -> Option<Notice> {
         self.state.lock().notice(now_secs())
+    }
+
+    pub fn popup(&self) -> Option<Popup> {
+        self.state.lock().popup(now_secs())
+    }
+
+    /// Later, Update now or closing the popup.
+    pub fn popup_closed(&self) {
+        self.with(|state| state.popup_closed(now_secs()));
     }
 
     pub fn check_status(&self) -> CheckStatus {

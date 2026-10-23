@@ -1,13 +1,25 @@
-//! The update banner above every page, the update rows in Settings, and the
-//! notice shown when an iPad cannot connect because of a version difference.
+//! The update banner above every page, the update popup, the update rows in
+//! Settings, and the notice shown when an iPad cannot connect because of a
+//! version difference.
 
-use eframe::egui::{self, Ui};
+use eframe::egui::{self, vec2, Color32, Frame, Margin, Rect, Sense, Stroke, Ui};
 
-use super::icons::Icon;
+use super::icons::{self, Icon};
 use super::theme::*;
 use super::widgets::{self, Tone, GAP};
-use super::{update_toast, AnalyzerApp, ClientSnapshot, StatsSnapshot, StreamState};
+use super::{update_toast, AnalyzerApp, ClientSnapshot, Page, StatsSnapshot, StreamState};
 use crate::updates::{CheckStatus, Notice, OlderSide, WEBSITE_DOWNLOAD};
+
+/// The popup's last line: what Update now does from here.
+pub(super) fn popup_hint(installs_in_place: bool, streaming: bool) -> &'static str {
+    if !installs_in_place {
+        "Update now opens the download page."
+    } else if streaming {
+        "Your iPad stays connected. The update installs when you stop streaming."
+    } else {
+        "Windows will ask for permission, then EternalMonitor restarts."
+    }
+}
 
 impl AnalyzerApp {
     pub(super) fn update_banner(
@@ -134,6 +146,101 @@ impl AnalyzerApp {
         ui.add_space(GAP - 10.0);
         if let Some(action) = action {
             self.update_action(ui.ctx(), action);
+        }
+    }
+
+    /// A small card over the window, once per version and then at most every
+    /// three days (see `updates::State::popup`). It opens only on the Stream
+    /// page and not mid-click, mid-drag or while typing; streaming is fine,
+    /// since Update now waits for the stream like the banner's button.
+    pub(super) fn update_popup(
+        &mut self,
+        ctx: &egui::Context,
+        snap: &StatsSnapshot,
+        client: &ClientSnapshot,
+    ) {
+        let Some(popup) = self.updates.popup() else {
+            self.update_popup_open = false;
+            return;
+        };
+        if !self.update_popup_open {
+            let busy = self.page != Page::Stream
+                || ctx.egui_wants_keyboard_input()
+                || ctx.input(|i| i.pointer.any_down());
+            if busy {
+                return;
+            }
+            self.update_popup_open = true;
+        }
+        let streaming = StreamState::of(snap, client) == StreamState::Streaming;
+        let hint = popup_hint(self.updates.installs_in_place(), streaming);
+        let mut action = None;
+        let modal = egui::Modal::new(egui::Id::new("update-popup"))
+            .backdrop_color(Color32::from_black_alpha(140))
+            .frame(
+                Frame::new()
+                    .fill(SURFACE_RAISED)
+                    .stroke(Stroke::new(1.0, BORDER_STRONG))
+                    .corner_radius(16.0)
+                    .inner_margin(Margin::same(24))
+                    .shadow(egui::Shadow {
+                        offset: [0, 20],
+                        blur: 56,
+                        spread: 0,
+                        color: Color32::from_black_alpha(160),
+                    }),
+            )
+            .show(ctx, |ui| {
+                ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
+                    node.set_role(egui::accesskit::Role::Dialog);
+                    node.set_label("Update ready");
+                });
+                ui.set_width(340.0);
+                ui.spacing_mut().item_spacing.y = 6.0;
+                let (badge, _) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::hover());
+                ui.painter()
+                    .circle_filled(badge.center(), 20.0, mix(SURFACE_RAISED, ACCENT, 14));
+                icons::paint(
+                    ui.painter(),
+                    Rect::from_center_size(badge.center(), vec2(20.0, 20.0)),
+                    Icon::Download,
+                    ACCENT,
+                );
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(popup.title())
+                            .family(semibold())
+                            .size(18.0)
+                            .color(TEXT),
+                    )
+                    .wrap(),
+                );
+                ui.add(egui::Label::new(strong(popup.message())).wrap());
+                if let Some(note) = &popup.note {
+                    ui.add(egui::Label::new(muted(note)).wrap());
+                }
+                ui.add(egui::Label::new(faint(hint)).wrap());
+                ui.add_space(14.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if widgets::button(ui, Tone::Primary, None, "Update now").clicked() {
+                        action = Some(Action::UpdateNow);
+                    }
+                    if widgets::button(ui, Tone::Ghost, None, "Later").clicked() {
+                        action = Some(Action::Later);
+                    }
+                });
+            });
+        // Escape or a click beside the card means Later.
+        if action.is_none() && modal.should_close() {
+            action = Some(Action::Later);
+        }
+        if let Some(action) = action {
+            self.updates.popup_closed();
+            self.update_popup_open = false;
+            if matches!(action, Action::UpdateNow) {
+                self.update_action(ctx, action);
+            }
         }
     }
 

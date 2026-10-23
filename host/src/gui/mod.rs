@@ -279,6 +279,8 @@ pub struct AnalyzerApp {
     settings_encoder_input: crate::encoder::input::EncoderInput,
     settings_check_updates: bool,
     updates: crate::updates::Updater,
+    /// The update popup is on screen; it stays until a button is chosen.
+    update_popup_open: bool,
     settings_packet_size: u32,
     /// Last settings error worth showing (the autostart registry write or a
     /// pairing reset).
@@ -411,6 +413,7 @@ impl AnalyzerApp {
             settings_encoder_input: encoder_input,
             settings_check_updates: persisted.check_for_updates,
             updates,
+            update_popup_open: false,
             settings_packet_size: control.shared.max_dgram.load(Ordering::SeqCst),
             control,
             page: Page::Stream,
@@ -743,6 +746,8 @@ impl eframe::App for AnalyzerApp {
 
         if self.show_qr_modal {
             self.draw_qr_modal(&ctx, &snap);
+        } else {
+            self.update_popup(&ctx, &snap, &client);
         }
     }
 }

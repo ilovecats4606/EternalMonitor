@@ -202,14 +202,18 @@ Update both devices when a new version comes out. Each app tells you.
 new version number), and Windows shows one notification. Click **Update now**.
 When Windows asks for permission, click **Yes**. EternalMonitor closes,
 installs the update and opens again by itself. If you are streaming, the update
-waits until you stop. **Later** hides the banner until the next day.
+waits until you stop. **Later** hides the banner until the next day. A small
+window also says **EternalMonitor 0.3.2 is ready**. After **Later** it comes
+back at most every three days.
 
 In the PC window's **Settings**, **Check for updates automatically** turns the
 daily check on or off. **Check now** checks right away.
 
 **On the iPad:** the connect screen says **A new version is ready in
 TestFlight**. Tap **Open TestFlight**, then **Update**. The app's settings show
-the same message under **Updates**. To get new versions without asking, open
+the same message under **Updates**. A small window also says **A new version of
+EternalMonitor is ready**. After **Later** it comes back at most every three
+days. To get new versions without asking, open
 TestFlight, tap **EternalMonitor** and turn on **Automatic Updates**.
 
 The update check reads a small file from eternalmonitor.dev. It sends nothing
@@ -257,6 +261,7 @@ try fewer words. If your problem isn't here, see [Known issues](https://eternalm
 | **EternalMonitor on your PC is older than this iPad app, so they can't connect. Update EternalMonitor on your PC: click Update now on the PC, or download it from eternalmonitor.dev.** | The two apps are different versions and can't connect. | On the PC, the window says **Update this PC to connect your iPad**. Click **Update now**. If the button says **Check for updates** instead, click it, then click **Update now** when it appears. If no update is found, click **Download from the website** and run the installer. |
 | **This app and EternalMonitor on your PC are different versions. Update both, then try again.** | The two apps can't connect. | Install matching versions on both, then connect again. |
 | **A new version is ready in TestFlight** | A newer iPad app is available. | Tap **Open TestFlight**, then **Update**. |
+| **A new version of EternalMonitor is ready** | A newer iPad app is available, and updating is recommended. | Tap **Open TestFlight**, then **Update**. **Later** asks again in three days. |
 | **Apple Pencil can't draw on this PC. Update EternalMonitor on the PC; Windows 10 needs version 1809 or later.** | The PC has an older EternalMonitor, or Windows 10 older than version 1809. | Update EternalMonitor on the PC, and update Windows. |
 | **That QR code isn't from EternalMonitor. Scan the code shown on the PC’s Stream page.** or **That QR code couldn't be read. Try again, or type the address instead.** | The camera read a different code, or couldn't read it. | Scan the code from **QR code** on the PC's Stream page, or type the address instead. |
 
@@ -279,6 +284,7 @@ try fewer words. If your problem isn't here, see [Known issues](https://eternalm
 | **Restart the stream to apply your changes** | Some display and video settings only apply when the stream restarts. | Click **Restart now**. The iPad reconnects by itself. |
 | **Update the iPad app to connect** | The iPad app is older than EternalMonitor on the PC. | On the iPad, open TestFlight and tap **Update**. |
 | **Update this PC to connect your iPad** | EternalMonitor on the PC is older than the iPad app. | Click **Update now**. If the button says **Check for updates** instead, the PC doesn't know about the new version yet: click it, then click **Update now** when it appears. If it still finds nothing, click **Download from the website** and run the installer. |
+| **EternalMonitor … is ready** | A new version is ready, and updating is recommended. | Click **Update now**, as on the banner. **Later** asks again in three days. |
 | **EternalMonitor … is available** | A new version is ready. | Click **Update now**, then **Yes** when Windows asks. If you are streaming, the update waits until you stop, or click **Stop and update**. |
 | **The update did not finish** | The update couldn't download or install. You still have the old version. | Click **Try again**. If it fails again, click **Download from the website** and run the installer. |
 | **EternalMonitor could not start** or **EternalMonitor stopped unexpectedly** | The app hit an error. The message names it and the log file. | Open EternalMonitor again; after a failed start it tries another way to draw its window. Update the graphics driver. If it happens again, send the log file it names, from `%APPDATA%\EternalMonitor\logs`, through the feedback form. |

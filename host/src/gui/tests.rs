@@ -385,3 +385,25 @@ fn the_second_screen_notice_says_which_driver_problem_applies() {
         .starts_with("Windows didn't add the second screen in time"));
     assert!(slow.retry && !slow.installer);
 }
+
+#[test]
+fn the_update_popup_says_what_update_now_does_from_here() {
+    use super::update_banner::popup_hint;
+    assert_eq!(
+        popup_hint(true, false),
+        "Windows will ask for permission, then EternalMonitor restarts."
+    );
+    // While streaming, Update now waits for the stream, as the banner does.
+    let streaming = popup_hint(true, true);
+    assert!(
+        streaming.contains("installs when you stop streaming"),
+        "{streaming}"
+    );
+    // A copy Setup would not replace only opens the website.
+    for streaming in [false, true] {
+        assert_eq!(
+            popup_hint(false, streaming),
+            "Update now opens the download page."
+        );
+    }
+}
