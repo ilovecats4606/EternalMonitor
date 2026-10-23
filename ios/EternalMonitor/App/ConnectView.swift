@@ -42,6 +42,12 @@ struct ConnectView: View {
         return value
     }
 
+    /// The one-time feedback ask is on screen (see `body`).
+    private var showsFeedbackAsk: Bool {
+        connectionManager.problem == nil && connectionManager.connectionError == nil && !isConnecting
+            && connectionManager.feedbackAsk.due(streaming: connectionManager.state == .connected)
+    }
+
     private var canConnect: Bool {
         !normalizedHostIP.isEmpty && parsedPort != nil
     }
@@ -121,8 +127,12 @@ struct ConnectView: View {
                     .scrollDismissesKeyboard(.interactively)
                 }
 
+                // One thing at a time: not while connecting or typing, over a
+                // sheet (Settings, QR scanner, pairing, Mail or the feedback
+                // copy sheet) or next to the feedback ask.
                 UpdatePopup(allowed: connectionManager.state == .disconnected && focusedField == nil
-                    && !showSettings && !showQRScanner && connectionManager.pairingPrompt == nil)
+                    && !showSettings && !showQRScanner && connectionManager.pairingPrompt == nil
+                    && feedbackRequest == nil && !showsFeedbackAsk)
             }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

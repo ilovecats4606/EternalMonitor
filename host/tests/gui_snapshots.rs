@@ -14,7 +14,7 @@ use eternal_host::stats::{PipelineStats, PIPELINE_STATS};
 use eternal_host::transport::link::PeerId;
 use eternal_host::transport::session::ConfigSource;
 use eternal_wire::v2::control::{
-    ControlMessage, Hello2, ReceiverReport, StreamConfig, FEATURE_CHECKS_UPDATES,
+    ByeReason, ControlMessage, Hello2, ReceiverReport, StreamConfig, FEATURE_CHECKS_UPDATES,
 };
 
 struct Fixture;
@@ -169,6 +169,20 @@ fn connect_app(
         &Fixture,
         now,
     );
+}
+
+/// The connected iPad says goodbye, as when its user taps Disconnect.
+fn disconnect_ipad(shared: &SharedControl) {
+    let mut session = shared.session.lock();
+    let session_id = session.session_id().unwrap();
+    session.handle_control(
+        PeerId::usb(7),
+        session_id,
+        ControlMessage::Bye(ByeReason::UserDisconnect),
+        &Fixture,
+        Instant::now(),
+    );
+    assert!(session.session_id().is_none());
 }
 
 /// Another receiver report from the connected iPad, with cumulative counters.
@@ -340,12 +354,30 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     // The banner sits above every page, Settings included.
     harness.get_by_label("EternalMonitor 99.0.0 is available");
     harness.get_by_label("Version 99.0.0 is ready to install.");
-    // The popup waits for the Stream page, then shows over it while the
-    // iPad streams.
+    // The popup waits for the Stream page, and while the iPad streams, since
+    // this window may be on the screen the iPad shows.
     assert!(harness
         .query_by_role_and_label(Role::Dialog, "Update ready")
         .is_none());
     nav(&mut harness, "Stream");
+    assert!(harness
+        .query_by_role_and_label(Role::Dialog, "Update ready")
+        .is_none());
+    // Nor over another dialog: the stream ends while Send feedback is open.
+    harness
+        .get_all_by_role_and_label(Role::Button, "Send feedback")
+        .next()
+        .expect("the sidebar button")
+        .click();
+    harness.run_steps(4);
+    harness.get_by_label("Tell us how it's going");
+    disconnect_ipad(&shared);
+    harness.run_steps(4);
+    assert!(harness
+        .query_by_role_and_label(Role::Dialog, "Update ready")
+        .is_none());
+    harness.get_by_label("Close").click();
+    harness.run_steps(4);
     {
         let popup = harness.get_by_role_and_label(Role::Dialog, "Update ready");
         popup.get_by_label("EternalMonitor 99.0.0 is ready");
@@ -354,6 +386,15 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
         popup.get_by_role_and_label(Role::Button, "Update now");
     }
     snapshot(&mut harness, &shared, "update-popup");
+    // A stream that starts puts it away for now; it isn't a Later.
+    connect_ipad(&shared);
+    harness.run_steps(4);
+    assert!(harness
+        .query_by_role_and_label(Role::Dialog, "Update ready")
+        .is_none());
+    harness.get_by_label("EternalMonitor 99.0.0 is available");
+    disconnect_ipad(&shared);
+    harness.run_steps(4);
     harness
         .get_by_role_and_label(Role::Dialog, "Update ready")
         .get_by_label("Later")
@@ -362,6 +403,8 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     assert!(harness
         .query_by_role_and_label(Role::Dialog, "Update ready")
         .is_none());
+    connect_ipad(&shared);
+    harness.run_steps(4);
     // Later hides the popup for three days, not the banner.
     nav(&mut harness, "Settings");
     nav(&mut harness, "Stream");
@@ -460,8 +503,95 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     assert!(harness
         .query_by_label("Your iPad app is out of date")
         .is_none());
+    disconnect_ipad(&shared);
+    update_arrives_while_feedback_is_open(&shared, &dir, &mut results);
     std::fs::remove_dir_all(dir).unwrap();
     results.unwrap();
+}
+
+/// A check that finds an update while Send feedback is open on Stream, with
+/// no iPad connected: the popup waits for the panel to close, so there is
+/// never more than one dialog.
+fn update_arrives_while_feedback_is_open(
+    shared: &SharedControl,
+    dir: &std::path::Path,
+    results: &mut SnapshotResults,
+) {
+    use std::io::{BufRead, BufReader, Write};
+    // A site that answers the check only when told to.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let (answer, answered) = std::sync::mpsc::channel::<()>();
+    let manifest = serde_json::json!({
+        "schema": 1,
+        "windows": {
+            "version": "99.1.0",
+            "installer": format!("{base}/releases/download/v99.1.0/EternalMonitor-Setup.exe"),
+            "sha256": "0".repeat(64),
+        },
+    })
+    .to_string();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap_or(0) > 2 {
+            line.clear();
+        }
+        let _ = answered.recv();
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{manifest}",
+            manifest.len()
+        );
+    });
+    // Never checked, so the window checks as it opens; already announced,
+    // so no notification.
+    std::fs::write(
+        dir.join("EternalMonitor/update-state.json"),
+        serde_json::json!({ "notified": "99.1.0" }).to_string(),
+    )
+    .unwrap();
+    SettingsFile {
+        check_for_updates: true,
+        feedback_ask_done: true,
+        star_clicked: true,
+        ..Default::default()
+    }
+    .save();
+    std::env::set_var("ETERNAL_UPDATE_BASE", &base);
+    let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
+    std::env::remove_var("ETERNAL_UPDATE_BASE");
+    window
+        .get_all_by_role_and_label(Role::Button, "Send feedback")
+        .next()
+        .expect("the sidebar button")
+        .click();
+    window.run_steps(4);
+    window.get_by_label("Tell us how it's going");
+    answer.send(()).unwrap();
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    while window
+        .query_by_label("EternalMonitor 99.1.0 is available")
+        .is_none()
+    {
+        assert!(Instant::now() < deadline, "the check never finished");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        window.run_steps(1);
+    }
+    window.run_steps(4);
+    assert!(
+        window
+            .query_by_role_and_label(Role::Dialog, "Update ready")
+            .is_none(),
+        "the popup must not open over Send feedback"
+    );
+    window.get_by_label("Close").click();
+    window.run_steps(4);
+    window
+        .get_by_role_and_label(Role::Dialog, "Update ready")
+        .get_by_label("EternalMonitor 99.1.0 is ready");
+    results.extend_harness(&mut window);
 }
 
 /// The text the last frame copied, if any.
@@ -837,8 +967,8 @@ fn review_screens() {
     let mut small = harness(&shared, egui::vec2(820.0, 560.0), 1.5);
     save(&mut small, "minimum-size");
 
-    // The update popup with a note from latest.json, over a stream from an
-    // iPad app older than 0.3.2; then that iPad's notice.
+    // The update popup with a note from latest.json, with no iPad
+    // connected; then an iPad app older than 0.3.2 connects.
     let state = dir.join("EternalMonitor/update-state.json");
     let mut cached: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
@@ -850,12 +980,13 @@ fn review_screens() {
         ..Default::default()
     }
     .save();
-    connect_app(&shared, "Test iPad Pro", 10, 20, 3);
+    disconnect_ipad(&shared);
     let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
     save(&mut h, "update-popup-note");
     h.get_by_role_and_label(Role::Dialog, "Update ready")
         .get_by_label("Later")
         .click();
+    connect_app(&shared, "Test iPad Pro", 10, 20, 3);
     save(&mut h, "ipad-out-of-date");
     std::fs::remove_dir_all(dir).unwrap();
 

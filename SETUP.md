@@ -202,9 +202,9 @@ Update both devices when a new version comes out. Each app tells you.
 new version number), and Windows shows one notification. Click **Update now**.
 When Windows asks for permission, click **Yes**. EternalMonitor closes,
 installs the update and opens again by itself. If you are streaming, the update
-waits until you stop. **Later** hides the banner until the next day. A small
-window also says **EternalMonitor 0.3.2 is ready**. After **Later** it comes
-back at most every three days.
+waits until you stop. **Later** hides the banner until the next day. When no
+iPad is connected, a small window also says **EternalMonitor 0.3.2 is ready**.
+After **Later** it comes back at most every three days.
 
 In the PC window's **Settings**, **Check for updates automatically** turns the
 daily check on or off. **Check now** checks right away.

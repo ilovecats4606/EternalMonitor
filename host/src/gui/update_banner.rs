@@ -11,13 +11,42 @@ use super::{update_toast, AnalyzerApp, ClientSnapshot, Page, StatsSnapshot, Stre
 use crate::updates::{CheckStatus, Notice, OlderSide, IPAD_OUT_OF_DATE, WEBSITE_DOWNLOAD};
 
 /// The popup's last line: what Update now does from here.
-pub(super) fn popup_hint(installs_in_place: bool, streaming: bool) -> &'static str {
-    if !installs_in_place {
-        "Update now opens the download page."
-    } else if streaming {
-        "Your iPad stays connected. The update installs when you stop streaming."
-    } else {
+pub(super) fn popup_hint(installs_in_place: bool) -> &'static str {
+    if installs_in_place {
         "Windows will ask for permission, then EternalMonitor restarts."
+    } else {
+        "Update now opens the download page."
+    }
+}
+
+/// What the update popup does this frame, given what else is going on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PopupGate {
+    Show,
+    /// Not yet: it opens once the user is on Stream and between clicks.
+    Wait,
+    /// Off screen, without counting as Later, so it comes back afterwards.
+    Hide,
+}
+
+impl PopupGate {
+    /// `connected`: an iPad is streaming, so this window may be in its
+    /// picture. `other`: another dialog or ask is up. Either hides an open
+    /// popup; at most one dialog shows at a time.
+    pub(super) fn of(
+        open: bool,
+        connected: bool,
+        other: bool,
+        on_stream: bool,
+        busy: bool,
+    ) -> Self {
+        if connected || other {
+            PopupGate::Hide
+        } else if !open && (!on_stream || busy) {
+            PopupGate::Wait
+        } else {
+            PopupGate::Show
+        }
     }
 }
 
@@ -150,9 +179,11 @@ impl AnalyzerApp {
     }
 
     /// A small card over the window, once per version and then at most every
-    /// three days (see `updates::State::popup`). It opens only on the Stream
-    /// page and not mid-click, mid-drag or while typing; streaming is fine,
-    /// since Update now waits for the stream like the banner's button.
+    /// three days (see `updates::State::popup`). It waits while an iPad is
+    /// connected, since this window may be on the screen the iPad shows, and
+    /// while the QR code, Send feedback, the feedback ask or a menu is open.
+    /// It opens only on the Stream page, between clicks and while nobody
+    /// types. The banner offers the update meanwhile.
     pub(super) fn update_popup(
         &mut self,
         ctx: &egui::Context,
@@ -163,17 +194,30 @@ impl AnalyzerApp {
             self.update_popup_open = false;
             return;
         };
-        if !self.update_popup_open {
-            let busy = self.page != Page::Stream
-                || ctx.egui_wants_keyboard_input()
-                || ctx.input(|i| i.pointer.any_down());
-            if busy {
+        let connected = matches!(
+            StreamState::of(snap, client),
+            StreamState::Streaming | StreamState::Paused
+        );
+        let other = self.show_qr_modal
+            || self.feedback.is_some()
+            || self.feedback_ask.due(client.info.is_some())
+            || egui::Popup::is_any_open(ctx);
+        let busy = ctx.egui_wants_keyboard_input() || ctx.input(|i| i.pointer.any_down());
+        match PopupGate::of(
+            self.update_popup_open,
+            connected,
+            other,
+            self.page == Page::Stream,
+            busy,
+        ) {
+            PopupGate::Show => self.update_popup_open = true,
+            PopupGate::Wait => return,
+            PopupGate::Hide => {
+                self.update_popup_open = false;
                 return;
             }
-            self.update_popup_open = true;
         }
-        let streaming = StreamState::of(snap, client) == StreamState::Streaming;
-        let hint = popup_hint(self.updates.installs_in_place(), streaming);
+        let hint = popup_hint(self.updates.installs_in_place());
         let mut action = None;
         let modal = egui::Modal::new(egui::Id::new("update-popup"))
             .backdrop_color(Color32::from_black_alpha(140))

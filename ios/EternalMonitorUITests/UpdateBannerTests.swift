@@ -58,6 +58,29 @@ final class UpdateBannerTests: XCTestCase {
         XCTAssertFalse(banner.waitForExistence(timeout: 2))
     }
 
+    /// One thing at a time: the popup waits for the feedback ask, then for
+    /// the feedback sheet the ask opens, and shows once that closes.
+    func testFeedbackAskAndSheetComeBeforeThePopup() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-checkForUpdates", "YES",
+                               "-updateDismissedBuild", "0", "-updatePopupClosedBuild", "0",
+                               "-feedbackLongSessions", "3", "-feedbackAskDone", "NO"]
+        app.launchEnvironment["EM_UPDATE_MANIFEST"] = manifest
+        app.launch()
+        let send = app.buttons["feedback.askSend"]
+        XCTAssertTrue(send.waitForExistence(timeout: 10))
+        let later = app.buttons["updatePopup.later"]
+        XCTAssertFalse(later.waitForExistence(timeout: 3), "not next to the feedback ask")
+        send.tap()
+        let done = app.buttons["feedback.done"]
+        XCTAssertTrue(done.waitForExistence(timeout: 15))
+        XCTAssertFalse(later.waitForExistence(timeout: 2), "not over the feedback sheet")
+        attach(app, "feedback-sheet-without-popup")
+        done.tap()
+        XCTAssertTrue(later.waitForExistence(timeout: 10), "shows once the sheet closes")
+        later.tap()
+    }
+
     func testFirstLaunchShowsThePopupOnce() {
         let withNote = #"{"schema":1,"ipad":{"version":"9.9.9","build":999,"note":"Fixes Apple Pencil pressure in drawing apps."}}"#
         let app = launch(manifest: withNote, keepPopup: true)

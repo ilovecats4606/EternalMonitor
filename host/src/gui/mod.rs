@@ -767,9 +767,8 @@ impl eframe::App for AnalyzerApp {
 
         if self.show_qr_modal {
             self.draw_qr_modal(&ctx, &snap);
-        } else {
-            self.update_popup(&ctx, &snap, &client);
         }
+        self.update_popup(&ctx, &snap, &client);
         self.draw_feedback_panel(&ctx, &client);
     }
 }
