@@ -130,10 +130,11 @@ struct ConnectView: View {
                     .scrollDismissesKeyboard(.interactively)
                 }
 
-                // One thing at a time: not while connecting or typing, over a
-                // sheet (Settings, QR scanner, pairing, Mail or the feedback
-                // copy sheet) or next to the feedback ask.
-                UpdatePopup(allowed: connectionManager.state == .disconnected && focusedField == nil
+                // One thing at a time: not while connecting or reconnecting,
+                // over a problem card, while typing, over a sheet (Settings,
+                // QR scanner, pairing, Mail or the feedback copy sheet) or
+                // next to the feedback ask.
+                UpdatePopup(allowed: connectionManager.isIdleOnConnect && focusedField == nil
                     && !showSettings && !showQRScanner && connectionManager.pairingPrompt == nil
                     && feedbackRequest == nil && !preparingFeedback && !showsFeedbackAsk)
             }

@@ -539,6 +539,7 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
         .is_none());
     popup_waits_while_the_ipad_has_a_session(&shared, &dir, &mut results);
     disconnect_ipad(&shared);
+    popup_waits_after_launch(&shared, &dir, &mut results);
     update_arrives_while_feedback_is_open(&shared, &dir, &mut results);
     std::fs::remove_dir_all(dir).unwrap();
     results.unwrap();
@@ -610,6 +611,31 @@ fn popup_waits_while_the_ipad_has_a_session(
         .click();
     window.run_steps(4);
     connect_ipad(shared);
+    results.extend_harness(&mut window);
+}
+
+/// An update known at launch waits the quiet period too: after a login
+/// start, a USB iPad connects within seconds and may mirror this window.
+fn popup_waits_after_launch(
+    shared: &SharedControl,
+    dir: &std::path::Path,
+    results: &mut SnapshotResults,
+) {
+    let state = dir.join("EternalMonitor/update-state.json");
+    let mut cached: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    cached["popup"] = serde_json::Value::Null;
+    cached["later"] = serde_json::Value::Null;
+    std::fs::write(&state, cached.to_string()).unwrap();
+    let mut window = harness(shared, egui::vec2(1040.0, 720.0), 1.0);
+    window.get_by_label("EternalMonitor 99.0.0 is available");
+    no_popup_for(&mut window, POPUP_QUIET_MS - 1000, "too soon after launch");
+    wait_for_popup(&mut window);
+    window
+        .get_by_role_and_label(Role::Dialog, "Update ready")
+        .get_by_label("Later")
+        .click();
+    window.run_steps(4);
     results.extend_harness(&mut window);
 }
 
@@ -691,7 +717,7 @@ fn update_arrives_while_feedback_is_open(
         "the popup must not open over Send feedback"
     );
     window.get_by_label("Close").click();
-    window.run_steps(4);
+    wait_for_popup(&mut window);
     window
         .get_by_role_and_label(Role::Dialog, "Update ready")
         .get_by_label("EternalMonitor 99.1.0 is ready");
@@ -1086,6 +1112,7 @@ fn review_screens() {
     .save();
     disconnect_ipad(&shared);
     let mut h = harness(&shared, egui::vec2(1040.0, 720.0), 2.0);
+    wait_for_popup(&mut h);
     save(&mut h, "update-popup-note");
     h.get_by_role_and_label(Role::Dialog, "Update ready")
         .get_by_label("Later")

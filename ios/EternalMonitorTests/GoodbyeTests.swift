@@ -137,6 +137,40 @@ final class GoodbyeTests: XCTestCase {
         XCTAssertEqual(attempts, 0)
     }
 
+    /// The update popup waits for Connect to settle: never between reconnect
+    /// attempts, where a tap meant for "Reconnecting" would hit its backdrop,
+    /// nor over the card the cycle ends with. Once that is dismissed, it may.
+    func testTheConnectScreenIsNotIdleDuringAReconnectCycle() async throws {
+        let previous = UserDefaults.standard.object(forKey: "autoReconnect")
+        UserDefaults.standard.set(true, forKey: "autoReconnect")
+        addTeardownBlock { UserDefaults.standard.set(previous, forKey: "autoReconnect") }
+        let host = FakeUDPHost()
+        let manager = try await connectedManager(host, timing: ConnectionManager.Timing(
+            connectTimeoutSeconds: 0.5, reconnectGraceSeconds: 0.1, reconnectBackoffSeconds: { _ in 0.4 }))
+        defer { manager.cancel() }
+        host.sendKeyframe(try FakeUDPHost.keyframe())
+        try await until("streaming") { manager.state == .connected }
+        XCTAssertFalse(manager.isIdleOnConnect)
+
+        // The PC goes away; nothing answers the reconnect attempts.
+        host.sendBye(.hostShuttingDown)
+        var betweenAttempts = 0
+        let deadline = Date().addingTimeInterval(20)
+        try await until("reconnecting") { manager.reconnectAttempt > 0 }
+        while manager.reconnectAttempt > 0, Date() < deadline {
+            if manager.state == .disconnected { betweenAttempts += 1 }
+            XCTAssertFalse(manager.isIdleOnConnect, "idle during attempt \(manager.reconnectAttempt)")
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertGreaterThan(betweenAttempts, 0, "the cycle never waited between attempts")
+        XCTAssertEqual(manager.reconnectAttempt, 0, "the cycle never ended")
+        // It ends on a problem card: still not idle.
+        XCTAssertNotNil(manager.problem)
+        XCTAssertFalse(manager.isIdleOnConnect)
+        manager.problem = nil
+        XCTAssertTrue(manager.isIdleOnConnect)
+    }
+
     /// Disconnected from the PC's side: the iPad stays away.
     func testAPCDisconnectingTheIPadStaysDisconnected() async throws {
         let host = FakeUDPHost()

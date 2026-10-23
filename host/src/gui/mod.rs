@@ -285,7 +285,8 @@ pub struct AnalyzerApp {
     updates: crate::updates::Updater,
     /// The update popup is on screen; it stays until a button is chosen.
     update_popup_open: bool,
-    /// When an iPad last had a session, for the popup's quiet period.
+    /// When an iPad last had a session, for the popup's quiet period. Starts
+    /// at launch: after a login start, a USB iPad connects within seconds.
     ipad_last_seen: Option<Instant>,
     popup_quiet: Duration,
     /// "Your iPad app is out of date" was dismissed for this run.
@@ -427,7 +428,7 @@ impl AnalyzerApp {
             settings_check_updates: persisted.check_for_updates,
             updates,
             update_popup_open: false,
-            ipad_last_seen: None,
+            ipad_last_seen: Some(Instant::now()),
             popup_quiet: popup_quiet(),
             ipad_notice_dismissed: false,
             settings_packet_size: control.shared.max_dgram.load(Ordering::SeqCst),

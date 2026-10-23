@@ -102,6 +102,12 @@ final class ConnectionManager: ObservableObject {
     @Published private(set) var signalLost = false
     /// Nonzero while an automatic reconnect cycle is running.
     @Published private(set) var reconnectAttempt = 0
+
+    /// Settled on the Connect screen: no attempt under way, no reconnect
+    /// cycle waiting between attempts, and no problem card.
+    var isIdleOnConnect: Bool {
+        state == .disconnected && problem == nil && reconnectAttempt == 0
+    }
     /// Decoded video dimensions in pixels — the touch relay maps gestures
     /// through the same aspect-fit rect the renderer draws.
     @Published private(set) var videoSize: CGSize = .zero
