@@ -34,21 +34,28 @@ final class ConnectScreenTests: XCTestCase {
         XCTAssertTrue(app.buttons["settings.done"].exists)
         let allowUSB = app.switches["settings.allowUSB"]
         XCTAssertTrue(allowUSB.exists)
-        XCTAssertEqual(allowUSB.value as? String, "1")
+        // Start from USB on. The setting is saved, so a run that failed
+        // between the two taps below left it off for every later run. A
+        // launch argument can't set it: it would shadow the toggle.
+        if allowUSB.value as? String == "0" {
+            allowUSB.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
+        }
+        XCTAssertTrue(switchValue(of: allowUSB, becomes: "1"), "\(allowUSB.value ?? "nil")")
         let screenshot = XCTAttachment(screenshot: app.screenshot())
         screenshot.name = "settings"
         screenshot.lifetime = .keepAlways
         add(screenshot)
         // SwiftUI exposes the whole form row as a switch. Tap its thumb.
         allowUSB.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
-        XCTAssertEqual(allowUSB.value as? String, "0")
+        // The switch's value can update a moment after the tap returns.
+        XCTAssertTrue(switchValue(of: allowUSB, becomes: "0"), "\(allowUSB.value ?? "nil")")
         app.buttons["settings.done"].tap()
         XCTAssertTrue(app.textFields["connect.host"].waitForExistence(timeout: 5))
         XCTAssertEqual(app.staticTexts["connect.usbStatus"].label, "Off. Turn on to connect with a cable.")
         settings.tap()
         XCTAssertTrue(allowUSB.waitForExistence(timeout: 5))
         allowUSB.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
-        XCTAssertEqual(allowUSB.value as? String, "1")
+        XCTAssertTrue(switchValue(of: allowUSB, becomes: "1"), "\(allowUSB.value ?? "nil")")
         app.buttons["settings.done"].tap()
         let listening = NSPredicate(format: "label == %@", "Plug this iPad into your PC. Keep Apple Devices open on the PC.")
         expectation(for: listening, evaluatedWith: app.staticTexts["connect.usbStatus"])
@@ -172,5 +179,12 @@ final class ConnectScreenTests: XCTestCase {
         rate.tap()
         app.buttons["60 fps"].tap()
         app.buttons["settings.done"].tap()
+    }
+
+    /// Whether `element`'s value becomes `value` within five seconds.
+    private func switchValue(of element: XCUIElement, becomes value: String) -> Bool {
+        let changed = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "value == %@", value), object: element)
+        return XCTWaiter().wait(for: [changed], timeout: 5) == .completed
     }
 }

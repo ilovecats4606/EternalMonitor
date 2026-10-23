@@ -106,6 +106,10 @@ final class ConnectionManager: ObservableObject {
     @Published private(set) var audioStats = AudioStats()
     /// The host's HELLO_ACK identity (name, negotiated timing) for Settings.
     @Published private(set) var hostInfo: ControlChannel.SessionInfo?
+    /// The one-time feedback card's progress, kept in UserDefaults.
+    @Published private(set) var feedbackAsk = FeedbackAsk()
+    /// When the current session's first frame arrived.
+    private var streamingSince: Date?
     /// The host's live stream parameters — from the ACK, then refreshed by
     /// every heartbeat (so ABR bitrate changes and codec switches show up).
     @Published private(set) var hostStreamConfig: StreamConfig?
@@ -377,6 +381,7 @@ final class ConnectionManager: ObservableObject {
                     self.record(.info, "decode", "First frame decoded successfully")
                     self.timeoutTask?.cancel()
                     self.state = .connected
+                    self.streamingSince = Date()
                     // A reconnect attempt that streams ends its cycle.
                     self.endReconnectCycle()
                     self.transportMode = isUSB ? "USB" : "WiFi"
@@ -1022,6 +1027,19 @@ final class ConnectionManager: ObservableObject {
         connect(host: target.host, port: target.port)
     }
 
+    /// Send feedback or Not now on the one-time card.
+    func finishFeedbackAsk() {
+        feedbackAsk.finish()
+    }
+
+    /// The details a feedback email carries about this connection.
+    var feedbackContext: Feedback.Context {
+        Feedback.Context.current(
+            pcVersion: PCVersions.version(address: lastTarget?.host, name: hostInfo?.hostName),
+            connection: state == .disconnected ? nil : (transportMode == "USB" ? "USB" : "Wi-Fi")
+        )
+    }
+
     func disconnect(reason: ByeReason = .userDisconnect) {
         if state != .disconnected {
             recordStreamSummary(reason: "disconnect=\(reason)")
@@ -1056,6 +1074,10 @@ final class ConnectionManager: ObservableObject {
         sessionWantsAudio = false
         audioStats = AudioStats()
 
+        if state == .connected, let since = streamingSince {
+            feedbackAsk.sessionEnded(after: Date().timeIntervalSince(since))
+        }
+        streamingSince = nil
         state = .disconnected
         fps = 0
         lagMs = 0

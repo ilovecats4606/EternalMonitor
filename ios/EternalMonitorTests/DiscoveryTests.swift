@@ -88,8 +88,12 @@ final class DiscoveryTests: XCTestCase {
         scanner.merge(found)
         scanner.lookUpIPv4(hostName: "studio.local.", service: found)
         scanner.startScan()
-        defer { scanner.stopScan() }
         scanner.merge(DiscoveredHost(name: "PC", address: "192.168.1.21", port: 9876))
+        // Stop the real Bonjour browse before the run loop can deliver
+        // anything from it: a PC running EternalMonitor on this network
+        // would otherwise join the list. The old lookup still belongs to
+        // the previous scan.
+        scanner.stopScan()
         lookup.answer("192.168.1.20")
         try await Task.sleep(for: .milliseconds(300))
         XCTAssertEqual(scanner.hosts.map(\.address), ["192.168.1.21"])
