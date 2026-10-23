@@ -1136,7 +1136,7 @@ html.js .reveal.visible { opacity: 1; transform: none; }
 @media (max-width: 720px) {
   .caption, .fact .d, .hero-meta, .footer, .status-line, .chip span, .toc,
   .mac-notice, .field label, .field legend, .dl-meta, .nav-link { font-size: 0.9375rem; }
-  .kicker, .btn-sm, .clip-controls .btn, .badge, .sha-label,
+  .kicker, .btn-sm, .clip-controls .btn, .badge, .sha-label, .stage-chip,
   .sha .btn-sm, .toc h2 { font-size: 0.875rem; }
   .nav-link .count, .btn .count, .pc-titlebar, .sha code { font-size: 0.8125rem; }
   .fallback pre, .source-body pre { font-size: 0.875rem; }
