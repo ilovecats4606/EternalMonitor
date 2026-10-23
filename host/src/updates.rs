@@ -678,6 +678,10 @@ pub struct State {
     auto: bool,
     manual_check: bool,
     saved: Saved,
+    /// The release being downloaded, waited for or installed. A check that
+    /// finds a newer one meanwhile leaves it alone: the helper checks the
+    /// file against this release's hash.
+    chosen: Option<Release>,
     phase: Phase,
     check: CheckStatus,
     updated: Option<String>,
@@ -696,6 +700,7 @@ impl State {
             auto,
             manual_check: false,
             saved,
+            chosen: None,
             phase: Phase::Idle,
             check: CheckStatus::NotChecked,
             updated: None,
@@ -790,9 +795,9 @@ impl State {
 
     pub fn notice(&self, now: u64) -> Option<Notice> {
         let version = || {
-            self.saved
-                .latest
+            self.chosen
                 .as_ref()
+                .or(self.saved.latest.as_ref())
                 .map_or_else(String::new, |r| r.version.clone())
         };
         match &self.phase {
@@ -830,6 +835,7 @@ impl State {
         }
         let release = self.available()?.clone();
         self.force = false;
+        self.chosen = Some(release.clone());
         if streaming {
             self.phase = Phase::Queued(None);
             self.idle_since = None;
@@ -856,7 +862,8 @@ impl State {
                     received: 0,
                     total: 0,
                 };
-                self.available().cloned().map(Command::Download)
+                self.chosen = self.available().cloned();
+                self.chosen.clone().map(Command::Download)
             }
             other => {
                 self.phase = other;
@@ -895,7 +902,8 @@ impl State {
                     received: 0,
                     total: 0,
                 };
-                self.available().cloned().map(Command::Download)
+                self.chosen = self.available().cloned();
+                self.chosen.clone().map(Command::Download)
             }
         }
     }
@@ -927,7 +935,7 @@ impl State {
             return None;
         }
         let path = path.clone();
-        let release = self.saved.latest.clone()?;
+        let release = self.chosen.clone()?;
         self.phase = Phase::Installing;
         self.saved.pending = Some((self.current.clone(), release.version.clone()));
         Some((path, release))

@@ -581,6 +581,43 @@ fn update_waits_for_the_stream_to_stop() {
     assert_eq!(s.saved.pending, Some(("0.3.1".into(), "0.3.2".into())));
 }
 
+/// A check can find a newer release while one is downloading or waiting for a
+/// stream to end. The file must still go to the helper with its own hash,
+/// which the helper checks, not the newer release's.
+#[test]
+fn a_release_found_mid_update_does_not_replace_the_one_downloaded() {
+    let a = release("0.3.2");
+    let b = Release {
+        sha256: "1".repeat(64),
+        ..release("0.3.3")
+    };
+    let path_a = PathBuf::from("setup-0.3.2.exe");
+
+    let mut s = state(Saved::default());
+    s.finish_check(1000, false, Ok(a.clone()));
+    s.begin_check(false);
+    assert!(matches!(s.update_now(false), Some(Command::Download(r)) if r == a));
+    s.finish_check(1001, false, Ok(b.clone()));
+    assert_eq!(
+        s.notice(1001),
+        Some(Notice::Downloading("0.3.2".into(), None))
+    );
+    s.download_finished(Ok(path_a.clone()));
+    assert_eq!(s.take_ready(false), Some((path_a.clone(), a.clone())));
+    assert_eq!(s.saved.pending, Some(("0.3.1".into(), "0.3.2".into())));
+
+    let mut s = state(Saved::default());
+    s.finish_check(1000, false, Ok(a.clone()));
+    s.update_now(false);
+    s.download_finished(Ok(path_a.clone()));
+    assert!(s.take_ready(true).is_none(), "waits for the stream");
+    s.finish_check(1001, false, Ok(b));
+    let start = Instant::now();
+    assert!(s.tick(false, start).is_none());
+    assert!(s.tick(false, start + Duration::from_secs(4)).is_none());
+    assert_eq!(s.take_ready(false), Some((path_a, a)));
+}
+
 #[test]
 fn update_now_while_streaming_can_be_forced_or_cancelled() {
     let mut s = state(Saved::default());
