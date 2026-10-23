@@ -291,6 +291,57 @@ final class PencilRelayTests: XCTestCase {
         XCTAssertTrue(events.prefix(2).allSatisfy { $0.kind == 2 && $0.buttons == 1 && $0.xNorm == 555 })
         XCTAssertTrue(events.dropFirst(2).allSatisfy { $0.buttons == 0 && $0.phase == 1 }, "\(events)")
     }
+
+    /// The PC changed resolution mid-drag: a new shape moves the picture, and
+    /// a new size changes what each point means on the PC.
+    func testADragHeldAcrossAResolutionChangeEndsWhereItWas() {
+        for size in [CGSize(width: 2560, height: 1080), CGSize(width: 3840, height: 2160)] {
+            let view = iPadAirRelay()
+            var events: [WireInputEvent] = []
+            view.onEvents = { events += $0 }
+            let finger = TestTouch(.direct)
+            finger.point = CGPoint(x: 10, y: 410)
+            view.touchesBegan([finger], with: nil)
+            finger.point = CGPoint(x: 100, y: 410)
+            view.touchesMoved([finger], with: nil)
+            view.videoSize = size
+            finger.point = CGPoint(x: 200, y: 400)
+            view.touchesMoved([finger], with: nil)
+            view.touchesEnded([finger], with: nil)
+            XCTAssertEqual(events.map(\.phase), [0, 1, 3], "\(size)")
+            XCTAssertEqual(events.last?.xNorm, 5554, "\(size)")
+            XCTAssertEqual(events.last?.yNorm, 32768, "\(size)")
+        }
+    }
+
+    func testATwoFingerScrollAcrossASwitchStops() {
+        let view = iPadAirRelay()
+        var events: [WireInputEvent] = []
+        view.onEvents = { events += $0 }
+        let first = TestTouch(.direct), second = TestTouch(.direct)
+        first.point = CGPoint(x: 500, y: 300)
+        second.point = CGPoint(x: 600, y: 300)
+        let event = TestEvent([first, second])
+        view.touchesBegan([first, second], with: event)
+        first.point.y = 400
+        second.point.y = 400
+        view.touchesMoved([first, second], with: event)
+        XCTAssertEqual(events.map(\.kind), [3], "the scroll did not start")
+        view.pictureFit = .fill
+        // Past the relay's move interval, so a stale scroll would be sent.
+        Thread.sleep(forTimeInterval: 0.01)
+        first.point.y = 450
+        second.point.y = 450
+        view.touchesMoved([first, second], with: event)
+        view.touchesEnded([first, second], with: event)
+        XCTAssertEqual(events.count, 1, "scrolled after the switch: \(events.dropFirst())")
+    }
+}
+
+private final class TestEvent: UIEvent {
+    let touches: Set<UITouch>
+    init(_ touches: Set<UITouch>) { self.touches = touches; super.init() }
+    override var allTouches: Set<UITouch>? { touches }
 }
 
 private final class TestTouch: UITouch {

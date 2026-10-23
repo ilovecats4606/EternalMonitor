@@ -48,7 +48,8 @@ final class RelayTouchUIView: UIView {
     var onToggleHUD: (() -> Void)?
     var videoSize: CGSize = .zero {
         didSet {
-            if oldValue != videoSize && pencil.isDown { cancelInput() }
+            // A new PC resolution moves the picture or changes what it maps to.
+            if oldValue != videoSize { pictureMoved() }
             machine.videoPixelSize = videoSize
         }
     }
@@ -227,10 +228,11 @@ final class RelayTouchUIView: UIView {
         keyboardInput.updateSticky(keyboard.sticky)
     }
 
-    /// The picture moved under the contacts: Fit or Fill changed, or the iPad
-    /// rotated. End every gesture where it was, as a three-finger tap does:
-    /// a pending tap never clicks, a held button is cancelled at the last
-    /// point sent, and fingers still down are ignored until they all lift.
+    /// The picture moved under the contacts: Fit or Fill changed, the iPad
+    /// rotated, or the PC changed resolution. End every gesture where it was,
+    /// as a three-finger tap does: a pending tap never clicks, a held button
+    /// is cancelled at the last point sent, and fingers still down are
+    /// ignored until they all lift.
     /// Keys stay held; they don't depend on the picture.
     private func pictureMoved() {
         holdTimer?.cancel()
