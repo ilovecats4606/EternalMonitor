@@ -271,6 +271,24 @@ small { font-size: 0.875rem; }
 @media (max-width: 720px) {
   .hide-sm { display: none !important; }
 }
+/* On phones the GitHub link drops its word (screen readers still hear
+   "GitHub, 181 stars") and the nav tightens, so Download stays on screen. */
+@media (max-width: 480px) {
+  .nav-inner { gap: 10px; }
+  .nav-link { padding: 0 8px; }
+  .nav .btn { margin-left: 0; }
+  .nav-link > span:not(.count) {
+    position: absolute;
+    width: 1px; height: 1px;
+    overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+/* At 375px and below the decorative star goes too and the links tighten again. */
+@media (max-width: 380px) {
+  .nav-link { padding: 0 6px; }
+  .nav .count-star { display: none; }
+}
 
 /* --- Sections -------------------------------------------------------------- */
 
