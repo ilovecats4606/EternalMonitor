@@ -11,7 +11,7 @@
     var age = Date.now() - at;
     return age >= 0 && age <= CACHE_TTL;
   };
-  // True when version a (e.g. "v0.3.10") is strictly newer than b, compared
+  // True when version a (e.g. v0.3.10 against v0.3.2) is strictly newer than b, compared
   // number by number; unparseable versions are never newer.
   var isNewer = function (a, b) {
     var pa = String(a).replace(/^v/, '').split('.'), pb = String(b).replace(/^v/, '').split('.');
