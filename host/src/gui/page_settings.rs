@@ -1,6 +1,6 @@
 //! Settings, grouped by what they change.
 
-use eframe::egui::{self, pos2, vec2, Align, Color32, Layout, Rect, RichText, Sense, Ui};
+use eframe::egui::{self, pos2, vec2, Color32, Rect, RichText, Sense, Ui};
 
 use super::page_performance::page_header;
 use super::theme::*;
@@ -302,22 +302,18 @@ impl AnalyzerApp {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 18.0;
                 widgets::link(ui, "sideband.studio", "https://sideband.studio");
-                widgets::link(ui, "Source code", "https://github.com/sidebandstudio/EternalMonitor");
-                feedback = widgets::link_button(ui, "Send feedback", super::icons::Icon::Mail).clicked();
+                widgets::link(
+                    ui,
+                    "Source code",
+                    "https://github.com/sidebandstudio/EternalMonitor",
+                );
+                feedback =
+                    widgets::link_button(ui, "Send feedback", super::icons::Icon::Mail).clicked();
                 widgets::link(ui, "hello@sideband.studio", "mailto:hello@sideband.studio");
             });
             if feedback {
                 self.open_feedback();
             }
-            ui.add_space(6.0);
-            ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
-                ui.add(
-                    egui::Label::new(faint(
-                        "Set in Geist and Geist Mono by Vercel, used under the SIL Open Font License 1.1.",
-                    ))
-                    .wrap(),
-                );
-            });
         });
     }
 }

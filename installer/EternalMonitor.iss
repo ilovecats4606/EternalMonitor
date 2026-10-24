@@ -72,6 +72,7 @@ Source: "{#StagingDir}\ffmpeg.exe";              DestDir: "{app}"; Flags: ignore
 Source: "{#StagingDir}\README.md";               DestDir: "{app}"; Flags: ignoreversion isreadme skipifsourcedoesntexist
 Source: "{#StagingDir}\LICENSE";                 DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#StagingDir}\QUICKSTART.txt";          DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#StagingDir}\Geist-OFL.txt";           DestDir: "{app}"; Flags: ignoreversion
 #ifdef IncludeDriver
 ; Third-party Virtual Display Driver setup, bundled so the tester never touches GitHub.
 Source: "{#StagingDir}\driver\*"; DestDir: "{app}\driver"; Flags: ignoreversion recursesubdirs
