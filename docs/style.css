@@ -251,19 +251,43 @@ small { font-size: 0.875rem; }
 .nav-link:hover { color: var(--text); background: var(--raised); }
 .nav-link svg { width: 16px; height: 16px; }
 .nav-link .count, .btn .count {
-  display: inline-block;
-  min-width: 2.2em;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3em;
   font-family: var(--mono);
   font-size: 0.8rem;
   color: var(--text);
 }
-.btn .count { color: inherit; min-width: 2em; text-align: left; }
+.btn .count { color: inherit; }
+/* GitHub's star, in warm gold, before a loaded count only (the script adds it
+   with the number). Decorative: the count reads "N stars" to screen readers. */
+.count .count-star { flex: none; width: 0.9em; height: 0.9em; fill: #f5c542; }
+/* In the Star on GitHub button the count sits apart, as on GitHub's own button. */
+.btn .count { margin-left: 4px; padding-left: 10px; border-left: 1px solid var(--border-strong); }
 /* No count yet (offline, or GitHub rate-limited): no gap either. */
 .count:empty { display: none; }
 .nav .btn { margin-left: 6px; }
 
 @media (max-width: 720px) {
   .hide-sm { display: none !important; }
+}
+/* On phones the GitHub link drops its word (screen readers still hear
+   "GitHub, 181 stars") and the nav tightens, so Download stays on screen. */
+@media (max-width: 480px) {
+  .nav-inner { gap: 10px; }
+  .nav-link { padding: 0 8px; }
+  .nav .btn { margin-left: 0; }
+  .nav-link > span:not(.count) {
+    position: absolute;
+    width: 1px; height: 1px;
+    overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+/* At 375px and below the decorative star goes too and the links tighten again. */
+@media (max-width: 380px) {
+  .nav-link { padding: 0 6px; }
+  .nav .count-star { display: none; }
 }
 
 /* --- Sections -------------------------------------------------------------- */
