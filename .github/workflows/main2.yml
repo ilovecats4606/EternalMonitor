@@ -20,23 +20,22 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Install Build Tools
+      - name: Install Protoc
         shell: pwsh
         run: |
-          choco install protoc pkgconfiglite --yes --no-progress
+          choco install protoc --yes --no-progress
 
-      - name: Set up FFmpeg Dev Libraries
+      - name: Install FFmpeg via vcpkg
         shell: pwsh
         run: |
-          $url = "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-7.1-full_build-shared.7z"
-          Invoke-WebRequest -Uri $url -OutFile ffmpeg.7z
-          7z x ffmpeg.7z -y -offmpeg_root
-          $ffmpegFolder = (Get-ChildItem -Path ffmpeg_root -Directory | Select-Object -First 1).FullName
-          echo "FFMPEG_DIR=$ffmpegFolder" >> $env:GITHUB_ENV
-          echo "$ffmpegFolder\bin" >> $env:GITHUB_PATH
+          $vcpkgDir = $env:VCPKG_INSTALLATION_ROOT
+          echo "VCPKG_ROOT=$vcpkgDir" >> $env:GITHUB_ENV
+          vcpkg install ffmpeg:x64-windows
 
       - name: Build Rust Project
         shell: pwsh
+        env:
+          VCPKG_ROOT: ${{ env.VCPKG_INSTALLATION_ROOT }}
         run: |
           cargo build --release
 
@@ -46,7 +45,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path portable
           Get-ChildItem -Path "target/release/*.exe" | Copy-Item -Destination portable/
           Get-ChildItem -Path "target/release/*.dll" -ErrorAction SilentlyContinue | Copy-Item -Destination portable/
-          Get-ChildItem -Path "$env:FFMPEG_DIR\bin\*.dll" | Copy-Item -Destination portable/
+          Get-ChildItem -Path "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin\*.dll" -ErrorAction SilentlyContinue | Copy-Item -Destination portable/
 
       - name: Upload Portable Windows Artifact
         uses: actions/upload-artifact@v4
