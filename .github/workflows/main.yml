@@ -1,0 +1,56 @@
+name: Build and Export IPA
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-ipa:
+    runs-on: macos-14
+
+    defaults:
+      run:
+        working-directory: ios
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode Project
+        run: xcodegen generate
+
+      - name: Build EternalMonitor for Device
+        run: |
+          xcodebuild build \
+            -project EternalMonitor.xcodeproj \
+            -scheme EternalMonitor \
+            -destination 'generic/platform=iOS' \
+            -configuration Release \
+            CODE_SIGNING_ALLOWED='NO' \
+            CODE_SIGNING_REQUIRED='NO' \
+            CODE_SIGN_IDENTITY='' \
+            BUILD_DIR='build'
+
+      - name: Package into IPA
+        run: |
+          mkdir -p Payload
+          cp -r build/Release-iphoneos/EternalMonitor.app Payload/
+          zip -r EternalMonitor.ipa Payload
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EternalMonitor-ipa
+          path: ios/EternalMonitor.ipa
+          retention-days: 14
